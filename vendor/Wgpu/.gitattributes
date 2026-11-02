@@ -1,0 +1,4 @@
+# Third-party sources and test documents are kept byte for byte as their
+# release ships them.
+vendor/** -text
+tests/psd-tools/** -text

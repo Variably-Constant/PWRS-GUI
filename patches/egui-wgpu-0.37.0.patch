@@ -1,0 +1,350 @@
+diff --git a/src/renderer.rs b/src/renderer.rs
+index 382d874..569e05f 100644
+--- a/src/renderer.rs
++++ b/src/renderer.rs
+@@ -158,6 +158,12 @@ struct SlicedBuffer {
+     capacity: wgpu::BufferAddress,
+ }
+ 
++/// The textures the renderer has, by egui's id, which [`Renderer::update_buffers`] puts in
++/// the [`CallbackResources`] before it prepares a frame's callbacks, so a callback can draw
++/// with egui's font atlas and the images egui has loaded. A texture egui has freed is not
++/// among them.
++pub struct EguiTextures(pub HashMap<epaint::TextureId, wgpu::Texture>);
++
+ pub struct Texture {
+     /// The texture may be None if the `TextureId` is just a handle to a user-provided bind-group.
+     pub texture: Option<wgpu::Texture>,
+@@ -259,6 +265,11 @@ pub struct Renderer {
+ 
+     options: RendererOptions,
+ 
++    /// Whether the last [`Self::update_buffers`] wrote its frame's vertices and indices. A
++    /// lost device gives no staging buffer to write them through, and [`Self::render`] then
++    /// draws nothing.
++    buffers_written: bool,
++
+     /// Storage for resources shared with all invocations of [`CallbackTrait`]'s methods.
+     ///
+     /// See also [`CallbackTrait`].
+@@ -489,6 +500,7 @@ impl Renderer {
+             next_user_texture_id: 0,
+             samplers: HashMap::default(),
+             options,
++            buffers_written: false,
+             callback_resources: CallbackResources::default(),
+         }
+     }
+@@ -501,6 +513,9 @@ impl Renderer {
+     /// The only consequence of `forget_lifetime` is that any operation on the parent encoder will cause a runtime error
+     /// instead of a compile time error.
+     ///
++    /// A frame whose [`Renderer::update_buffers`] could not write its vertices and indices,
++    /// as on a lost device, draws nothing.
++    ///
+     /// # Panic
+     /// Always ensure that [`Renderer::update_buffers`] has been called otherwise calling [`Renderer::render`] will panic!
+     pub fn render(
+@@ -511,6 +526,10 @@ impl Renderer {
+     ) {
+         profiling::function_scope!();
+ 
++        if !self.buffers_written {
++            return;
++        }
++
+         let pixels_per_point = screen_descriptor.pixels_per_point;
+         let size_in_pixels = screen_descriptor.size_in_pixels;
+ 
+@@ -961,6 +980,10 @@ impl Renderer {
+     /// Should be called before [`Self::render`].
+     ///
+     /// Returns all user-defined command buffers gathered from [`CallbackTrait::prepare`] & [`CallbackTrait::finish_prepare`] callbacks.
++    ///
++    /// When the device gives no staging buffer for the vertices or indices, as a lost device
++    /// gives none, this writes nothing more, runs no callback and returns no command buffer,
++    /// and [`Self::render`] draws nothing for the frame.
+     pub fn update_buffers(
+         &mut self,
+         device: &wgpu::Device,
+@@ -971,6 +994,8 @@ impl Renderer {
+     ) -> Vec<wgpu::CommandBuffer> {
+         profiling::function_scope!();
+ 
++        self.buffers_written = false;
++
+         let screen_size_in_points = screen_descriptor.screen_size_in_points();
+ 
+         let uniform_buffer_content = UniformBuffer {
+@@ -1030,11 +1055,12 @@ impl Renderer {
+             );
+ 
+             let Some(mut index_buffer_staging) = index_buffer_staging else {
+-                panic!(
+-                    "Failed to create staging buffer for index data. Index count: {index_count}. Required index buffer size: {required_index_buffer_size}. Actual size {} and capacity: {} (bytes)",
++                log::warn!(
++                    "No staging buffer for index data, as on a lost device, so the frame draws nothing. Index count: {index_count}. Required index buffer size: {required_index_buffer_size}. Actual size {} and capacity: {} (bytes)",
+                     self.index_buffer.buffer.size(),
+                     self.index_buffer.capacity
+                 );
++                return Vec::new();
+             };
+ 
+             let mut index_offset = 0;
+@@ -1076,11 +1102,12 @@ impl Renderer {
+             );
+ 
+             let Some(mut vertex_buffer_staging) = vertex_buffer_staging else {
+-                panic!(
+-                    "Failed to create staging buffer for vertex data. Vertex count: {vertex_count}. Required vertex buffer size: {required_vertex_buffer_size}. Actual size {} and capacity: {} (bytes)",
++                log::warn!(
++                    "No staging buffer for vertex data, as on a lost device, so the frame draws nothing. Vertex count: {vertex_count}. Required vertex buffer size: {required_vertex_buffer_size}. Actual size {} and capacity: {} (bytes)",
+                     self.vertex_buffer.buffer.size(),
+                     self.vertex_buffer.capacity
+                 );
++                return Vec::new();
+             };
+ 
+             let mut vertex_offset = 0;
+@@ -1100,7 +1127,17 @@ impl Renderer {
+             }
+         }
+ 
++        self.buffers_written = true;
++
+         let mut user_cmd_bufs = Vec::new();
++        if !callbacks.is_empty() {
++            let textures = self
++                .textures
++                .iter()
++                .filter_map(|(id, t)| t.texture.clone().map(|texture| (*id, texture)))
++                .collect();
++            self.callback_resources.insert(EguiTextures(textures));
++        }
+         {
+             profiling::scope!("prepare callbacks");
+             for callback in &callbacks {
+diff --git a/src/winit.rs b/src/winit.rs
+index 59fb626..31ec3b5 100644
+--- a/src/winit.rs
++++ b/src/winit.rs
+@@ -5,7 +5,7 @@
+ 
+ use crate::{RenderState, SurfaceConfig, SurfaceErrorAction, WgpuConfiguration, renderer};
+ use crate::{RendererOptions, capture::CaptureState};
+-use core::num::NonZeroU32;
++use core::num::{NonZeroU32, NonZeroU64};
+ use egui::{Context, ViewportId, ViewportIdMap, ViewportIdSet};
+ use std::sync::Arc;
+ 
+@@ -17,6 +17,61 @@ struct SurfaceState {
+     resizing: bool,
+     needs_reconfigure: bool,
+     needs_recreate: bool,
++
++    /// Whether a configure of this surface has succeeded. wgpu panics when a frame is
++    /// requested of a surface none has set up, so until then a paint skips its frame.
++    configured: bool,
++
++    /// The frames skipped in a row because the surface was not configured, which space
++    /// out the configures that follow them.
++    unconfigured_paints: u32,
++}
++
++/// How many times [`Painter::configure_surface`] configures a surface while another
++/// thread's submissions repeatedly cut its wait for an idle GPU short.
++const CONFIGURE_TRIES: u32 = 8;
++
++/// The size of the staging write [`device_lost`] makes.
++const PROBE_SIZE: NonZeroU64 = NonZeroU64::MIN.saturating_add(3);
++
++/// Whether `device` is lost. wgpu reports a lost device's errors to no error scope, so a
++/// configure on one seems to succeed while leaving the surface with nothing to present;
++/// a staging write to a buffer made for it, which wgpu refuses on a lost device, tells
++/// the two apart.
++fn device_lost(device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
++    let probe = device.create_buffer(&wgpu::BufferDescriptor {
++        label: Some("egui_device_probe"),
++        size: PROBE_SIZE.get(),
++        usage: wgpu::BufferUsages::COPY_DST,
++        mapped_at_creation: false,
++    });
++    queue.write_buffer_with(&probe, 0, PROBE_SIZE).is_none()
++}
++
++/// Whether `error` is wgpu-core's refusal of a surface configure whose wait for an
++/// idle GPU did not end with the queue empty: another thread submitted work while it
++/// waited, or the wait timed out.
++fn wait_cut_short(error: &wgpu::Error) -> bool {
++    core::iter::successors(Some(error as &(dyn std::error::Error + 'static)), |e| {
++        e.source()
++    })
++    .any(|e| {
++        matches!(
++            e.downcast_ref::<wgpu::wgc::present::ConfigureSurfaceError>(),
++            Some(wgpu::wgc::present::ConfigureSurfaceError::GpuWaitTimeout)
++        )
++    })
++}
++
++/// Submits the work a frame's paint callbacks prepared, with the encoder they prepared it
++/// into, for a paint that ends before its render pass. A callback may count on what it
++/// prepared having run, as one that keeps a drawing of its own between frames does.
++fn submit_prepared(
++    queue: &wgpu::Queue,
++    user_cmd_bufs: Vec<wgpu::CommandBuffer>,
++    encoder: wgpu::CommandEncoder,
++) {
++    queue.submit(core::iter::chain(user_cmd_bufs, [encoder.finish()]));
+ }
+ 
+ /// Everything you need to paint egui with [`wgpu`] on [`winit`].
+@@ -107,11 +162,23 @@ impl Painter {
+         }
+     }
+ 
++    /// Configures the surface, and returns whether it is confirmed to be configured.
++    ///
++    /// wgpu-core configures a surface only when the queue is empty once the GPU has
++    /// finished its work, and fails the configure when another thread submitted work
++    /// while it waited, as a thread that runs GPU work on the device egui draws with
++    /// does. Each try but the last runs in an error scope of this thread's, which native
++    /// backends resolve at once, and a try that failed that way is made again. The last
++    /// try, and one after a try that failed any other way, runs outside any scope, so
++    /// its error reaches the device's uncaptured-error handler as it would without the
++    /// tries before it; whether it succeeded cannot be told, so it returns false. A try
++    /// no scope caught an error in still fails on a lost device, whose errors reach no
++    /// scope, so the surface counts as configured only on a device that is not lost.
+     fn configure_surface(
+         surface_state: &SurfaceState,
+         render_state: &RenderState,
+         config: &SurfaceConfig,
+-    ) {
++    ) -> bool {
+         profiling::function_scope!();
+ 
+         let SurfaceConfig {
+@@ -147,9 +214,28 @@ impl Painter {
+             surf_config.desired_maximum_frame_latency = desired_maximum_frame_latency;
+         }
+ 
++        for _ in 1..CONFIGURE_TRIES {
++            let scope = render_state
++                .device
++                .push_error_scope(wgpu::ErrorFilter::Validation);
++            surface_state
++                .surface
++                .configure(&render_state.device, &surf_config);
++            let mut caught = core::pin::pin!(scope.pop());
++            match caught.as_mut().poll(&mut core::task::Context::from_waker(
++                core::task::Waker::noop(),
++            )) {
++                core::task::Poll::Ready(None) => {
++                    return !device_lost(&render_state.device, &render_state.queue);
++                }
++                core::task::Poll::Ready(Some(error)) if wait_cut_short(&error) => {}
++                core::task::Poll::Ready(Some(_)) | core::task::Poll::Pending => break,
++            }
++        }
+         surface_state
+             .surface
+             .configure(&render_state.device, &surf_config);
++        false
+     }
+ 
+     /// Drop the existing [`wgpu::Surface`] for `viewport_id` and create a fresh one for the
+@@ -312,6 +398,8 @@ impl Painter {
+                 resizing,
+                 needs_reconfigure: false,
+                 needs_recreate: false,
++                configured: false,
++                unconfigured_paints: 0,
+             },
+         );
+         let Some(width) = NonZeroU32::new(width) else {
+@@ -353,7 +441,8 @@ impl Painter {
+         surface_state.width = width;
+         surface_state.height = height;
+ 
+-        Self::configure_surface(surface_state, render_state, &self.config.surface);
++        let configured = Self::configure_surface(surface_state, render_state, &self.config.surface);
++        surface_state.configured |= configured;
+ 
+         if let Some(depth_format) = self.options.depth_stencil_format {
+             self.depth_texture_view.insert(
+@@ -453,7 +542,9 @@ impl Painter {
+                         .lock()
+                         .setPresentsWithTransaction(resizing);
+ 
+-                    Self::configure_surface(state, render_state, &self.config.surface);
++                    let configured =
++                        Self::configure_surface(state, render_state, &self.config.surface);
++                    state.configured |= configured;
+                 }
+             }
+         }
+@@ -587,10 +678,31 @@ impl Painter {
+         };
+ 
+         if surface_state.needs_reconfigure {
+-            Self::configure_surface(surface_state, render_state, &self.config.surface);
++            let configured =
++                Self::configure_surface(surface_state, render_state, &self.config.surface);
++            surface_state.configured |= configured;
+             surface_state.needs_reconfigure = false;
+         }
+ 
++        // A surface no configure has set up has no frame to give, and wgpu panics when
++        // one is requested. One with an area is configured again at a later paint, after a
++        // wait that doubles with each frame skipped, up to about a second.
++        if !surface_state.configured {
++            if surface_state.width > 0 && surface_state.height > 0 {
++                surface_state.needs_reconfigure = true;
++                let wait = 16_u64 << surface_state.unconfigured_paints.min(6);
++                surface_state.unconfigured_paints =
++                    surface_state.unconfigured_paints.saturating_add(1);
++                self.context.request_repaint_after_for(
++                    core::time::Duration::from_millis(wait),
++                    viewport_id,
++                );
++            }
++            submit_prepared(&render_state.queue, user_cmd_bufs, encoder);
++            render_queue_guard.commands_submitted = true;
++            return vsync_sec;
++        }
++
+         let output_frame = {
+             profiling::scope!("get_current_texture");
+             // This is what vsync-waiting happens on my Mac.
+@@ -612,7 +724,12 @@ impl Painter {
+             other => {
+                 match (*self.config.on_surface_status)(&other) {
+                     SurfaceErrorAction::Reconfigure => {
+-                        Self::configure_surface(surface_state, render_state, &self.config.surface);
++                        let configured = Self::configure_surface(
++                            surface_state,
++                            render_state,
++                            &self.config.surface,
++                        );
++                        surface_state.configured |= configured;
+                         self.context.request_repaint_of(viewport_id);
+                     }
+                     SurfaceErrorAction::RecreateSurface => {
+@@ -627,6 +744,8 @@ impl Painter {
+                     SurfaceErrorAction::SkipFrame => {}
+                 }
+                 if !capture {
++                    submit_prepared(&render_state.queue, user_cmd_bufs, encoder);
++                    render_queue_guard.commands_submitted = true;
+                     return vsync_sec;
+                 }
+                 None
+@@ -656,6 +775,8 @@ impl Painter {
+                 };
+                 if size.width == 0 || size.height == 0 {
+                     log::warn!("Cannot capture a screenshot of a zero-sized surface");
++                    submit_prepared(&render_state.queue, user_cmd_bufs, encoder);
++                    render_queue_guard.commands_submitted = true;
+                     return vsync_sec;
+                 }
+ 

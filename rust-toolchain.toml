@@ -1,0 +1,7 @@
+# Rust 1.99.0, the release the project's Wgpu module requires, which the
+# GPU layer links. Every build of this tree, local, on a guest or in CI,
+# uses it; rustup installs it beside a host's default toolchain on first
+# use.
+[toolchain]
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]

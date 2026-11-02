@@ -1,0 +1,22 @@
+---
+title: "Maps & Lists"
+weight: 210
+sidebar:
+  open: true
+---
+
+# Maps, ordered maps, and linked sequences
+
+Keyed lookup and ordered storage primitives.
+
+| Primitive | Lookup shape |
+|---|---|
+| [Shared Hash Map](shared-hash-map/) | O(1) average; open-addressed; FNV-1a hashing for cross-process determinism |
+| [Shared Named Values](shared-named-values/) | Byte values of any size under case-insensitive names, over a raw hash map, a raw arena and an epoch table |
+| [Shared B-Tree Map](shared-btree-map/) | Ordered; supports range queries |
+| [Versioned BTree Map](versioned-btree-map/) | Ordered with epoch-stamped entries; a scan reads a fixed view while writers run |
+| [Laned Versioned Map](laned-versioned-map/) | One versioned index across n single-writer lanes, so n statements write it at once |
+| [Shared Versioned Index](shared-versioned-index/) | Ordered, every version a pin still needs; any number of threads and processes write it at once with no lock, one compare-and-swap deciding each key |
+| [Shared Linked List](shared-linked-list/) | Doubly-linked; stable iterator positions across mutations |
+
+For prose overview of the category, see [shared-hash-map](../shared-hash-map/).

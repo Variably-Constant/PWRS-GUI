@@ -1,0 +1,133 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pwrs-gui-proto",
+    "crates/pwrs-gui-fonts",
+    "crates/pwrs-gui-client",
+    "crates/pwrs-gui-dialogs",
+    "crates/pwrs-gui-gpu",
+    "crates/pwrs-gui-egui",
+    "crates/pwrs-gui-web",
+    "crates/pwrs-gui",
+    "crates/pwrs-gui-standin",
+    "crates/pwrs-gui-addons",
+]
+# The patched crates.io crates under patched/ are dependencies, not members.
+exclude = ["patched"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+authors = ["Mark Newton"]
+
+[workspace.dependencies]
+pwrs = { package = "PoWerRuSt", version = "=0.8.0" }
+# SubEtha's tree, for BlockingAdaptiveRing, which no published release
+# includes yet.
+subetha-cxc = { path = "../SubEtha/crates/subetha-cxc" }
+# The project's Wgpu module as a library, from its tree beside the checkout
+# until it is released: none of its PowerShell module's exports, and the
+# DirectX shader compiler linked in, as the module links it.
+wgpu-pwsh = { path = "../Wgpu", default-features = false, features = ["static-dxc"] }
+# The WGSL front end of the naga wgpu 30 builds with, which reads a compute
+# pass's entry point and workgroup size for an HTML page's surface.
+naga = { version = "30.0.1", default-features = false, features = ["wgsl-in"] }
+# eframe's default features but its system font provider: the egui
+# renderer reads the system's fonts through fontdb itself, as HTML windows
+# are given them.
+eframe = { version = "0.37.0", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "links", "wayland", "web_screen_reader", "wgpu", "x11"] }
+egui_extras = "0.37.0"
+tao = "0.37.2"
+# devtools lets a page opened with -DevTools open them in a release build;
+# linux-body gives WebKitGTK's custom-protocol requests their bodies, which
+# a page's channel sends its frames in.
+wry = { version = "0.57.1", features = ["devtools", "linux-body"] }
+# With preserve_order an object's keys stay in the order a page wrote them,
+# so what a page sends arrives with its properties in that order.
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+# The engines' binding crates at the versions wry 0.57.1 takes: their
+# webview types are wry's own. cairo-rs is 0.18, whose Surface WebKitGTK's
+# snapshot returns, and gtk is 0.18, whose settings give WebKitGTK's pages
+# their hint style.
+png = "0.18.1"
+webview2-com = "0.39.1"
+windows = "0.62.2"
+webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
+cairo-rs = "0.18.5"
+gtk = "0.18.2"
+block2 = "0.6.2"
+dispatch2 = { version = "0.3.1", default-features = false, features = ["std"] }
+objc2 = "0.6.5"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std"] }
+objc2-web-kit = { version = "0.3.2", default-features = false, features = ["std"] }
+# rc lets a value store its bytes behind an Arc, so a copy of a window's
+# tree shares a picture's bytes.
+serde = { version = "1.0.229", features = ["derive", "rc"] }
+# The CommonMark parser the session and both renderers read a Markdown
+# document with, as egui_commonmark reads one.
+pulldown-cmark = { version = "0.13.6", default-features = false }
+postcard = { version = "1.1.3", features = ["use-std"] }
+getrandom = "0.4.3"
+crossbeam-queue = "0.3.14"
+arc-swap = "1.9.3"
+libc = "0.2.191"
+windows-sys = "0.61.2"
+# A FilePicker's dialog in both renderers: the system's own on Windows and
+# macOS, the XDG Desktop Portal through libdbus loaded at run time
+# elsewhere, or zenity where no portal is available.
+rfd = "0.17.2"
+# A window's file watch: the system's change notifications, inotify on
+# Linux, ReadDirectoryChangesW on Windows, FSEvents on macOS and kqueue on
+# FreeBSD.
+notify = "8.2.1"
+
+# eframe, winit, tao, epaint, rfd and egui-wgpu are crates.io's with a
+# patch each from patches/, unpacked and patched by patches/apply.ps1,
+# which every build runs first. eframe's gives every viewport's window an
+# AccessKit adapter. winit's and tao's request no activation from macOS at
+# launch when a helper opens its windows without the focus. tao's, on Linux
+# and the BSDs, sends its window requests to the GTK main context through
+# async-channel and sets a progress bar and a window on all workspaces,
+# which 0.37.2 does on Linux alone. epaint's gives a galley's glyph
+# outlines. rfd's lets a dialog the XDG portal shows be
+# closed, reports where the portal cannot show it rather than falling back
+# to zenity, and reports when the portal has taken the request and shows
+# it. egui-wgpu's configures a window's surface again when the GPU layer's
+# thread submitted work while the configure waited for the GPU, which
+# wgpu-core refuses; it skips the frames of a surface no configure has set
+# up, where wgpu would panic, and of a lost device, where egui-wgpu would
+# panic. wgpu-core is the Wgpu module's vendored 30.0.1 with wgpu's fix for
+# the assertion a timed wait hits while another thread polls the same
+# device, which only the top workspace's patch applies.
+[patch.crates-io]
+wgpu-core = { path = "../Wgpu/vendor/wgpu-core" }
+tao = { path = "patched/tao-0.37.2" }
+winit = { path = "patched/winit-0.30.13" }
+eframe = { path = "patched/eframe-0.37.0" }
+epaint = { path = "patched/epaint-0.37.0" }
+egui-wgpu = { path = "patched/egui-wgpu-0.37.0" }
+rfd = { path = "patched/rfd-0.17.2" }
+# PWRS's tree beside the checkout, as ../pwrs, for every crate here that
+# builds on PoWerRuSt, the Wgpu library among them: the workspace builds on
+# PWRS's next release before it is published, and cargo-pwrs comes from the
+# same tree, since it embeds that runtime.
+PoWerRuSt = { path = "../pwrs/crates/pwrs" }
+
+# Modules ship from this profile, as PWRS's do: whole-program LTO, one
+# codegen unit, and unwinding left on so a panic is caught at the module
+# boundary rather than taking the host process down.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+
+# Development builds and test runs: release optimization without the
+# fat-LTO link.
+[profile.test-fast]
+inherits = "release"
+lto = false
+codegen-units = 16

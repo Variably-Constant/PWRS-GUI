@@ -1,0 +1,25 @@
+[package]
+name = "subetha-ffi-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The C test suite for subetha-ffi, compiled by the host's C compiler and run by cargo test on every gate host."
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# The suite against a library carrying every transport. Without it the
+# transports' entry points are the refusals, which the suite checks as
+# well, so the release gate runs it both ways.
+transports = ["subetha-ffi/transports", "subetha-ffi/tcp-tls-bridge"]
+
+[dependencies]
+subetha-ffi = { workspace = true, features = ["test-hooks"] }
+
+[build-dependencies]
+cc = "1.5.1"

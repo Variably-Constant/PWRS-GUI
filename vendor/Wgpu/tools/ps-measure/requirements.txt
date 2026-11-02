@@ -1,0 +1,8 @@
+# The Python the measuring scripts run on, with python -u -I -B.
+aggdraw==1.4.1
+attrs==26.1.0
+numpy==2.5.4
+pillow==13.0.0
+psd-tools==1.26.0
+scipy==1.18.1
+shapely==2.2.0

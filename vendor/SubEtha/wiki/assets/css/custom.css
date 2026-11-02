@@ -1,0 +1,8 @@
+/* Chroma marks a token its lexer does not understand as an error, such
+   as the colon of a PowerShell drive variable ($shm:name, $env:PATH).
+   Those are valid code, so the token renders as plain text. */
+.highlight .chroma .err,
+.dark .highlight .chroma .err {
+  color: inherit;
+  background-color: transparent;
+}

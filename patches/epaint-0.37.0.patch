@@ -1,0 +1,362 @@
+diff --git a/src/text/font_face.rs b/src/text/font_face.rs
+index d066659..d7abde1 100644
+--- a/src/text/font_face.rs
++++ b/src/text/font_face.rs
+@@ -5,7 +5,7 @@ use alloc::sync::Arc;
+ 
+ use ahash::HashMap;
+ use ecolor::Color32;
+-use emath::{GuiRounding as _, OrderedFloat, vec2};
++use emath::{GuiRounding as _, OrderedFloat, Pos2, pos2, vec2};
+ use self_cell::self_cell;
+ use skrifa::{GlyphId, MetadataProvider as _};
+ use vello_cpu::{color, kurbo};
+@@ -13,7 +13,7 @@ use vello_cpu::{color, kurbo};
+ use crate::{
+     ColorImage, TextOptions,
+     text::{
+-        FontTweak, GlyphBitmap, VariationCoords,
++        FontTweak, GlyphBitmap, GlyphSource, OutlineSegment, VariationCoords,
+         font_data::Blob,
+         glyph_atlas::SubpixelBin,
+         styled_metrics::{LocationHash, StyledMetrics},
+@@ -321,6 +321,45 @@ impl skrifa::outline::OutlinePen for VelloPen<'_> {
+     }
+ }
+ 
++/// Writes a glyph's outline as [`OutlineSegment`]s, its origin at `origin`,
++/// y growing downward.
++struct SegmentPen<'a> {
++    origin: Pos2,
++    out: &'a mut Vec<OutlineSegment>,
++}
++
++impl SegmentPen<'_> {
++    fn at(&self, x: f32, y: f32) -> Pos2 {
++        pos2(self.origin.x + x, self.origin.y - y)
++    }
++}
++
++impl skrifa::outline::OutlinePen for SegmentPen<'_> {
++    fn move_to(&mut self, x: f32, y: f32) {
++        let to = self.at(x, y);
++        self.out.push(OutlineSegment::MoveTo(to));
++    }
++
++    fn line_to(&mut self, x: f32, y: f32) {
++        let to = self.at(x, y);
++        self.out.push(OutlineSegment::LineTo(to));
++    }
++
++    fn quad_to(&mut self, cx0: f32, cy0: f32, x: f32, y: f32) {
++        let (control, to) = (self.at(cx0, cy0), self.at(x, y));
++        self.out.push(OutlineSegment::QuadTo(control, to));
++    }
++
++    fn curve_to(&mut self, cx0: f32, cy0: f32, cx1: f32, cy1: f32, x: f32, y: f32) {
++        let (first, second, to) = (self.at(cx0, cy0), self.at(cx1, cy1), self.at(x, y));
++        self.out.push(OutlineSegment::CubicTo(first, second, to));
++    }
++
++    fn close(&mut self) {
++        self.out.push(OutlineSegment::Close);
++    }
++}
++
+ /// A specific font face.
+ /// The interface uses points as the unit for everything.
+ pub struct FontFace {
+@@ -557,6 +596,38 @@ impl FontFace {
+         advance
+     }
+ 
++    /// Appends to `out` the outline of the glyph `source` names, drawn
++    /// unhinted at its size with its origin at `origin`, at the variation
++    /// location `coords` give after the face's tweak; false, with `out` as
++    /// it was, when the face has no outline for the glyph.
++    pub(super) fn outline_into(
++        &self,
++        source: &GlyphSource,
++        coords: &VariationCoords,
++        origin: Pos2,
++        out: &mut Vec<OutlineSegment>,
++    ) -> bool {
++        let font_data = self.font.borrow_dependent();
++        let Some(glyph) = font_data.outline_glyphs.get(GlyphId::new(source.glyph_id)) else {
++            return false;
++        };
++        let location = font_data
++            .skrifa
++            .axes()
++            .location(core::iter::chain(self.tweak.coords.as_ref(), coords.as_ref()));
++        let before = out.len();
++        let mut pen = SegmentPen { origin, out };
++        let settings = skrifa::outline::DrawSettings::unhinted(
++            skrifa::instance::Size::new(source.size),
++            &location,
++        );
++        if glyph.draw(settings, &mut pen).is_err() {
++            out.truncate(before);
++            return false;
++        }
++        true
++    }
++
+     /// `\n` will result in `None`.
+     ///
+     /// Caller must pass [`StyledMetrics`] resolved against *this* face so that
+diff --git a/src/text/fonts.rs b/src/text/fonts.rs
+index b5ea20e..5ffcaa1 100644
+--- a/src/text/fonts.rs
++++ b/src/text/fonts.rs
+@@ -4,8 +4,8 @@ use crate::{
+     Color32, ColorImage, TextureAtlas,
+     text::{
+         FontDefinitions, FontFamily, FontId, FontInsert, FontPriority, FontProvider, Galley,
+-        GlyphBitmap, GlyphRasterizer, GlyphRasterizerRequest, LayoutJob, RasterizedGlyph,
+-        TextOptions, VariationCoords,
++        GlyphBitmap, GlyphRasterizer, GlyphRasterizerRequest, LayoutJob, OutlineSegment,
++        RasterizedGlyph, TextOptions, VariationCoords,
+         face_store::{FaceStore, FontFaceKey},
+         family::{Family, FamilyKey},
+         font_face::{FontFace, GlyphInfo, ShapedGlyph},
+@@ -474,6 +474,42 @@ impl FontsView<'_> {
+     ) -> Arc<Galley> {
+         self.layout(text, font_id, Color32::PLACEHOLDER, wrap_width)
+     }
++
++    /// The outlines of `galley`'s glyphs as their faces draw them unhinted,
++    /// in points from the galley's top left, y growing downward, each
++    /// contour opened by a [`OutlineSegment::MoveTo`], and how many of its
++    /// glyphs could not be outlined: one drawn as a bitmap, a color glyph or
++    /// a rasterizer's, one whose face is no longer among these fonts, as
++    /// once [`Fonts::begin_pass`] has made them anew, or one whose face has
++    /// no outline for it. `coords` are the variation coordinates the
++    /// galley's text was formatted with.
++    pub fn galley_outlines(
++        &self,
++        galley: &Galley,
++        coords: &VariationCoords,
++    ) -> (Vec<OutlineSegment>, usize) {
++        let mut out = Vec::new();
++        let mut missed = 0;
++        for placed in &galley.rows {
++            for glyph in &placed.row.glyphs {
++                match &glyph.source {
++                    Some(source) if !glyph.is_color => {
++                        let origin = placed.pos + glyph.pos.to_vec2() + source.origin;
++                        let drawn = self
++                            .fonts
++                            .face(source.face)
++                            .is_some_and(|face| face.outline_into(source, coords, origin, &mut out));
++                        if !drawn {
++                            missed += 1;
++                        }
++                    }
++                    _ if glyph.uv_rect.is_nothing() => {}
++                    _ => missed += 1,
++                }
++            }
++        }
++        (out, missed)
++    }
+ }
+ 
+ // ----------------------------------------------------------------------------
+diff --git a/src/text/text_layout.rs b/src/text/text_layout.rs
+index 3482c80..3077c2e 100644
+--- a/src/text/text_layout.rs
++++ b/src/text/text_layout.rs
+@@ -18,8 +18,8 @@ use crate::{
+ };
+ 
+ use super::{
+-    ByteRangeExt as _, Galley, Glyph, LayoutJob, LayoutSection, PlacedRow, Row, RowVisuals,
+-    VariationCoords,
++    ByteRangeExt as _, Galley, Glyph, GlyphSource, LayoutJob, LayoutSection, PlacedRow, Row,
++    RowVisuals, VariationCoords,
+     family::FamilyKey,
+     font_face::{FontFace, GlyphInfo, ShapedGlyph},
+     glyph_atlas::{GlyphAllocation, OutlineGlyph, RasterGlyphAllocation},
+@@ -184,6 +184,7 @@ impl ShapingContext {
+         advance_width_px: f32,
+         face_metrics: &StyledMetrics,
+         alloc: GlyphAllocation,
++        source: Option<GlyphSource>,
+     ) -> Glyph {
+         let GlyphAllocation { uv_rect, is_color } = alloc;
+         Glyph {
+@@ -199,6 +200,7 @@ impl ShapingContext {
+             is_color,
+             section_index: self.section_index,
+             first_vertex: 0,
++            source,
+         }
+     }
+ }
+@@ -347,20 +349,25 @@ fn layout_shaped_run(
+                 }
+                 let advance_width_px =
+                     glyph_info.advance_width_unscaled.0 * fallback_metrics.px_scale_factor;
++                let h_pos = paragraph.cursor_x_px;
+                 let OutlineGlyph { allocation, x_px } = allocate_glyph_info(
+                     fonts,
+                     fallback_key,
+                     &fallback_metrics,
+                     glyph_info,
+-                    paragraph.cursor_x_px,
++                    h_pos,
+                     chr,
+                 );
+ 
+                 paragraph.cursor_x_px += advance_width_px;
+ 
+-                ctx.glyph(chr, x_px, advance_width_px, &fallback_metrics, allocation)
++                let source = glyph_info.id.map(|id| {
++                    GlyphSource::new(fallback_key, id, &fallback_metrics, h_pos - x_px as f32, 0.0)
++                });
++                ctx.glyph(chr, x_px, advance_width_px, &fallback_metrics, allocation, source)
+             }
+         } else {
++            let h_pos = paragraph.cursor_x_px + x_offset_px;
+             let OutlineGlyph {
+                 allocation: mut glyph_alloc,
+                 x_px,
+@@ -369,7 +376,7 @@ fn layout_shaped_run(
+                 face_metrics,
+                 &ShapedGlyph {
+                     glyph_id,
+-                    h_pos: paragraph.cursor_x_px + x_offset_px,
++                    h_pos,
+                     is_cjk: is_cjk(chr),
+                 },
+             );
+@@ -380,7 +387,14 @@ fn layout_shaped_run(
+ 
+             paragraph.cursor_x_px += advance_width_px;
+ 
+-            ctx.glyph(chr, x_px, advance_width_px, face_metrics, glyph_alloc)
++            let source = GlyphSource::new(
++                run.font_key,
++                glyph_id,
++                face_metrics,
++                h_pos - x_px as f32,
++                y_offset_px,
++            );
++            ctx.glyph(chr, x_px, advance_width_px, face_metrics, glyph_alloc, Some(source))
+         };
+         paragraph.glyphs.push(glyph);
+         cluster_glyph_count += 1;
+@@ -441,6 +455,7 @@ fn raster_glyph(
+         raster.advance_px,
+         face_metrics,
+         raster.allocation,
++        None,
+     )
+ }
+ 
+@@ -507,6 +522,7 @@ fn emit_continuation_glyphs(
+             0.0,
+             face_metrics,
+             GlyphAllocation::default(),
++            None,
+         ));
+     }
+ }
+@@ -946,6 +962,19 @@ fn replace_last_glyph_with_overflow_character(
+                 .line_height
+                 .unwrap_or(font_metrics.row_height);
+ 
++            let source = match &raster {
++                Some(_) => None,
++                None => glyph_info.id.map(|id| {
++                    GlyphSource::new(
++                        face_key,
++                        id,
++                        &font_face_metrics,
++                        overflow_glyph_x * pixels_per_point - x_px as f32,
++                        0.0,
++                    )
++                }),
++            };
++
+             row.glyphs.push(Glyph {
+                 chr: overflow_character,
+                 pos: pos2(x_px as f32 / pixels_per_point, f32::NAN),
+@@ -959,6 +988,7 @@ fn replace_last_glyph_with_overflow_character(
+                 is_color: replacement_glyph_alloc.is_color,
+                 section_index,
+                 first_vertex: 0, // filled in later
++                source,
+             });
+             return;
+         }
+diff --git a/src/text/text_layout_types.rs b/src/text/text_layout_types.rs
+index 8d07864..7246b50 100644
+--- a/src/text/text_layout_types.rs
++++ b/src/text/text_layout_types.rs
+@@ -3,8 +3,10 @@ use core::{ops::Range, str::FromStr as _};
+ 
+ use super::{
+     cursor::{CCursor, LayoutCursor},
++    face_store::FontFaceKey,
+     glyph_atlas::UvRect,
+     index::{ByteIndex, ByteRange, ByteRangeExt as _, CharIndex},
++    styled_metrics::StyledMetrics,
+ };
+ use crate::{Color32, FontId, Mesh, Stroke, text::FontsView};
+ use emath::{Align, GuiRounding as _, NumExt as _, OrderedFloat, Pos2, Rect, Vec2, pos2, vec2};
+@@ -938,6 +940,53 @@ pub struct Glyph {
+ 
+     /// Which is our first vertex in [`RowVisuals::mesh`].
+     pub first_vertex: u32,
++
++    /// The face and glyph it is drawn from, which
++    /// [`FontsView::galley_outlines`] outlines; `None` for a glyph drawn
++    /// from no face's outline: one that draws nothing, as a cluster's
++    /// continuation does, or a bitmap a rasterizer made.
++    #[cfg_attr(feature = "serde", serde(skip))]
++    pub source: Option<GlyphSource>,
++}
++
++/// The font face and glyph a [`Glyph`] is drawn from, the size the face
++/// draws it at, and where its origin, on the baseline, lies from
++/// [`Glyph::pos`].
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct GlyphSource {
++    pub(crate) face: FontFaceKey,
++    pub(crate) glyph_id: u32,
++
++    /// In points, the face's tweak applied.
++    pub(crate) size: f32,
++
++    /// In points.
++    pub(crate) origin: Vec2,
++}
++
++impl GlyphSource {
++    /// The source of glyph `glyph_id` of `face`, drawn with `metrics`, its
++    /// origin `x_px` and `y_px` physical pixels from where the glyph is
++    /// placed, as the shaper offsets it.
++    pub(crate) fn new(face: FontFaceKey, glyph_id: skrifa::GlyphId, metrics: &StyledMetrics, x_px: f32, y_px: f32) -> Self {
++        let ppp = metrics.pixels_per_point;
++        Self {
++            face,
++            glyph_id: glyph_id.to_u32(),
++            size: metrics.scale / ppp,
++            origin: vec2(x_px / ppp, metrics.y_offset_in_points + y_px / ppp),
++        }
++    }
++}
++
++/// One step of a glyph's outline, in points, y growing downward.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub enum OutlineSegment {
++    MoveTo(Pos2),
++    LineTo(Pos2),
++    QuadTo(Pos2, Pos2),
++    CubicTo(Pos2, Pos2, Pos2),
++    Close,
+ }
+ 
+ impl Glyph {

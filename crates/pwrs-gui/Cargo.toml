@@ -1,0 +1,120 @@
+[package]
+name = "pwrs-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Windows, dialogs and grids for PowerShell, drawn by Rust renderers in a helper process the module starts, or on Windows in the module itself."
+keywords = ["powershell", "gui", "egui", "wgpu"]
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+# The renderers' processes, shipped beside the native library.
+[[bin]]
+name = "pwrs-gui-egui"
+path = "src/bin/pwrs-gui-egui.rs"
+
+[[bin]]
+name = "pwrs-gui-web"
+path = "src/bin/pwrs-gui-web.rs"
+
+[dependencies]
+pwrs.workspace = true
+pwrs-gui-proto = { path = "../pwrs-gui-proto" }
+pwrs-gui-client = { path = "../pwrs-gui-client" }
+pwrs-gui-egui = { path = "../pwrs-gui-egui" }
+pwrs-gui-web = { path = "../pwrs-gui-web" }
+arc-swap.workspace = true
+serde_json.workspace = true
+# Save-GuiGpuSurface writes a surface's texels as a PNG.
+png.workspace = true
+# The Wgpu module's element types and its conversions between PowerShell
+# arrays and GPU bytes, which the GPU commands use as its cmdlets do.
+wgpu-pwsh.workspace = true
+# A compute pass's entry point and workgroup size, for an HTML page's
+# surface, which reads no shader.
+naga.workspace = true
+
+[package.metadata.pwrs]
+helpers = ["pwrs-gui-egui", "pwrs-gui-web"]
+# Licenses beyond cargo-pwrs's permissive defaults. egui's bundled fonts
+# (epaint_default_fonts) are under OFL-1.1 and Ubuntu-font-1.0. MPL-2.0
+# covers option-ext, which wry links through dirs on Linux, the BSDs and
+# Apple systems.
+allowed-licenses = ["OFL-1.1", "Ubuntu-font-1.0", "MPL-2.0"]
+
+# License texts for linked crates whose packages ship none: each file contains
+# the license files of the crate's repository at the commit its package
+# names, and SPDX's text of the license the crate declares where those
+# files contain none; the workspace's own crates take the workspace LICENSE,
+# but pwrs-gui-egui, whose folder has a copy of it beside the notice of the
+# code it takes from egui_commonmark.
+[package.metadata.pwrs.license-files]
+"accesskit@0.25.2" = "licenses/accesskit-0.25.2.txt"
+"accesskit_consumer@0.39.2" = "licenses/accesskit_consumer-0.39.2.txt"
+"accesskit_winit@0.34.2" = "licenses/accesskit_winit-0.34.2.txt"
+"bcdec_rs@0.2.1" = "licenses/bcdec_rs-0.2.1.txt"
+"ecolor@0.37.0" = "licenses/ecolor-0.37.0.txt"
+"eframe@0.37.0" = "licenses/eframe-0.37.0.txt"
+"egui@0.37.0" = "licenses/egui-0.37.0.txt"
+"egui-wgpu@0.37.0" = "licenses/egui-wgpu-0.37.0.txt"
+"egui-winit@0.37.0" = "licenses/egui-winit-0.37.0.txt"
+"egui_extras@0.37.0" = "licenses/egui_extras-0.37.0.txt"
+"egui_plot@0.38.0" = "licenses/egui_plot-0.38.0.txt"
+"emath@0.37.0" = "licenses/emath-0.37.0.txt"
+"enum-map@3.1.0" = "licenses/enum-map-3.1.0.txt"
+"epaint@0.37.0" = "licenses/epaint-0.37.0.txt"
+"epaint_default_fonts@0.37.0" = "licenses/epaint_default_fonts-0.37.0.txt"
+"lyon_algorithms@1.0.22" = "licenses/lyon_algorithms-1.0.22.txt"
+"lyon_geom@1.0.20" = "licenses/lyon_geom-1.0.20.txt"
+"lyon_path@1.0.19" = "licenses/lyon_path-1.0.19.txt"
+"lyon_tessellation@1.0.23" = "licenses/lyon_tessellation-1.0.23.txt"
+"profiling@1.0.18" = "licenses/profiling-1.0.18.txt"
+"pulp-wasm-simd-flag@0.1.1" = "licenses/pulp-wasm-simd-flag-0.1.1.txt"
+"pwrs-gui-client@0.1.0" = "../../LICENSE"
+"pwrs-gui-dialogs@0.1.0" = "../../LICENSE"
+"pwrs-gui-gpu@0.1.0" = "../../LICENSE"
+"pwrs-gui-proto@0.1.0" = "../../LICENSE"
+"pwrs-gui-web@0.1.0" = "../../LICENSE"
+"spirv@0.4.0+sdk-1.4.341.0" = "licenses/spirv-0.4.0+sdk-1.4.341.0.txt"
+"zune-inflate@0.2.54" = "licenses/zune-inflate-0.2.54.txt"
+
+# Crates only the Windows build links.
+[package.metadata.pwrs.license-files.'cfg(windows)']
+"accesskit_windows@0.35.2" = "licenses/accesskit_windows-0.35.2.txt"
+"clipboard-win@5.4.3" = "licenses/clipboard-win-5.4.3.txt"
+"webview2-com@0.39.1" = "licenses/webview2-com-0.39.1.txt"
+"webview2-com-sys@0.39.1" = "licenses/webview2-com-sys-0.39.1.txt"
+
+# Crates only the Linux and BSD builds link, under the cfg accesskit_winit
+# takes accesskit_unix under and tao takes dlopen2 under.
+[package.metadata.pwrs.license-files.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))']
+"accesskit_atspi_common@0.21.1" = "licenses/accesskit_atspi_common-0.21.1.txt"
+"accesskit_unix@0.24.1" = "licenses/accesskit_unix-0.24.1.txt"
+"dlopen2@0.8.2" = "licenses/dlopen2-0.8.2.txt"
+
+# Crates only the macOS build links.
+[package.metadata.pwrs.license-files.'cfg(target_os = "macos")']
+"accesskit_macos@0.27.2" = "licenses/accesskit_macos-0.27.2.txt"
+"block2@0.5.1" = "licenses/block2-0.5.1.txt"
+"block2@0.6.2" = "licenses/block2-0.6.2.txt"
+"dispatch@0.2.0" = "licenses/dispatch-0.2.0.txt"
+"dispatch2@0.3.1" = "licenses/dispatch2-0.3.1.txt"
+"objc-sys@0.3.5" = "licenses/objc-sys-0.3.5.txt"
+"objc2@0.5.3" = "licenses/objc2-0.5.3.txt"
+"objc2@0.6.5" = "licenses/objc2-0.6.5.txt"
+"objc2-app-kit@0.2.2" = "licenses/objc2-app-kit-0.2.2.txt"
+"objc2-app-kit@0.3.2" = "licenses/objc2-app-kit-0.3.2.txt"
+"objc2-core-foundation@0.3.2" = "licenses/objc2-core-foundation-0.3.2.txt"
+"objc2-core-graphics@0.3.2" = "licenses/objc2-core-graphics-0.3.2.txt"
+"objc2-core-services@0.3.2" = "licenses/objc2-core-services-0.3.2.txt"
+"objc2-encode@4.1.0" = "licenses/objc2-encode-4.1.0.txt"
+"objc2-exception-helper@0.1.1" = "licenses/objc2-exception-helper-0.1.1.txt"
+"objc2-foundation@0.2.2" = "licenses/objc2-foundation-0.2.2.txt"
+"objc2-foundation@0.3.2" = "licenses/objc2-foundation-0.3.2.txt"
+"objc2-metal@0.3.2" = "licenses/objc2-metal-0.3.2.txt"
+"objc2-quartz-core@0.3.2" = "licenses/objc2-quartz-core-0.3.2.txt"
+"objc2-web-kit@0.3.2" = "licenses/objc2-web-kit-0.3.2.txt"

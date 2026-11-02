@@ -1,0 +1,62 @@
+[package]
+name = "pwrs-gui-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "PWRS-GUI's HTML renderer: draws each window the module opens in a webview of its own, from a widget runtime loaded from memory, and reports what people do in it."
+publish = false
+
+[dependencies]
+pwrs-gui-proto = { path = "../pwrs-gui-proto", features = ["typeface"] }
+pwrs-gui-dialogs = { path = "../pwrs-gui-dialogs" }
+# The fonts text is drawn in by default, given to pages first ([`look`]).
+pwrs-gui-fonts = { path = "../pwrs-gui-fonts" }
+arc-swap.workspace = true
+# egui's own fonts, given to pages after the system's ([`look`]).
+epaint_default_fonts = "0.37.0"
+serde_json.workspace = true
+tao.workspace = true
+wry.workspace = true
+# A Markdown widget's document written as HTML ([`markdown`]) by pulldown-cmark's
+# writer.
+pulldown-cmark = { workspace = true, features = ["html"] }
+# A GpuSurface draw's WGSL written as GLSL ES 3.00 for a page with WebGL 2
+# alone ([`glsl`]), by the naga wgpu 30 builds with.
+naga = { workspace = true, features = ["glsl-out"] }
+
+# Each engine's capture, process events, chrome settings and a test's input
+# ([`input`]), through the binding crates wry links ([`chrome`]). They also
+# give each system's process start times and double-click settings. On
+# Windows they bring a new window to the front and read the environment of a
+# Fixed Version runtime ([`fixed`]). On Linux and the BSDs they give GTK's
+# hint style for the pages' text, and on macOS they show a window without
+# the focus and find the system's buttons over a frameless page
+# ([`app_window`]).
+[target.'cfg(windows)'.dependencies]
+png.workspace = true
+webview2-com.workspace = true
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_Globalization", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies]
+webkit2gtk.workspace = true
+cairo-rs.workspace = true
+gtk.workspace = true
+libc.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+png.workspace = true
+block2.workspace = true
+libc.workspace = true
+objc2.workspace = true
+objc2-app-kit = { workspace = true, features = ["NSBitmapImageRep", "NSButton", "NSControl", "NSEvent", "NSGraphicsContext", "NSImage", "NSImageRep", "NSResponder", "NSTrackingArea", "NSView", "NSWindow"] }
+objc2-foundation = { workspace = true, features = ["NSArray", "NSBundle", "NSData", "NSDate", "NSDictionary", "NSEnumerator", "NSError", "NSGeometry", "NSProcessInfo", "NSString", "NSUUID"] }
+objc2-web-kit = { workspace = true, features = ["WKSnapshotConfiguration", "WKWebView", "WKWebsiteDataStore", "block2", "objc2-app-kit"] }
+
+# The page's canvas script, run against the protocol crate's own
+# arithmetic in the parity tests ([`canvas_parity`]), and its pointer's
+# clicks and drags against egui's own, the version the egui renderer runs.
+[dev-dependencies]
+boa_engine = "0.22.0"
+egui = { version = "0.37.0", default-features = false }

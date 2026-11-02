@@ -1,0 +1,32 @@
+# Rust build output. One directory for the whole workspace.
+/target
+
+# The crates.io crates patches/apply.ps1 unpacks and patches, which the
+# workspace's [patch.crates-io] entries point at.
+/patched
+
+# The fetched csc toolchain, when PWRS_HOME points inside the checkout
+# instead of at ~/.pwrs.
+/.pwrs
+
+# Local tools for running gates and timed runs on the build hosts.
+/_tools/
+
+# Instructions written for coding assistants working in this
+# checkout. They are local working notes, not part of the project.
+/CLAUDE.md
+/AGENTS.md
+/.claude/
+
+# The internal design record: the decisions and the reasoning behind
+# them, kept for whoever works on this checkout. What a consumer of the
+# project needs is in README.md, docs/ and wiki/.
+/docs/DESIGN.md
+
+# Editor and operating system state.
+.vs/
+.vscode/
+.idea/
+*.user
+.DS_Store
+Thumbs.db

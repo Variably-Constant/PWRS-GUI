@@ -1,0 +1,670 @@
+//! `subetha-cxc` - CXC (Cross-Context Channel): memory-mapped file
+//! primitives for cross-thread, cross-process, and disk-persistent
+//! communication.
+//!
+//! The name comes from Douglas Adams's *Hitchhiker's Guide to the
+//! Galaxy*: the Sub-Etha Sens-O-Matic uses sub-etheric waves to
+//! communicate **around** conventional channels. CXC does the same
+//! thing - it skips the kernel's conventional channel (named pipes,
+//! sockets, IPC handles) and writes directly to user-space memory
+//! the kernel page-aliases between participants.
+//!
+//! Four cooperating modules:
+//! - [`shared_ring`]: MPMC lock-free ring backed by an MMF
+//! - [`heartbeat`]: per-process liveness slots in an MMF table
+//! - [`failover`]: watchdog that reclaims work from dead processes
+//! - [`pass_registry`]: closure registry for cross-process Pass dispatch
+//! - [`scheduler`]: BackgroundScheduler tying the above into an
+//!   autonomous executor
+//!
+//! # How many producers, how many consumers
+//!
+//! Several queue primitives here give a single thread ownership of one end.
+//! Exceeding that is not slow, it is a data race, and the usual symptom
+//! is a hang rather than an error. The counts are the first thing to
+//! check when picking one:
+//!
+//! | Primitive | Producers | Consumers | Why |
+//! |---|---|---|---|
+//! | [`mpmc_ring`] `SharedRingMpmc` | N | M | N Lamport SPSC rings; each consumer sole-drains a round-robin subset, so neither side CASes |
+//! | [`shared_deque`] `SharedDeque` | **1** | N | Chase-Lev: the owner's `bottom` push/pop is a Relaxed store with no CAS. A second producer races the index |
+//! | [`adaptive_ring`] under `MergeByStamp` / `MergeStrict` | N | **1** | the k-way merge that makes stamps monotone runs under the single-drainer lease |
+//! | [`spsc_ring`] | 1 | 1 | pure Lamport |
+//!
+//! A consumer that holds no drainer lease on a merge-ordered
+//! [`adaptive_ring`] never makes progress and spins; the lease has to be
+//! acquired and renewed, and a silent drainer becomes preemptible after
+//! a grace window counted in drainer epochs.
+//!
+//! [`dispatch_deque`] routes across the deque family by `WorkloadShape`
+//! when the choice is per-call rather than fixed.
+//!
+//! # The unifying mechanism
+//!
+//! Every primitive in this crate uses one mechanism: a file-mapped
+//! MMF region. That single mechanism gives:
+//!
+//! 1. **Cross-thread** communication (threads in one process map the
+//!    same file; lock-free CAS handles concurrency).
+//! 2. **Cross-process** communication (different processes open the
+//!    same file; the OS page-cache aliases them onto the same
+//!    physical pages).
+//! 3. **Disk persistence** (the MMF is backed by a real file; data
+//!    survives process death and can be reopened later).
+//!
+//! The same byte layout serves all three. There is no separate
+//! "shared memory" vs "disk" abstraction; the MMF is both at once.
+//!
+//! # Architectural pattern
+//!
+//! Bare OS IPC primitives (named pipes, sockets, anonymous shared
+//! memory) hide useful metadata: which logical stream a message
+//! belongs to, what priority it has, whether the peer is alive,
+//! when the data needs to hit disk. The protocol layer here names
+//! each of those as a first-class field so the application can
+//! reason about (and direct) the substrate's behavior.
+//!
+//! The win over OS pipes/sockets is the same shape as QUIC over
+//! TCP: userspace transport eliminates the kernel from the hot
+//! path. A pipe write costs ~20us (CreateFile + WriteFile
+//! syscalls); a SharedRing slot publish is ~50-200ns (atomic CAS +
+//! fence). That's a ~100x improvement that vanishes the moment a
+//! Mutex enters the picture.
+
+pub mod sidecar_ops;
+
+pub mod cached_clock;
+pub mod holder_table;
+pub mod shared_arc;
+pub mod shared_epochs;
+pub mod versioned_btree_map;
+pub(crate) mod chunk_pool;
+pub mod shared_versioned_index;
+pub mod epoch_barrier;
+pub mod event_state_log;
+pub mod failover;
+pub mod k_tower_cascade;
+pub mod heartbeat;
+pub mod lazy_config;
+pub mod pass_registry;
+pub mod priority_fanout;
+pub mod progress_task;
+pub mod reorder;
+pub mod scheduler;
+pub mod shared_async_pointer;
+pub mod shared_atomic;
+pub mod shared_bit_vec;
+pub mod shared_blocked_bloom_filter;
+pub mod shared_bloom_filter;
+pub mod shared_btree_map;
+pub mod shared_broadcast_ring;
+pub mod shared_cell;
+pub mod shared_count_min_sketch;
+pub mod adaptive_ipc;
+pub mod api;
+pub mod dispatch_deque;
+pub mod message_transport;
+pub mod mmf_dispatcher;
+pub mod cross_process_notifier;
+pub mod raw_btree_map;
+pub mod raw_cell;
+pub mod raw_deque;
+pub mod raw_graph;
+pub mod shared_array;
+pub mod raw_hash_map;
+pub mod raw_arena;
+pub mod shared_named_values;
+pub mod raw_linked_list;
+pub mod raw_k_tower;
+pub mod raw_lru_cache;
+pub mod raw_region;
+pub mod raw_time_point;
+pub mod raw_umbra_pointer;
+pub mod raw_universal;
+/// The lock-free set table both strategies of the strategy-switching set
+/// store their keys in.
+pub(crate) mod set_table;
+/// A test-build trace of what writers, carriers and passes did to the set
+/// tables a test names.
+#[cfg(test)]
+pub(crate) mod set_trace;
+/// The lock-free CLOCK cache the shared and raw LRU caches are faces of.
+pub(crate) mod clock_cache;
+/// Two 64-bit halves read, written and swapped as one 16-byte word.
+pub(crate) mod atomic_pair;
+/// Copies into and out of shared memory another participant may touch
+/// meanwhile, a whole element at a time.
+pub(crate) mod atomic_copy;
+/// Offsets into a mapping held as integers relative to a base the reader
+/// supplies, packed two or four to an atomic word when they change together.
+pub mod atomic_offset;
+/// Indexes from a bump counter below a limit, refused at the limit without
+/// a write.
+pub(crate) mod bump;
+/// A process's pid and start stamp, so a holder whose pid the system handed
+/// to another process reads as gone.
+pub(crate) mod process_identity;
+/// One element slot of two buffers and a head naming the current one,
+/// written and read by any number of processes at once.
+pub(crate) mod slot_pair;
+/// The push, pop, read and write the shared and raw vecs share: a top word
+/// and slots that each claim and publish an element with one swap.
+pub(crate) mod vec_core;
+/// The lock-free doubly linked list the shared and raw linked lists are
+/// faces of.
+pub(crate) mod list_core;
+/// Flags set by the operating system's process exit events.
+pub(crate) mod exit_watch;
+/// A debug-build trace of what happened to a ring's ownership and its
+/// pops, so a two-reader failure can say what the other thread did.
+#[cfg(debug_assertions)]
+pub mod ring_trace;
+pub mod raw_slab;
+/// The laned versioned map with its key and value sizes given at run
+/// time, for callers that cannot name them in the type system.
+pub mod raw_laned_versioned_map;
+/// The versioned B-tree map with its key and value sizes given at run
+/// time, for callers that cannot name them in the type system.
+pub mod raw_versioned_btree_map;
+/// The versioned index with its key and value sizes given at run time,
+/// for callers that cannot name them in the type system.
+pub mod raw_shared_versioned_index;
+/// The versioned slab with its value size and chain depth given at run
+/// time, for callers that cannot name them in the type system.
+pub mod raw_versioned_slab;
+pub mod raw_treiber_stack;
+pub mod raw_vec;
+pub mod shared_holder_table;
+pub mod shared_deque;
+pub mod shared_deque_fcl;
+pub mod shared_deque_khl;
+pub mod shared_deque_khpd;
+pub mod shared_deque_loh;
+pub mod shared_deque_urd;
+pub mod shared_fence_clock;
+pub mod shared_graph;
+pub mod shared_handle_table;
+pub mod shared_hash_map;
+pub mod shared_histogram;
+pub mod shared_hyper_log_log;
+pub mod shared_leader_election;
+pub mod shared_linked_list;
+pub mod shared_lru_cache;
+pub mod shared_nan_tagged_value;
+pub mod shared_nan_value;
+pub mod shared_once_cell;
+pub mod shared_rate_limiter;
+pub mod shared_region;
+pub mod shared_reservoir_sampler;
+pub mod cpu_affinity;
+mod run_state;
+mod take_slot;
+mod unbounded_queue;
+mod waker_slot;
+mod warm_slot;
+pub mod task_pool;
+pub mod waker_ring;
+pub mod ring_executor;
+pub mod reactor;
+pub mod net_bridge;
+
+/// The README, whose Rust examples `cargo test --doc` compiles.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;
+
+pub mod shared_ring;
+pub mod spsc_ring;
+pub mod frame_ring;
+pub mod frame_region;
+pub mod mpsc_ring;
+pub mod mpmc_ring;
+pub mod adaptive_ring;
+pub mod ring_contract;
+pub mod capacity_adaptive_ring;
+pub mod policy_gate;
+pub mod unified_policy;
+pub mod phase_estimator;
+pub mod capacity_broadcast_ring;
+pub mod capacity_pubsub_ring;
+pub mod async_ring;
+pub mod blocking_spsc_ring;
+pub mod blocking_mpsc_ring;
+pub mod blocking_mpmc_ring;
+pub mod blocking_adaptive_ring;
+pub mod blocking_broadcast_ring;
+pub mod blocking_capacity_ring;
+pub mod blocking_deque;
+pub mod blocking_locale_ring;
+pub mod blocking_stack;
+pub mod blocking_vyukov_ring;
+pub mod blocking_wait;
+pub mod byte_value;
+#[cfg(feature = "tcp-bridge")]
+pub mod blocking_tcp_bridge;
+pub mod bbr;
+pub mod cache_ops;
+pub mod control_frame;
+/// The wire specification's packet-type table, read back so the modules
+/// owning those constants assert against it.
+#[cfg(test)]
+mod spec_doc;
+pub mod control_table;
+pub mod fec;
+/// Residue erasure coding, behind the `residue-fec` feature and off by
+/// default.
+///
+/// It is correct and its seven tests pass, and it is not what a caller
+/// wants: it encodes about 210 times slower than [`rlc_fec`] and
+/// recovers about 135 times slower, it costs slightly more on the wire,
+/// and it is a block code, so a loss waits for the rest of its block
+/// where the sliding window does not. The one thing it had that
+/// [`rlc_fec`] did not - a construction that generates no coefficient -
+/// the published taps now have too.
+///
+/// It stays because it rests on none of the reasoning the taps rest on,
+/// so it is the fallback if that reasoning does not survive review. It
+/// is gated rather than published because its own notes say the
+/// optimizations worth trying would change its moduli and its chunk
+/// mapping, and a published module is an API promise not to.
+#[cfg(feature = "residue-fec")]
+pub mod residue_fec;
+pub mod rlc_fec;
+pub mod rlc_control;
+#[cfg(feature = "tls")]
+pub mod rlc_crypto;
+pub mod dgram;
+/// Sens-O-Matic transport carrying the sliding-window RLC erasure code (the
+/// adaptive, optionally-TLS code; the block Reed-Solomon code lives in
+/// [`udp_bridge`]). The RLC coding internals are in [`rlc_fec`] / [`rlc_control`].
+pub mod sens_rlc;
+/// Unified Sens-O-Matic endpoint: one transport carrying both erasure codes,
+/// switching RLC <-> RS mid-stream on the loss the receiver feeds back (the
+/// loss-driven auto-switch, with operator override).
+pub mod sens_unified;
+pub mod fusion;
+pub mod interleave;
+pub mod link_sensor;
+pub mod compressed_udp;
+pub mod reliable_udp;
+pub mod salvage;
+pub mod schema_codec;
+pub mod sharded_udp;
+pub mod path_sensor;
+pub mod path_model_sensor;
+pub mod net_events;
+pub mod stream_mux;
+pub mod wbest_sensor;
+pub mod trace_sensor;
+pub mod forecast_sensor;
+pub mod periodicity_sensor;
+pub mod rtt_shape_sensor;
+pub mod burst_model_sensor;
+pub mod loss_class_sensor;
+pub mod temporal_sensor;
+pub mod tower;
+pub mod udp_bridge;
+pub mod claim;
+pub mod cross_process_waker;
+#[cfg(windows)]
+mod park_event;
+pub mod shared_condvar;
+pub mod locale_adaptive_ring;
+mod mmf_attach;
+mod move_watch;
+pub mod mmf_warm;
+pub mod monitor_wait;
+pub mod host_load;
+pub mod wait_active;
+pub mod wait_calibration;
+pub mod wait_instr;
+pub mod wait_plan;
+pub mod wait_topology;
+pub mod net_tune;
+pub mod ordering;
+pub mod peer_directory;
+pub mod protocol_pubsub;
+/// Opening and removing a file-backed region, in one place, so a
+/// removal means the same thing on every platform.
+pub mod region_file;
+pub mod ring_holders;
+pub mod qos_policy;
+pub mod replay_positions;
+pub mod laned_versioned_map;
+/// What a file holds against what a call asked for, carried by every
+/// layout-mismatch error.
+pub mod layout;
+pub mod shared_slab;
+pub mod shared_versioned_slab;
+#[cfg(test)]
+pub(crate) mod test_paths;
+#[cfg(test)]
+pub(crate) mod test_races;
+pub mod shm_file;
+pub mod virtual_endpoint;
+#[cfg(target_os = "linux")]
+pub mod hugepages;
+#[cfg(windows)]
+pub mod large_pages;
+#[cfg(any(target_os = "freebsd", target_os = "macos"))]
+pub mod super_pages;
+#[cfg(any(target_os = "linux", windows))]
+pub mod locale_vsock;
+#[cfg(any(unix, windows))]
+pub mod protocol_direct_file;
+#[cfg(any(unix, windows))]
+pub mod fd_handoff;
+#[cfg(any(target_os = "linux", windows, target_os = "freebsd", target_os = "macos"))]
+pub mod kernel_async_ring;
+#[cfg(all(
+    any(target_os = "linux", windows, target_os = "freebsd", target_os = "macos"),
+    feature = "wire-locale"
+))]
+pub mod locale_wire;
+#[cfg(any(feature = "tcp-bridge", feature = "quic-bridge"))]
+mod bridge_wire;
+#[cfg(feature = "quic-bridge")]
+pub mod quic_bridge;
+#[cfg(feature = "quic-bridge")]
+pub mod sens_quic;
+#[cfg(feature = "tcp-bridge")]
+pub mod tcp_bridge;
+#[cfg(feature = "tcp-tls-bridge")]
+pub mod tcp_tls_bridge;
+pub mod shared_string_arena;
+pub mod shared_time_point;
+pub mod shared_topology_map;
+pub mod shared_treiber_stack;
+pub mod shared_umbra_pointer;
+pub mod shared_universal;
+pub mod shared_vec;
+pub mod shared_versioned_chain;
+pub mod tagged_offset_ptr;
+
+pub use atomic_offset::{AtomicOffset, AtomicRel, Pair32, Quad32, Tagged32};
+pub use epoch_barrier::{BarrierError, EpochBarrier, DEFAULT_BARRIER_GRACE_EPOCHS};
+pub use event_state_log::{EventLogError, EventStateLog};
+pub use failover::{FailoverWatchdog, ReclaimReport, DEFAULT_GRACE_EPOCHS};
+pub use k_tower_cascade::{
+    CascadeError, CascadeResolver2, CascadeResolverN, KTowerCascade,
+    NIL_INDEX as CASCADE_NIL_INDEX,
+};
+pub use lazy_config::{LazyConfig, LazyConfigError};
+pub use heartbeat::{
+    HeartbeatError, HeartbeatHeader, HeartbeatSlot, HeartbeatSnapshot,
+    HeartbeatTable, EMPTY_PID, HEARTBEAT_MAGIC, IN_FLIGHT_SLOTS,
+};
+pub use pass_registry::{
+    execute as execute_pass, is_registered, register as register_handler,
+    registered_count, unregister as unregister_handler,
+    Pass, PassError, PassHandler, PassResult,
+};
+pub use priority_fanout::{FanoutError, PriorityFanout, MAX_PRIORITIES};
+pub use progress_task::{ProgressReporter, ProgressTask, ProgressTaskError};
+pub use scheduler::{
+    BackgroundScheduler, ResultCollector, SchedError, SubmittedResult,
+    Submitter,
+};
+pub use shared_async_pointer::{SharedAsyncError, SharedAsyncPointer};
+pub use shared_atomic::{
+    SharedAtomicBool, SharedAtomicError, SharedAtomicU32, SharedAtomicU64,
+};
+pub use shared_bit_vec::{
+    bit_vec_file_size, BitVecError, BitVecHeader, SharedBitVec,
+    BITS_PER_WORD, BITVEC_MAGIC,
+};
+pub use shared_blocked_bloom_filter::{
+    BlockedBloomError, SharedBlockedBloomFilter,
+};
+pub use shared_bloom_filter::{
+    BloomError, BloomHeader, SharedBloomFilter, BLOOM_MAGIC,
+};
+pub use shared_broadcast_ring::{
+    broadcast_file_size, BroadcastError, BroadcastHeader, BroadcastSlot,
+    SharedBroadcastRing, BROADCAST_MAGIC, BROADCAST_PAYLOAD_BYTES,
+    MAX_CONSUMERS,
+};
+pub use shared_cell::{
+    CellHeader, SharedCell, SharedCellError, CELL_FILE_SIZE, CELL_MAGIC,
+    PAYLOAD_BYTES as CELL_PAYLOAD_BYTES,
+};
+pub use shared_count_min_sketch::{
+    cms_file_size, CMSError, CMSHeader, SharedCountMinSketch, CMS_MAGIC,
+};
+pub use dispatch_deque::{
+    DequeDispatcher, DequeVariant, DispatchError, DispatcherBuilder, WorkloadShape,
+};
+pub use message_transport::{MessageTransport, PassSlot, TransportError};
+pub use mmf_dispatcher::{MmfDispatcher, MmfFamily, MmfWorkloadShape};
+pub use api::{ApiError, AutoIpc, Channel, KvMap, WorkStealQueue};
+pub use adaptive_ipc::{
+    AdaptiveIpc, AdaptiveIpcSidecar, PinnedIpc, ProfileSnapshot,
+};
+pub use shared_deque::{
+    deque_file_size, slot_bytes_for, DequeError, DequeHeader, SharedDeque, DEQUE_MAGIC,
+};
+pub use shared_deque_fcl::SharedDequeFcl;
+pub use shared_deque_khl::{
+    khl_file_size, KhlHeader, KhlSlot, PublishRadius as KhlPublishRadius,
+    PushError as KhlPushError, SharedDequeKhl, Steal as KhlSteal,
+    StealResult as KhlStealResult, KHL_ITEMS_PER_SLOT, KHL_MAGIC, KHL_SLOT_SIZE,
+};
+pub use shared_deque_khpd::{
+    khpd_file_size, FatLineItem, KhpdHeader, KhpdStager, LineItem, PublicationLine,
+    PushError as KhpdPushError, SharedDequeKhpd, Steal as KhpdSteal,
+    StealResult as KhpdStealResult, KHPD_ITEM_BYTES, KHPD_LINE_SIZE, KHPD_MAGIC,
+    LINE_ITEMS,
+};
+pub use shared_deque_loh::{
+    loh_file_size, LcrqJobSlot, LohHeader, LohStager, PushError as LohPushError,
+    SharedDequeLoh, Steal as LohSteal, StealResult as LohStealResult,
+    DEFAULT_LIFO_CAP as LOH_DEFAULT_LIFO_CAP, LOH_MAGIC, LOH_SLOT_SIZE,
+};
+pub use shared_deque_urd::{
+    urd_file_size, Drain as UrdDrain, DrainResult as UrdDrainResult, Mailbox,
+    PublishError as UrdPublishError, PublishStrategy as UrdPublishStrategy,
+    SharedDequeUrd, UrdHeader, WaitStrategy, MAILBOX_ITEMS, URD_MAGIC, URD_MAILBOX_SIZE,
+};
+pub use shared_fence_clock::{
+    fence_clock_file_size, FenceClockError, Hlc, HlcHeader, HlcSlot,
+    HlcSlotSnapshot, SharedFenceClock, FENCE_CLOCK_MAGIC,
+};
+pub use shared_graph::{
+    EdgeIndex, GraphEdge, GraphError, GraphNode, NodeIndex, SharedGraph,
+    NIL_INDEX as GRAPH_NIL_INDEX,
+};
+pub use shared_handle_table::{
+    handle_table_file_size, slot_offset, Handle, HandleHeader, HandleTableError,
+    SharedHandleTable, SharedSlot, HANDLE_TABLE_MAGIC, NIL_SLOT, SLOT_PAYLOAD_BYTES,
+};
+pub use shared_hash_map::{
+    fnv1a_64, map_file_size, InsertOutcome, MapError, MapHeader, MapSlot,
+    SharedHashMap, MAP_MAGIC, MAP_PAYLOAD_BYTES,
+    SLOT_EMPTY, SLOT_OCCUPIED, SLOT_TOMBSTONE,
+};
+pub use shared_histogram::{
+    histogram_file_size, HistogramError, HistogramHeader, SharedHistogram,
+    HISTOGRAM_MAGIC,
+};
+pub use shared_hyper_log_log::{
+    hll_file_size, HLLError, HLLHeader, SharedHyperLogLog,
+    HLL_MAGIC, MAX_PRECISION as HLL_MAX_PRECISION,
+    MIN_PRECISION as HLL_MIN_PRECISION,
+};
+pub use shared_leader_election::{
+    LeaderError, LeaderHeader, SharedLeaderElection,
+    DEFAULT_GRACE_EPOCHS as LEADER_DEFAULT_GRACE_EPOCHS,
+    LEADER_FILE_SIZE, LEADER_MAGIC, NO_LEADER,
+};
+pub use shared_linked_list::{
+    LinkedListError, NodeHandle, SharedLinkedList,
+    HEAD_INDEX as LINKED_LIST_HEAD_INDEX, NIL_INDEX as LINKED_LIST_NIL_INDEX,
+};
+pub use shared_lru_cache::{LRUError, SharedLRUCache};
+pub use shared_nan_tagged_value::{NaNTaggedType, SharedNaNTaggedValue};
+pub use shared_nan_value::{
+    NaNValueType, SharedNaNValue,
+    BOXED_MASK, BOXED_PREFIX, CANONICAL_QNAN, PAYLOAD_MASK,
+    TAG_BOOL, TAG_I32, TAG_MASK, TAG_NIL, TAG_OFFSET_PTR, TAG_SHIFT,
+    TAG_TAGGED_OFFSET_PTR, TAG_U32,
+};
+pub use shared_once_cell::{
+    Fetch, OnceHeader, OnceSlot, SharedOnceCell, SharedOnceError, ONCE_FILE_SIZE,
+    ONCE_INLINE_BYTES, ONCE_MAGIC, ONCE_PAYLOAD_BYTES, ONCE_SLOTS, STATE_EMPTY, STATE_INITIALIZED,
+    STATE_INITIALIZING,
+};
+pub use shared_rate_limiter::{
+    RateLimiterError, RateLimiterHeader, SharedRateLimiter, RATE_LIMITER_MAGIC,
+};
+pub use shared_region::{
+    region_file_size, OffsetPtr, RegionError, RegionHeader, SharedRegion,
+    NIL_INDEX, REGION_MAGIC,
+};
+pub use shared_reservoir_sampler::{
+    reservoir_file_size, ReservoirError, ReservoirHeader, ReservoirSlot,
+    SharedReservoirSampler, RESERVOIR_MAGIC, RESERVOIR_SLOT_PAYLOAD,
+};
+pub use shared_ring::{
+    ring_file_size, Consumer as SpscConsumer, LazySharedRing, Producer as SpscProducer,
+    RingError, RingHeader, SharedRing, SharedRingSpsc, Slot, PAYLOAD_BYTES,
+    RING_MAGIC, SLOT_SIZE,
+};
+pub use frame_ring::{
+    frame_ring_file_size, FrameClass, FrameRing, LayoutHint,
+    DESC_HEADER_BYTES, FRAME_MAGIC, MIN_SLOT_SIZE,
+};
+pub use frame_region::{
+    frame_region_file_size, FrameRegion, FRAME_REGION_MAGIC, MIN_BLOCK_SIZE,
+};
+pub use mpsc_ring::{
+    MpscConsumer, MpscFifoConsumer, MpscFifoProducer, MpscProducer,
+    SharedRingMpsc, SharedRingMpscFifo,
+};
+pub use mpmc_ring::{MpmcConsumer, MpmcProducer, SharedRingMpmc};
+pub use adaptive_ring::{
+    AdaptiveError, AdaptiveRing, AdaptiveRingSidecar, DefaultOrderingPolicy,
+    DefaultRingShapePolicy, OrderingPolicy, OrderingPolicyObservation,
+    PinnedRing, PolicyObservation, QosRingShapePolicy, RingShape,
+    RingShapePolicy, ADAPTIVE_SPSC_PAYLOAD_BYTES,
+    ADAPTIVE_VYUKOV_PAYLOAD_BYTES, DRAINER_GRACE_EPOCHS,
+};
+pub use cache_ops::{cldemote, has_cldemote, prefetchw, sfence};
+pub use mmf_warm::{warm_mmap, warm_region};
+pub use monitor_wait::{
+    monitor_wait_budget_cycles, monitor_wait_kind, monitor_wait_u32,
+    monitor_wait_u32_with, monitor_wait_u64, monitor_wait_u64_with,
+    MonitorWaitKind, DEFAULT_MONITOR_BUDGET_CYCLES,
+};
+pub use ordering::{
+    default_stamp_kind, has_invariant_tsc, ordering_region_size,
+    OrderingHeader, OrderingMode, OrderingRegion, StampKind,
+    MONOTONIC_FRESHNESS_GUARD_NANOS, ORDERING_MAGIC, STAMPED_PAYLOAD_BYTES,
+    STAMP_BYTES, TSC_FRESHNESS_GUARD_CYCLES,
+};
+pub use qos_policy::{
+    Durability, History, Ordering as QosOrdering, QosPolicy, QosSnapshot,
+    Reliability,
+};
+pub use capacity_adaptive_ring::{
+    BackingTarget, CapacityAdaptiveRing, CapacityAdaptiveRingSidecar,
+    CapacityMorphError, CapacityPolicy, CapacityPolicyObservation,
+    DefaultCapacityPolicy, PinnedCapacity, RingConfig,
+};
+pub use policy_gate::{min_samples_for_arity, ConfidenceGate, GateConfig};
+pub use unified_policy::{
+    UnifiedObservation, UnifiedPolicy, UnifiedSidecar, UnifiedWeights,
+};
+pub use phase_estimator::{PhaseConfig, PhaseEstimator};
+pub use capacity_broadcast_ring::{
+    BroadcastCapacityMorphError, CapacityBroadcastRing, PinnedBroadcastCapacity,
+};
+pub use capacity_pubsub_ring::{
+    CapacityPubSubRing, CapacityPubSubSubscriber, PubSubCapacityMorphError,
+};
+pub use blocking_spsc_ring::{BlockingError, BlockingSpscRing, PhaseRecvStats};
+pub use blocking_mpsc_ring::{
+    BlockingMpscConsumer, BlockingMpscProducer, BlockingMpscRing,
+};
+pub use blocking_mpmc_ring::{
+    BlockingMpmcConsumer, BlockingMpmcProducer, BlockingMpmcRing,
+};
+pub use blocking_adaptive_ring::BlockingAdaptiveRing;
+pub use byte_value::{ByteValue, LeaseValue, SlotValue, ValueTooLong, LEASE_VALUE_BYTES, SLOT_VALUE_BYTES};
+pub use cross_process_waker::{
+    CrossProcessWaker, WakerError, WakerToken, MAX_WAITERS_DEFAULT, WAKER_MAGIC,
+    waker_region_size,
+};
+pub use shared_condvar::{CondvarError, SharedCondvar};
+pub use async_ring::{AsyncRecv, AsyncSend, AsyncSpscRing};
+pub use locale_adaptive_ring::{
+    DefaultLocalePolicy, Locale, LocaleAdaptiveRing, LocaleAdaptiveRingSidecar,
+    LocalePolicy, LocalePolicyObservation, PinnedLocale,
+};
+pub use shared_arc::{
+    arc_file_size, ArcError, ArcHeader, LastHolder, SharedArc, SharedCounter,
+    ARC_MAGIC,
+};
+pub use holder_table::{
+    holder_table_size, HolderSlot, HolderTable, HOLDER_FREE, HOLDER_RESERVED,
+};
+pub use shared_epochs::{
+    epoch_file_size, Epoch, EpochError, EpochHeader, EpochTicket, PinGuard, SharedEpochs,
+    EPOCH_MAGIC, PIN_FREE, PIN_RESERVED,
+};
+pub use shared_versioned_index::{IndexError, RangeRows, SharedVersionedIndex, INDEX_MAGIC};
+pub use shared_slab::{
+    slab_file_size, slab_slot_size, SharedSlab, SlabError, SlabHeader,
+    SLAB_MAGIC, SLAB_SLOT_PREFIX,
+};
+pub use shared_versioned_slab::{SharedVersionedSlab, SlotVersion, VersionChain, VersionedSlabError};
+pub use laned_versioned_map::{
+    lanes_file_size, LaneGuard, LanedError, LanedVersionedMap, LanesHeader, LANES_MAGIC,
+};
+pub use shared_btree_map::{BTreeError, SharedBTreeMap};
+pub use versioned_btree_map::{
+    Versioned, VersionedBTreeMap, VersionedError, DIED_LIVE,
+};
+pub use shared_string_arena::{
+    arena_file_size, ArenaError, ArenaHeader, SharedStringArena, StringRef,
+    ARENA_MAGIC,
+};
+pub use shared_time_point::{
+    tile_file_size, SharedTimePointTile, TileError, TileHeader, VersionedSlot,
+    SLOT_PAYLOAD, TILE_CAP, TIME_POINT_MAGIC,
+};
+pub use shared_topology_map::{
+    topology_file_size, SharedTopologyMap, TopologyError, TopologyHeader,
+    TopologyKind, TopologyStats, DEFAULT_FAN_IN_THRESHOLD,
+    DEFAULT_FAN_OUT_THRESHOLD, TOPOLOGY_MAGIC,
+};
+pub use shared_treiber_stack::{
+    stack_file_size, SharedTreiberStack, StackError, StackHeader,
+    STACK_MAGIC, STACK_NIL,
+};
+pub use raw_treiber_stack::{ElementLayout, RawTreiberStack};
+pub use cross_process_notifier::{Notifier, NotifierSet, NotifyError, NotifyPlace, NotifyRecord, NOTIFY_MAGIC};
+pub use raw_deque::{raw_deque_file_size, raw_slot_bytes, RawDeque};
+pub use raw_hash_map::RawHashMap;
+pub use raw_arena::{raw_arena_file_size, BlockHandle, CollectReport, RawArena, RawArenaError, BLOCK_HEADER_BYTES, RAW_ARENA_MAGIC};
+pub use shared_named_values::{name_key, NamedValuesError, NamedValuesLayout, SharedNamedValues, MAX_NAME_BYTES};
+pub use wait_calibration::cache_dir as per_user_dir;
+pub use raw_btree_map::{node_geometry, raw_btree_file_size, NodeGeometry, RawBTreeMap, RAW_BTREE_MAGIC};
+pub use raw_cell::RawCell;
+pub use raw_linked_list::RawLinkedList;
+pub use raw_region::{raw_region_file_size, raw_region_links_offset, raw_region_slots_offset, RawRegion};
+pub use raw_slab::{raw_slab_data_offset, raw_slab_file_size, raw_slab_geometry, RawSlab};
+pub use raw_vec::{raw_vec_data_offset, raw_vec_file_size, raw_vec_geometry, raw_vec_table_offset, RawVec, VEC_SLOT_PREFIX};
+pub use shared_umbra_pointer::SharedUmbraPointer;
+pub use shared_universal::{
+    SharedUniversal, Strategy as UniversalStrategy, UniversalError,
+    UniversalHeader, UNIVERSAL_MAGIC,
+};
+pub use shared_vec::{
+    vec_file_size, SharedVec, VecError, VecHeader, VecSlot,
+    VEC_MAGIC, VEC_PAYLOAD_BYTES,
+};
+pub use shared_versioned_chain::{
+    versioned_chain_file_size, ChainError, ChainHeader, SharedVersionedChain,
+    VersionNode, NIL_NODE, NODE_PAYLOAD_BYTES, VERSIONED_CHAIN_MAGIC,
+};
+pub use tagged_offset_ptr::{TaggedOffsetPtr, TaggedPtrError};

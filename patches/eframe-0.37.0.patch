@@ -1,0 +1,309 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 55caffd..d296735 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -201,6 +201,10 @@ pub use native::run::EframeWinitApplication;
+ #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+ pub use native::run::EframePumpStatus;
+ 
++#[cfg(not(target_arch = "wasm32"))]
++#[cfg(feature = "wgpu_no_default_features")]
++pub use native::before_inactive_window_shown;
++
+ #[cfg(not(target_arch = "wasm32"))]
+ #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+ #[cfg(feature = "persistence")]
+diff --git a/src/native/epi_integration.rs b/src/native/epi_integration.rs
+index 951c372..bf5c692 100644
+--- a/src/native/epi_integration.rs
++++ b/src/native/epi_integration.rs
+@@ -173,6 +173,18 @@ impl egui::FontProvider for MissingSystemFontsWarning {
+ 
+ // ----------------------------------------------------------------------------
+ 
++thread_local! {
++    static ROOT_KEPT_HIDDEN: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
++}
++
++/// Whether the app running on this thread builds its root viewport hidden:
++/// its first frame does not show it, and neither is a repaint requested of it
++/// put off nor its thread slept after each frame as an invisible window's
++/// is, since it is hidden on purpose and paints only when a repaint is requested.
++pub(crate) fn root_kept_hidden() -> bool {
++    ROOT_KEPT_HIDDEN.with(core::cell::Cell::get)
++}
++
+ /// Everything needed to make a winit-based integration for [`epi`].
+ ///
+ /// Only one instance per app (not one per viewport).
+@@ -257,6 +269,9 @@ impl EpiIntegration {
+             Some(icon),
+         );
+ 
++        let kept_hidden = native_options.viewport.visible == Some(false);
++        ROOT_KEPT_HIDDEN.with(|h| h.set(kept_hidden));
++
+         if native_options.system_font_fallback {
+             egui_ctx.add_font_provider(cfg_select! {
+                 feature = "system_fonts" => Arc::new(egui_system_font_provider::SystemFontProvider::new()),
+@@ -291,7 +306,8 @@ impl EpiIntegration {
+             beginning: Instant::now()
+                 .checked_sub(web_time::Duration::from_secs_f64(egui_ctx.time()))
+                 .unwrap_or_else(Instant::now),
+-            is_first_frame: true,
++            // A root the app builds hidden is not shown by its first frame.
++            is_first_frame: !kept_hidden,
+             egui_ctx,
+         }
+     }
+diff --git a/src/native/mod.rs b/src/native/mod.rs
+index 771964a..793fb44 100644
+--- a/src/native/mod.rs
++++ b/src/native/mod.rs
+@@ -17,3 +17,6 @@ mod glow_integration;
+ 
+ #[cfg(feature = "wgpu_no_default_features")]
+ mod wgpu_integration;
++
++#[cfg(feature = "wgpu_no_default_features")]
++pub use wgpu_integration::before_inactive_window_shown;
+diff --git a/src/native/run.rs b/src/native/run.rs
+index e42b458..ededd93 100644
+--- a/src/native/run.rs
++++ b/src/native/run.rs
+@@ -373,8 +373,12 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
+                             // Throttle repaints for invisible windows to prevent
+                             // high CPU usage on Windows.
+                             // See: https://github.com/emilk/egui/issues/7776
++                            // A root the app leaves hidden paints only when
++                            // requested, so its repaints are not put off.
+                             let when = if let Some(window) = self.winit_app.window(window_id)
+                                 && is_invisible_or_minimized(&window)
++                                && !(viewport_id == egui::ViewportId::ROOT
++                                    && super::epi_integration::root_kept_hidden())
+                             {
+                                 when.max(Instant::now() + INVISIBLE_WINDOW_REPAINT_INTERVAL)
+                             } else {
+diff --git a/src/native/wgpu_integration.rs b/src/native/wgpu_integration.rs
+index 9b2307c..836c9bd 100644
+--- a/src/native/wgpu_integration.rs
++++ b/src/native/wgpu_integration.rs
+@@ -37,6 +37,18 @@ use crate::{
+ 
+ use super::{epi_integration, event_loop_context, winit_integration, winit_integration::WinitApp};
+ 
++thread_local! {
++    static BEFORE_INACTIVE_SHOWN: core::cell::Cell<Option<fn(&Window)>> = const { core::cell::Cell::new(None) };
++}
++
++/// Sets what runs with each viewport window this thread's event loop makes
++/// whose builder requests that it not be active, once the window is made and
++/// before it is first shown, so the window system reads what it sets as the
++/// window opens.
++pub fn before_inactive_window_shown(hook: fn(&Window)) {
++    BEFORE_INACTIVE_SHOWN.with(|h| h.set(Some(hook)));
++}
++
+ // ----------------------------------------------------------------------------
+ // Types:
+ 
+@@ -93,6 +105,9 @@ pub struct SharedState {
+ 
+     /// Passed on to each [`egui_winit::State`]. See [`NativeOptions::clipboard_shortcuts`].
+     clipboard_shortcuts: bool,
++
++    /// Each viewport's AccessKit adapter delivers its events through a clone.
++    repaint_proxy: Arc<Mutex<EventLoopProxy<UserEvent>>>,
+ }
+ 
+ pub type Viewports = egui::OrderedViewportIdMap<Viewport>;
+@@ -165,6 +180,7 @@ impl<'app> WgpuWinitApp<'app> {
+             painter,
+             viewport_from_window,
+             clipboard_shortcuts,
++            repaint_proxy,
+             ..
+         } = &mut *shared;
+ 
+@@ -175,6 +191,7 @@ impl<'app> WgpuWinitApp<'app> {
+                 viewport_from_window,
+                 painter,
+                 *clipboard_shortcuts,
++                repaint_proxy,
+             );
+         }
+     }
+@@ -187,6 +204,7 @@ impl<'app> WgpuWinitApp<'app> {
+             viewport_from_window,
+             painter,
+             clipboard_shortcuts,
++            repaint_proxy,
+             ..
+         } = &mut *running.shared.borrow_mut();
+ 
+@@ -204,6 +222,7 @@ impl<'app> WgpuWinitApp<'app> {
+             viewport_from_window,
+             painter,
+             *clipboard_shortcuts,
++            repaint_proxy,
+         );
+     }
+ 
+@@ -373,6 +392,7 @@ impl<'app> WgpuWinitApp<'app> {
+             focused_viewport: Some(ViewportId::ROOT),
+             resized_viewport: None,
+             clipboard_shortcuts: self.native_options.clipboard_shortcuts,
++            repaint_proxy: Arc::clone(&self.repaint_proxy),
+         }));
+ 
+         {
+@@ -751,13 +771,15 @@ impl WgpuWinitRunning<'_> {
+                 }
+             }
+ 
+-            sleep_if_invisible_or_minimized(
+-                shared
+-                    .borrow()
+-                    .viewports
+-                    .get(&viewport_id)
+-                    .and_then(|viewport| viewport.window.as_deref()),
+-            );
++            if !kept_hidden_root(viewport_id) {
++                sleep_if_invisible_or_minimized(
++                    shared
++                        .borrow()
++                        .viewports
++                        .get(&viewport_id)
++                        .and_then(|viewport| viewport.window.as_deref()),
++                );
++            }
+ 
+             return Ok(if integration.should_close() {
+                 EventResult::CloseRequested
+@@ -907,7 +929,9 @@ impl WgpuWinitRunning<'_> {
+         };
+         integration.maybe_autosave(app.as_mut(), window_for_autosave);
+ 
+-        sleep_if_invisible_or_minimized(window.map(|window| window.as_ref()));
++        if !kept_hidden_root(viewport_id) {
++            sleep_if_invisible_or_minimized(window.map(|window| window.as_ref()));
++        }
+ 
+         if integration.should_close() {
+             Ok(EventResult::CloseRequested)
+@@ -1110,6 +1134,13 @@ impl Viewport {
+     }
+ 
+     /// Create winit window, if needed.
++    ///
++    /// A viewport other than the root gets an AccessKit adapter of its own,
++    /// as the root does when the app starts. An adapter must exist before its
++    /// window is first shown, so the window is created hidden, given its
++    /// adapter, then shown as its builder requests; one whose builder requests it
++    /// not be active is passed first to the hook [`before_inactive_window_shown`]
++    /// sets.
+     fn initialize_window(
+         &mut self,
+         event_loop: &ActiveEventLoop,
+@@ -1117,6 +1148,9 @@ impl Viewport {
+         windows_id: &mut HashMap<WindowId, ViewportId>,
+         painter: &mut egui_wgpu::winit::Painter,
+         clipboard_shortcuts: bool,
++        #[cfg_attr(not(feature = "accesskit"), allow(unused_variables))] repaint_proxy: &Mutex<
++            EventLoopProxy<UserEvent>,
++        >,
+     ) {
+         if self.window.is_some() {
+             return; // we already have one
+@@ -1125,8 +1159,15 @@ impl Viewport {
+         profiling::function_scope!();
+ 
+         let viewport_id = self.ids.this;
++        let adapted = cfg!(feature = "accesskit") && viewport_id != ViewportId::ROOT;
++        let shown_after = adapted && self.builder.visible != Some(false);
++        let builder = if shown_after {
++            self.builder.clone().with_visible(false)
++        } else {
++            self.builder.clone()
++        };
+ 
+-        match egui_winit::create_window(egui_ctx, event_loop, &self.builder) {
++        match egui_winit::create_window(egui_ctx, event_loop, &builder) {
+             Ok(window) => {
+                 windows_id.insert(window.id(), viewport_id);
+ 
+@@ -1149,6 +1190,19 @@ impl Viewport {
+                 egui_winit.set_clipboard_shortcuts(clipboard_shortcuts);
+                 self.egui_winit = Some(egui_winit);
+ 
++                #[cfg(feature = "accesskit")]
++                if adapted && let Some(egui_winit) = &mut self.egui_winit {
++                    egui_winit.init_accesskit(event_loop, &window, repaint_proxy.lock().clone());
++                }
++                if shown_after {
++                    if self.builder.active == Some(false)
++                        && let Some(hook) = BEFORE_INACTIVE_SHOWN.with(core::cell::Cell::get)
++                    {
++                        hook(&window);
++                    }
++                    window.set_visible(true);
++                }
++
+                 egui_winit::update_viewport_info(&mut self.info, egui_ctx, &window, true);
+                 self.window = Some(window);
+             }
+@@ -1181,6 +1235,12 @@ fn create_window(
+     Ok((window, viewport_builder))
+ }
+ 
++/// Whether `viewport_id` is a root the app leaves hidden, which paints only
++/// when requested and so is not slept after each frame as an invisible window is.
++fn kept_hidden_root(viewport_id: ViewportId) -> bool {
++    viewport_id == ViewportId::ROOT && super::epi_integration::root_kept_hidden()
++}
++
+ /// Is this viewport, or any of its (transitive) descendant viewports, visible?
+ ///
+ /// Immediate viewports are rendered inline while their parent's UI runs, so even
+@@ -1220,6 +1280,7 @@ fn render_immediate_viewport(
+             painter,
+             viewport_from_window,
+             clipboard_shortcuts,
++            repaint_proxy,
+             ..
+         } = &mut *shared.borrow_mut();
+ 
+@@ -1239,6 +1300,7 @@ fn render_immediate_viewport(
+                     viewport_from_window,
+                     painter,
+                     *clipboard_shortcuts,
++                    repaint_proxy,
+                 );
+             });
+         }
+@@ -1342,6 +1404,10 @@ pub(crate) fn remove_viewports_not_in(
+ }
+ 
+ /// Add new viewports, and update existing ones:
++///
++/// egui has a viewport for an id that a repaint or a command named before
++/// any frame showed it, with the root class it defaults to and no ui
++/// callback; no window is made for one until a frame shows it.
+ fn handle_viewport_output(
+     egui_ctx: &egui::Context,
+     viewport_output: &OrderedViewportIdMap<ViewportOutput>,
+@@ -1361,6 +1427,14 @@ fn handle_viewport_output(
+         },
+     ) in viewport_output.clone()
+     {
++        if viewport_id != ViewportId::ROOT
++            && class == ViewportClass::Root
++            && viewport_ui_cb.is_none()
++            && !viewports.contains_key(&viewport_id)
++        {
++            continue;
++        }
++
+         let ids = ViewportIdPair::from_self_and_parent(viewport_id, parent);
+ 
+         let viewport =

@@ -1,0 +1,83 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/subetha-core",
+    "crates/subetha-sidecar",
+    "crates/subetha-pointers",
+    "crates/subetha-cxc",
+    "crates/subetha",
+    "crates/subetha-e2e",
+    "crates/subetha-ffi",
+    "crates/subetha-ffi-tests",
+    "crates/subetha-spec-c",
+    "crates/subetha-py",
+    "crates/subetha-pwrs",
+    "crates/subetha-wiki-tests",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.6.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+repository = "https://github.com/Variably-Constant/SubEtha"
+authors = ["Mark Newton"]
+keywords = ["ipc", "shared-memory", "mmf", "cross-process", "kernel-bypass"]
+categories = ["concurrency", "asynchronous"]
+readme = "README.md"
+
+[workspace.dependencies]
+subetha-core = { path = "crates/subetha-core", version = "0.6.0" }
+subetha-sidecar = { path = "crates/subetha-sidecar", version = "0.6.0" }
+subetha-pointers = { path = "crates/subetha-pointers", version = "0.6.0" }
+subetha-cxc = { path = "crates/subetha-cxc", version = "0.6.0" }
+subetha-ffi = { path = "crates/subetha-ffi", version = "0.6.0" }
+
+# Production dependencies.
+parking_lot = "0.12.5"
+once_cell = "1.21.4"
+memmap2 = "0.9.11"
+io-uring = "0.7.15"
+
+# Benchmarking competitors (dev-only)
+criterion = { version = "0.8.2", features = ["html_reports"] }
+crossbeam-channel = "0.5.17"
+crossbeam-deque = "0.8.8"
+interprocess = "2.4.4"
+ipc-channel = "0.23.0"
+iceoryx2 = "0.10.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+
+# QUIC bridge: subetha-cxc's optional `quic-bridge` feature (and `tls`,
+# `tcp-bridge`, `tcp-tls-bridge` for rustls and tokio). Crypto provider is
+# ring: bridge_lan loopback A/B against aws-lc-rs measured a tie
+# (627/685 vs 632/690 Mbit/s drain at 2M slots) on hosts without
+# VAES, and ring's build chain is lighter (no cmake/NASM). The
+# provider install is one caller-replaceable helper
+# (install_default_crypto_provider); hosts with VAES/AVX-512
+# AES-GCM kernels are where re-measuring aws-lc-rs makes sense.
+quinn = { version = "0.11.12", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-ring", "bloom"] }
+rcgen = "0.14.10"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26.5", default-features = false, features = ["ring"] }
+
+# Symbols are for debugging on the machine that built the thing, not for
+# the artifact that ships. Left in, they are carried by the binary on
+# every target that has nowhere else to put them: the module's Linux
+# library came to 28.6 MB against the same library's 6.3 MB on Windows,
+# which writes them to a separate file that never ships.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
+strip = "symbols"
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"

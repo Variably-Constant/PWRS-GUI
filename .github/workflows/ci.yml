@@ -1,0 +1,192 @@
+name: ci
+
+# Builds PWRS-GUI and runs its Rust tests, its Pester suites and a publish
+# dry run on macOS arm64, the one platform no machine of the project's own
+# runs, on macOS 15 and on the latest image. Windows,
+# Linux and FreeBSD are gated on those machines. It runs for a push to a
+# branch under ci/, which is deleted once its run is read; main never
+# runs it.
+#
+# The workspace builds against SubEtha's and Wgpu's source trees beside
+# the checkout, as ../SubEtha and ../Wgpu, and against PWRS's as ../pwrs
+# while its Cargo.toml patches PoWerRuSt from there. While no published
+# release carries what it needs, a commit may hold a snapshot of each under
+# vendor/, which the first step moves into place; without them the job says
+# so and builds nothing. cargo-pwrs embeds the runtime of the PoWerRuSt the
+# workspace builds on, so it is built from ../pwrs when the workspace builds
+# on that tree, and comes from crates.io at the version it pins otherwise.
+
+on:
+  push:
+    branches: ['ci/**']
+  workflow_dispatch:
+
+jobs:
+  # The older of these two images' WebKit, as WKWebView reports it, is the
+  # HTML renderer's floor; an app's WebKit on macOS 15 does not follow the
+  # installed Safari. Both run every step.
+  macos-arm64:
+    name: macos-arm64 (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: The SubEtha, Wgpu and PWRS trees beside the checkout
+        id: trees
+        shell: bash
+        run: |
+          need="SubEtha Wgpu"
+          if grep -qE '^PoWerRuSt = \{ path = "\.\./pwrs/crates/pwrs" \}' Cargo.toml; then need="$need pwrs"; fi
+          missing=""
+          for tree in $need; do [ -f "vendor/$tree/Cargo.toml" ] || missing="$missing $tree"; done
+          if [ -z "$missing" ]; then
+            for tree in $need; do mv "vendor/$tree" "../$tree"; done
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "Snapshots of $need moved beside the checkout"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No snapshot of$missing under vendor/, so nothing was built or tested."
+          fi
+      # A commit on the action's master, which its README asks a pin to
+      # name. A commit ref names no toolchain, so `toolchain` does.
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        if: steps.trees.outputs.present == 'true'
+        with:
+          toolchain: 1.99.0
+          components: clippy
+      # The workspace takes the six crates it patches from patched/, which
+      # this unpacks from crates.io and patches before cargo can load the
+      # workspace.
+      - name: The patched crates
+        if: steps.trees.outputs.present == 'true'
+        shell: pwsh
+        run: ./patches/apply.ps1
+      # cargo pwrs test imports the Pester PWRS_PESTER_PATH names before
+      # any on the module path.
+      - name: Pester 6.2.0
+        if: steps.trees.outputs.present == 'true'
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'pester'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Save-Module -Name Pester -RequiredVersion 6.2.0 -Path $dir -Force
+          Add-Content -Path $env:GITHUB_ENV -Value "PWRS_PESTER_PATH=$(Join-Path $dir 'Pester/6.2.0/Pester.psd1')"
+      - name: The machine this job runs on
+        if: steps.trees.outputs.present == 'true'
+        shell: pwsh
+        run: |
+          "pwsh $($PSVersionTable.PSVersion) on $([System.Runtime.InteropServices.RuntimeInformation]::FrameworkDescription), $([System.Runtime.InteropServices.RuntimeInformation]::OSDescription), $([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)"
+          sw_vers
+          system_profiler SPDisplaysDataType | Select-String 'Chipset|Metal|Resolution'
+          rustc --version
+      - name: Clippy, warnings denied
+        if: steps.trees.outputs.present == 'true'
+        run: cargo clippy --profile test-fast --workspace --no-deps --all-targets -- -D warnings
+      - name: The helpers, for the client's tests
+        if: steps.trees.outputs.present == 'true'
+        run: cargo build --profile test-fast -p pwrs-gui --bin pwrs-gui-egui --bin pwrs-gui-web
+      # Every test binary runs whatever an earlier one did, and the
+      # renderers trace their starts, windows and pages to their logs.
+      - name: Rust tests
+        if: steps.trees.outputs.present == 'true'
+        env:
+          PWRS_GUI_TRACE: '1'
+          RUST_BACKTRACE: '1'
+        run: cargo test --profile test-fast --workspace --no-fail-fast
+      - name: cargo-pwrs at the workspace's PoWerRuSt
+        if: steps.trees.outputs.present == 'true'
+        shell: bash
+        run: |
+          if grep -qE '^PoWerRuSt = \{ path = "\.\./pwrs/crates/pwrs" \}' Cargo.toml; then
+            cargo install --path ../pwrs/crates/cargo-pwrs --root target/tools --locked
+          else
+            version=$(sed -nE 's/^pwrs = \{ package = "PoWerRuSt", version = "=([0-9.]+)".*/\1/p' Cargo.toml)
+            if [ -z "$version" ]; then echo "::error::Cargo.toml names no exact PoWerRuSt version"; exit 1; fi
+            cargo install cargo-pwrs --version "$version" --root target/tools --locked
+          fi
+      - name: The stand-in module
+        if: steps.trees.outputs.present == 'true'
+        run: target/tools/bin/cargo-pwrs pwrs build --release --manifest-dir crates/pwrs-gui-standin
+      # The SubEtha ring suites import SubEtha's module, built with the
+      # cargo-pwrs its own tree pins, from the folder SUBETHA_MODULE names.
+      - name: SubEtha's module, for the ring suites
+        if: steps.trees.outputs.present == 'true'
+        shell: bash
+        run: |
+          version=$(sed -nE 's/^pwrs = \{ package = "PoWerRuSt", version = "=([0-9.]+)".*/\1/p' ../SubEtha/crates/subetha-pwrs/Cargo.toml)
+          if [ -z "$version" ]; then echo "::error::SubEtha's crates/subetha-pwrs/Cargo.toml names no exact PoWerRuSt version"; exit 1; fi
+          cargo install cargo-pwrs --version "$version" --locked --root target/tools-subetha
+          target/tools-subetha/bin/cargo-pwrs pwrs build --release --manifest-dir ../SubEtha/crates/subetha-pwrs
+          echo "SUBETHA_MODULE=$(cd ../SubEtha && pwd)/target/pwrs/SubEtha" >> "$GITHUB_ENV"
+      # The renderers trace here too, each test input's steps among it, to
+      # the logs the steps after a failure gather.
+      - name: The module and its Pester suites (pwsh 7)
+        if: steps.trees.outputs.present == 'true'
+        env:
+          PWRS_GUI_TRACE: '1'
+        run: target/tools/bin/cargo-pwrs pwrs test --release --manifest-dir crates/pwrs-gui
+      # The dry run refuses the module while a crate its library links has
+      # no license text for the notices to quote.
+      - name: Publish, dry run
+        if: steps.trees.outputs.present == 'true'
+        run: target/tools/bin/cargo-pwrs pwrs publish --release --dry-run --manifest-dir crates/pwrs-gui
+      - name: The module folder's files
+        if: steps.trees.outputs.present == 'true'
+        shell: pwsh
+        run: |
+          Get-ChildItem -Recurse -File target/pwrs/PWRS-GUI | ForEach-Object { '{0,12:N0}  {1}' -f $_.Length, $_.FullName.Substring((Resolve-Path target/pwrs/PWRS-GUI).Path.Length + 1) }
+          '{0,12:N0}  in all' -f (Get-ChildItem -Recurse -File target/pwrs/PWRS-GUI | Measure-Object Length -Sum).Sum
+      - name: Cargo.lock unchanged
+        if: steps.trees.outputs.present == 'true'
+        run: git diff --exit-code Cargo.lock
+      # Each helper's standard error goes to PWRS-GUI/<session>.log in the
+      # system's temporary folder, TMPDIR on macOS. The crash reports of
+      # WebKit's processes, which draw an HTML window's page, go beside the
+      # helpers' own, with the faulting thread of each printed here, and so
+      # does what WebKit's processes logged in the last hour.
+      - name: Gather the helpers' logs
+        if: failure() && steps.trees.outputs.present == 'true'
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/pwrs-gui-logs"
+          cp -R "${TMPDIR:-/tmp}/PWRS-GUI/." "$RUNNER_TEMP/pwrs-gui-logs/" || echo "no helper logs under ${TMPDIR:-/tmp}/PWRS-GUI"
+          cp -R "${TMPDIR:-/tmp}/pwrs-gui-session-tests/." "$RUNNER_TEMP/pwrs-gui-logs/" || echo "no test helper logs under ${TMPDIR:-/tmp}/pwrs-gui-session-tests"
+          for f in "${TMPDIR:-/tmp}"/pwrs-gui-session-tests/*.log; do [ -f "$f" ] && { echo "== $f"; tail -n 60 "$f"; }; done
+          sleep 15
+          for f in "$HOME"/Library/Logs/DiagnosticReports/pwrs* "$HOME"/Library/Logs/DiagnosticReports/Retired/pwrs* /Library/Logs/DiagnosticReports/pwrs*; do [ -f "$f" ] && { cp "$f" "$RUNNER_TEMP/pwrs-gui-logs/"; echo "== $f"; head -n 160 "$f"; }; done
+          for f in "$HOME"/Library/Logs/DiagnosticReports/com.apple.WebKit* /Library/Logs/DiagnosticReports/com.apple.WebKit*; do [ -f "$f" ] && cp "$f" "$RUNNER_TEMP/pwrs-gui-logs/"; done
+          python3 - "$RUNNER_TEMP/pwrs-gui-logs" <<'EOF' || echo "the WebKit crash reports could not be read"
+          import glob, json, os, sys
+          for path in sorted(glob.glob(os.path.join(sys.argv[1], 'com.apple.WebKit*.ips'))):
+              body = open(path, encoding='utf-8', errors='replace').read().partition('\n')[2]
+              try:
+                  report = json.loads(body)
+              except ValueError as e:
+                  print('== %s: no report read: %s' % (os.path.basename(path), e))
+                  continue
+              print('== %s' % os.path.basename(path))
+              print('exception: %s' % json.dumps(report.get('exception')))
+              print('termination: %s' % json.dumps(report.get('termination')))
+              print('asi: %s' % json.dumps(report.get('asi')))
+              images = report.get('usedImages', [])
+              threads = report.get('threads', [])
+              at = report.get('faultingThread', 0)
+              for frame in (threads[at].get('frames', []) if at < len(threads) else [])[:40]:
+                  index = frame.get('imageIndex')
+                  image = images[index].get('name', '?') if index is not None and index < len(images) else '?'
+                  print('  %s %s+%s' % (image, frame.get('symbol', hex(frame.get('imageOffset', 0))), frame.get('symbolLocation', 0)))
+          EOF
+          log show --last 60m --style compact --predicate 'process BEGINSWITH "com.apple.WebKit"' > "$RUNNER_TEMP/pwrs-gui-logs/webkit-processes.log" 2>&1 || echo "WebKit's log could not be read"
+          echo "WebKit's processes logged $(wc -l < "$RUNNER_TEMP/pwrs-gui-logs/webkit-processes.log") lines"
+          ls -la "$HOME"/Library/Logs/DiagnosticReports /Library/Logs/DiagnosticReports 2>&1 | tail -n 20
+      - name: The helpers' logs
+        if: failure() && steps.trees.outputs.present == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pwrs-gui-logs-${{ matrix.os }}
+          path: ${{ runner.temp }}/pwrs-gui-logs
+          if-no-files-found: ignore
