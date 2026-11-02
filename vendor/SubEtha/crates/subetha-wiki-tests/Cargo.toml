@@ -1,0 +1,28 @@
+[package]
+name = "subetha-wiki-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Runs every Rust and C program the SubEtha Guide shows, each as a process of its own, and checks every other block the Guide shows against the workspace."
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The Rust programs depend on the umbrella crate, as the Guide's
+# installation page tells a reader to, with every feature a page uses.
+subetha = { path = "../subetha", features = ["quic-bridge", "tcp-bridge", "tcp-tls-bridge", "tls"] }
+# The C programs call the ABI of a library carrying every transport.
+subetha-ffi = { workspace = true, features = ["transports", "tcp-tls-bridge"] }
+
+[build-dependencies]
+cc = "1.5.1"
+
+[[test]]
+name = "wiki"
+path = "tests/wiki.rs"
+harness = false

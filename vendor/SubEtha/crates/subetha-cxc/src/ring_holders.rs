@@ -1,0 +1,654 @@
+//! The processes holding a ring, and whether the last one out removes
+//! its backings.
+//!
+//! A ring's [`PeerDirectory`](crate::peer_directory::PeerDirectory)
+//! records producer and consumer slots. It cannot answer "is anyone
+//! still using this ring", because a process can hold a ring handle
+//! without registering as either - an attacher that has not begun, a
+//! supervisor that only reads stats, a caller between registrations.
+//! So holding is tracked separately from participating.
+//!
+//! # Its own region
+//!
+//! The table lives in a region of its own beside the directory rather
+//! than inside it. The directory's size is a `const fn` with
+//! compile-time offsets, while the holder count is the caller's to
+//! choose: the substrate has no limit on processes holding a ring, and
+//! a limit it does not have is not one to invent. A variable-size table
+//! belongs where variable sizing is free.
+//!
+//! The region is a file beside a file-backed ring and a shared-memory
+//! region beside a shm-backed one, named in the ring's namespace so every
+//! process that reaches the ring reaches its table.
+//!
+//! # Layout
+//!
+//! ```text
+//! | HoldersHeader (64B) | HolderSlot 0..N (64B each) |
+//! ```
+//!
+//! # The last holder is the last live process
+//!
+//! Not the last handle within a process, and not the last registered
+//! peer. A holder whose process died without releasing is reaped by the
+//! same pid-liveness probe the peer slots use, so a crash cannot keep a
+//! ring's files alive for ever, and a slow holder cannot have the files
+//! removed under it.
+
+use std::fs::File;
+use std::mem::size_of;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use memmap2::{MmapMut, MmapOptions};
+
+use crate::holder_table::{holder_table_size, HolderTable};
+use crate::shm_file::{ShmFile, ShmNamespace};
+
+pub const HOLDERS_MAGIC: u64 = 0x5355_4245_484c_4432; // "SUBEHLD2"
+
+/// Payload every holder slot carries. The table needs a value that is
+/// neither free nor reserved, and a ring holder has nothing else to say.
+const HOLDER_PRESENT: u64 = 1;
+
+/// What becomes of a ring's backings when the last holding process
+/// releases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LastHolder {
+    /// Remove them.
+    Unlink,
+    /// Leave them for a later process to attach to. The default: a ring
+    /// outliving its creator is the normal cross-process shape.
+    Keep,
+}
+
+#[repr(C, align(64))]
+pub struct HoldersHeader {
+    pub magic: u64,
+    /// Holder slots the table carries, checked on attach so a process
+    /// opening at a different count is refused rather than reading past
+    /// the region.
+    pub capacity: u64,
+    _pad: [u8; 48],
+}
+
+const _: () = {
+    assert!(size_of::<HoldersHeader>() == 64);
+};
+
+/// Bytes the region needs for `capacity` holders.
+pub const fn holders_region_size(capacity: usize) -> usize {
+    size_of::<HoldersHeader>() + holder_table_size(capacity)
+}
+
+#[derive(Debug)]
+pub enum HoldersError {
+    /// Every slot is held by a live process.
+    Exhausted,
+    /// The region was built for a different holder count.
+    LayoutMismatch(crate::layout::Mismatch),
+    /// The operating system refused to open, size or map the region; the
+    /// error carries its code and message.
+    IoError(std::io::Error),
+}
+
+impl From<std::io::Error> for HoldersError {
+    fn from(e: std::io::Error) -> Self {
+        HoldersError::IoError(e)
+    }
+}
+
+impl std::fmt::Display for HoldersError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HoldersError::Exhausted => write!(f, "every holder slot is held by a live process"),
+            HoldersError::LayoutMismatch(m) => write!(f, "a holders region of another shape: {m}"),
+            HoldersError::IoError(e) => write!(f, "holders region io: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for HoldersError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            HoldersError::IoError(e) => Some(e),
+            HoldersError::Exhausted | HoldersError::LayoutMismatch(_) => None,
+        }
+    }
+}
+
+/// Where a holder table lives.
+enum HoldersRegion {
+    /// A file beside a file-backed ring.
+    File { _file: File, mmap: MmapMut, path: PathBuf },
+    /// A shared-memory region beside a shm-backed ring. Its name outlives
+    /// every hold, as the file does, and goes with
+    /// [`RingHolders::unlink_self`]. `None` once that has let the mapping
+    /// go.
+    Shm { shm: Option<ShmFile>, name: String, namespace: ShmNamespace },
+}
+
+/// One process's hold on a ring.
+pub struct RingHolders {
+    region: HoldersRegion,
+    holders: HolderTable,
+    slot: usize,
+    capacity: usize,
+    on_last: LastHolder,
+}
+
+// The slots are atomics in a shared mapping; every access goes through
+// an atomic, and the mapping outlives the view.
+unsafe impl Send for RingHolders {}
+unsafe impl Sync for RingHolders {}
+
+impl RingHolders {
+    /// Create the region if it is not there, attach if it is, and take a
+    /// slot either way.
+    pub fn create_or_attach(
+        path: impl AsRef<Path>,
+        max_holders: usize,
+        on_last: LastHolder,
+    ) -> Result<Self, HoldersError> {
+        assert!(max_holders >= 1, "a ring needs room for at least one holder");
+        let path = path.as_ref().to_path_buf();
+        let (file, mmap) = crate::mmf_attach::create_or_attach(
+            &path,
+            holders_region_size(max_holders),
+            |ptr| unsafe { Self::init_region(ptr, max_holders) },
+            |ptr| unsafe { (*(ptr as *const HoldersHeader)).magic },
+            HOLDERS_MAGIC,
+        )
+        .map_err(|e| crate::mmf_attach::attach_error(e, HoldersError::LayoutMismatch))?;
+        let base = mmap.as_ptr();
+        Self::attach(HoldersRegion::File { _file: file, mmap, path }, base, max_holders, on_last)
+    }
+
+    /// Attach to a region that must already exist.
+    pub fn open(
+        path: impl AsRef<Path>,
+        max_holders: usize,
+        on_last: LastHolder,
+    ) -> Result<Self, HoldersError> {
+        let path = path.as_ref().to_path_buf();
+        let file = crate::region_file::open_existing(&path)?;
+        let total = holders_region_size(max_holders);
+        let len = file.metadata()?.len();
+        if len < total as u64 {
+            return Err(HoldersError::LayoutMismatch(crate::layout::Mismatch::new(
+                "length",
+                len,
+                total as u64,
+            )));
+        }
+        let mmap = unsafe { MmapOptions::new().len(total).map_mut(&file)? };
+        let base = mmap.as_ptr();
+        Self::attach(HoldersRegion::File { _file: file, mmap, path }, base, max_holders, on_last)
+    }
+
+    /// Create the region as shared memory named `name` in `namespace` if
+    /// it is not there, attach if it is, and take a slot either way. The
+    /// region's name outlives this hold, as a file does; the last holder
+    /// out removes it with [`unlink_self`](Self::unlink_self).
+    ///
+    /// `sddl` is applied when this call creates the region, as for the
+    /// regions of the shm-backed ring it sits beside.
+    pub fn create_or_attach_shm(
+        name: &str,
+        namespace: ShmNamespace,
+        sddl: Option<&str>,
+        max_holders: usize,
+        on_last: LastHolder,
+    ) -> Result<Self, HoldersError> {
+        assert!(max_holders >= 1, "a ring needs room for at least one holder");
+        let mut shm = ShmFile::create_or_open_named_secured(
+            name,
+            holders_region_size(max_holders),
+            namespace,
+            sddl,
+        )
+        .map_err(|e| crate::mmf_attach::attach_error(e, HoldersError::LayoutMismatch))?;
+        shm.keep_name();
+        let base = shm.as_mut_slice().as_mut_ptr();
+        // SAFETY: the mapping holds holders_region_size(max_holders)
+        // bytes, zeroed when this call made it and laid out by this same
+        // protocol when another process did.
+        unsafe { Self::lay_out(base, max_holders)? };
+        let region = HoldersRegion::Shm { shm: Some(shm), name: name.to_owned(), namespace };
+        Self::attach(region, base, max_holders, on_last)
+    }
+
+    /// Lay a shared-memory region out, or finish a layout another process
+    /// began, so it is published either way. Every process makes the same
+    /// two swaps from zero, the capacity and then the magic, and none waits
+    /// on another: the slots of a fresh region already read free, and the
+    /// first swap of the magic publishes the table. A capacity already
+    /// there that differs is another table's, and a magic other than this
+    /// layout's another layout's; both are refused as a mismatch, the
+    /// magic before anything is written.
+    ///
+    /// # Safety
+    /// `ptr` addresses at least `holders_region_size(capacity)` bytes,
+    /// zeroed or laid out by this protocol.
+    unsafe fn lay_out(ptr: *mut u8, capacity: usize) -> Result<(), HoldersError> {
+        let header = ptr as *mut HoldersHeader;
+        // SAFETY: both words are 8-byte aligned in the 64-byte aligned
+        // header, and every process reaches them atomically while a
+        // layout can be under way.
+        let (magic, held) = unsafe {
+            (
+                AtomicU64::from_ptr(std::ptr::addr_of_mut!((*header).magic)),
+                AtomicU64::from_ptr(std::ptr::addr_of_mut!((*header).capacity)),
+            )
+        };
+        let mismatch = |field, found, wanted| {
+            Err(HoldersError::LayoutMismatch(crate::layout::Mismatch::new(field, found, wanted)))
+        };
+        // The magic is read by a compare that writes it back unchanged, so
+        // the view's first touch is a write, as the slot claim's is: on
+        // Windows an attach whose first touch is a read spends about 0.5 us
+        // more in the kernel (Ryzen 9 7900X).
+        match magic
+            .compare_exchange(HOLDERS_MAGIC, HOLDERS_MAGIC, Ordering::AcqRel, Ordering::Acquire)
+            .unwrap_or_else(|found| found)
+        {
+            HOLDERS_MAGIC => return Ok(()),
+            0 => {}
+            found => return mismatch("magic", found, HOLDERS_MAGIC),
+        }
+        let wanted = capacity as u64;
+        if let Err(found) = held.compare_exchange(0, wanted, Ordering::AcqRel, Ordering::Acquire)
+            && found != wanted
+        {
+            return mismatch("holder count", found, wanted);
+        }
+        match magic.compare_exchange(0, HOLDERS_MAGIC, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) | Err(HOLDERS_MAGIC) => Ok(()),
+            Err(found) => mismatch("magic", found, HOLDERS_MAGIC),
+        }
+    }
+
+    /// Lay out an empty table: the capacity, then the magic.
+    ///
+    /// # Safety
+    /// `ptr` addresses a zeroed region of at least
+    /// `holders_region_size(capacity)` bytes.
+    unsafe fn init_region(ptr: *mut u8, capacity: usize) {
+        let header = ptr as *mut HoldersHeader;
+        unsafe {
+            (*header).capacity = capacity as u64;
+            std::ptr::write_volatile(std::ptr::addr_of_mut!((*header).magic), HOLDERS_MAGIC);
+        }
+    }
+
+    /// Take a slot in the table at `base`, the start of `region`'s
+    /// mapping, which stays where it is for as long as `region` holds it.
+    fn attach(
+        region: HoldersRegion,
+        base: *const u8,
+        capacity: usize,
+        on_last: LastHolder,
+    ) -> Result<Self, HoldersError> {
+        let header = unsafe { &*(base as *const HoldersHeader) };
+        crate::layout::Mismatch::first(&[
+            ("magic", header.magic, HOLDERS_MAGIC),
+            ("holder count", header.capacity, capacity as u64),
+        ])
+        .map_err(HoldersError::LayoutMismatch)?;
+        let holders = unsafe {
+            HolderTable::from_ptr(base.add(size_of::<HoldersHeader>()), capacity)
+        };
+        let slot = match holders.claim(HOLDER_PRESENT) {
+            Some(s) => s,
+            None => {
+                // A table full of processes that died is not a table
+                // that is full. Reap once, then try again.
+                holders.reap_dead();
+                holders.claim(HOLDER_PRESENT).ok_or(HoldersError::Exhausted)?
+            }
+        };
+        Ok(Self { region, holders, slot, capacity, on_last })
+    }
+
+    /// Processes holding this ring, this one included.
+    #[inline]
+    pub fn live(&self) -> usize {
+        self.holders.live()
+    }
+
+    /// Holder slots the region carries.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// What this hold does when it is the last one out.
+    #[inline]
+    pub fn on_last(&self) -> LastHolder {
+        self.on_last
+    }
+
+    /// Free every slot whose holding process is gone, and report how
+    /// many went.
+    pub fn reap_dead(&self) -> usize {
+        self.holders.reap_dead()
+    }
+
+    /// Give up this process's hold, and say whether the caller should
+    /// now remove the ring's backings.
+    ///
+    /// The ring's paths are the ring's own business, so the decision is
+    /// returned rather than acted on: this type knows how many hold the
+    /// ring, not what removing it would mean.
+    ///
+    /// Idempotent, so a caller that releases early and is then dropped
+    /// does not free a slot another process has since claimed.
+    pub fn release(&mut self) -> bool {
+        if self.slot == usize::MAX {
+            return false;
+        }
+        self.holders.release(self.slot);
+        self.slot = usize::MAX;
+        if self.on_last == LastHolder::Keep {
+            return false;
+        }
+        // Reap first, or a table of corpses keeps the backings alive
+        // after the last live holder has gone.
+        self.holders.reap_dead();
+        self.holders.live() == 0
+    }
+
+    /// Drop the mapping and remove the holders region itself: its file,
+    /// or its shared-memory name.
+    ///
+    /// Consumed, because the region is gone afterward and the view must
+    /// not outlive it.
+    pub fn unlink_self(mut self) -> Result<(), HoldersError> {
+        self.release_mapping()?;
+        let removed = match &mut self.region {
+            HoldersRegion::File { path, .. } => crate::region_file::remove(&std::mem::take(path)),
+            HoldersRegion::Shm { name, namespace, .. } => remove_shm_name(name, *namespace),
+        };
+        match removed {
+            Ok(()) => Ok(()),
+            // Another holder removed it first, which is the same outcome.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Let the live mapping go. A file's is replaced with a one-page
+    /// anonymous mapping, so the file handle is the only thing still
+    /// holding the path; a shared-memory region's is closed outright.
+    ///
+    /// Windows refuses to remove a file while a mapping is live, so a
+    /// failure here means the removal that follows cannot succeed. It is
+    /// returned rather than absorbed: an unlink that quietly left the
+    /// region on disk would read as a ring that had been cleaned up.
+    fn release_mapping(&mut self) -> Result<(), HoldersError> {
+        match &mut self.region {
+            HoldersRegion::File { mmap, .. } => *mmap = MmapOptions::new().len(1).map_anon()?,
+            HoldersRegion::Shm { shm, .. } => drop(shm.take()),
+        }
+        Ok(())
+    }
+}
+
+/// Remove a shared-memory holders region's name.
+#[cfg(unix)]
+fn remove_shm_name(name: &str, namespace: ShmNamespace) -> std::io::Result<()> {
+    crate::shm_file::unlink_named(name, namespace)
+}
+
+/// A Windows section goes with its last handle, which `release_mapping`
+/// closed if it was the last, so there is no name left to remove.
+#[cfg(windows)]
+fn remove_shm_name(_name: &str, _namespace: ShmNamespace) -> std::io::Result<()> {
+    Ok(())
+}
+
+impl std::fmt::Debug for RingHolders {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RingHolders")
+            .field("live", &self.live())
+            .field("capacity", &self.capacity)
+            .field("on_last", &self.on_last)
+            .finish()
+    }
+}
+
+impl Drop for RingHolders {
+    fn drop(&mut self) {
+        // A hold being dropped rather than released has no owner left to
+        // act on "you are the last", so the answer is checked here and
+        // not returned. A ring that wants the unlink calls `release`
+        // itself while it can still reach its paths.
+        let last = self.release();
+        debug_assert!(
+            !last || self.on_last == LastHolder::Unlink,
+            "a Keep hold reported itself as the last one out",
+        );
+    }
+}
+
+/// The header's magic, for a reader that wants to check a region without
+/// mapping it as a header.
+#[inline]
+pub fn magic_of(region: &[u8]) -> Option<u64> {
+    if region.len() < size_of::<HoldersHeader>() {
+        return None;
+    }
+    let p = region.as_ptr() as *const AtomicU64;
+    Some(unsafe { (*p).load(Ordering::Acquire) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the wall clock is after the epoch")
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("subetha_holders_{tag}_{}_{nanos}.bin", std::process::id()))
+    }
+
+    /// Remove a scratch region, saying so if it cannot be removed. A
+    /// leftover mapping on Windows shows up here rather than as the next
+    /// run mysteriously attaching to a stale region.
+    fn cleanup(path: &Path) {
+        match crate::region_file::remove(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("the scratch region {} could not be removed: {e}", path.display()),
+        }
+    }
+
+    /// Two holds on one region count each other, and the region survives
+    /// the first release.
+    #[test]
+    fn a_second_hold_keeps_the_region_alive() {
+        let path = scratch("two");
+        let a = RingHolders::create_or_attach(&path, 4, LastHolder::Unlink).unwrap();
+        let mut b = RingHolders::open(&path, 4, LastHolder::Unlink).unwrap();
+        assert_eq!(a.live(), 2);
+        assert_eq!(b.live(), 2);
+
+        assert!(!b.release(), "one of two holders out is not the last");
+        assert_eq!(a.live(), 1);
+        drop(b);
+
+        assert!(path.exists(), "a live holder keeps the region");
+        drop(a);
+        cleanup(&path);
+    }
+
+    /// The last hold out reports that it is, and only under Unlink.
+    #[test]
+    fn the_last_hold_reports_itself_and_only_when_asked_to() {
+        let path = scratch("last");
+        let mut only = RingHolders::create_or_attach(&path, 2, LastHolder::Unlink).unwrap();
+        assert_eq!(only.live(), 1);
+        assert!(only.release(), "the only holder is the last one out");
+        only.unlink_self().unwrap();
+        assert!(!path.exists(), "unlink_self removes the region");
+
+        let keep_path = scratch("keep");
+        let mut keeper = RingHolders::create_or_attach(&keep_path, 2, LastHolder::Keep).unwrap();
+        assert!(
+            !keeper.release(),
+            "a Keep hold never asks for the backings to be removed, even alone",
+        );
+        assert!(keep_path.exists());
+        drop(keeper);
+        cleanup(&keep_path);
+    }
+
+    /// Releasing twice frees one slot, not two. A second release would
+    /// otherwise free a slot another process had since claimed.
+    #[test]
+    fn releasing_twice_frees_one_slot() {
+        let path = scratch("twice");
+        let mut a = RingHolders::create_or_attach(&path, 4, LastHolder::Keep).unwrap();
+        let b = RingHolders::open(&path, 4, LastHolder::Keep).unwrap();
+        assert_eq!(b.live(), 2);
+        a.release();
+        assert_eq!(b.live(), 1);
+        a.release();
+        assert_eq!(b.live(), 1, "the second release is a no-op, not another slot freed");
+        drop(a);
+        drop(b);
+        cleanup(&path);
+    }
+
+    /// A region built for one holder count refuses an attach at another,
+    /// rather than reading past what is mapped.
+    #[test]
+    fn a_different_holder_count_is_refused() {
+        let path = scratch("count");
+        let a = RingHolders::create_or_attach(&path, 4, LastHolder::Keep).unwrap();
+        assert!(matches!(
+            RingHolders::open(&path, 8, LastHolder::Keep).unwrap_err(),
+            HoldersError::LayoutMismatch(m) if m == crate::layout::Mismatch::new(
+                "length",
+                holders_region_size(4) as u64,
+                holders_region_size(8) as u64,
+            ),
+        ));
+        drop(a);
+        cleanup(&path);
+    }
+
+    /// Every slot held by a live process is exhaustion; the caller is
+    /// told rather than given a slot that is not theirs.
+    #[test]
+    fn a_full_table_is_reported_rather_than_overrun() {
+        let path = scratch("full");
+        let a = RingHolders::create_or_attach(&path, 1, LastHolder::Keep).unwrap();
+        assert!(matches!(
+            RingHolders::open(&path, 1, LastHolder::Keep).unwrap_err(),
+            HoldersError::Exhausted,
+        ));
+        drop(a);
+        cleanup(&path);
+    }
+
+    /// A shared-memory table's name, unique to this run, removed when the
+    /// test ends however it ends.
+    struct ShmScratch(String);
+
+    impl ShmScratch {
+        fn named(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the wall clock is after the epoch")
+                .as_nanos();
+            Self(format!("subetha_holders_{tag}_{}_{nanos}", std::process::id()))
+        }
+    }
+
+    impl Drop for ShmScratch {
+        fn drop(&mut self) {
+            #[cfg(unix)]
+            if let Err(e) = crate::shm_file::unlink_named(&self.0, ShmNamespace::Session)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                eprintln!("the scratch table {} could not be removed: {e}", self.0);
+            }
+        }
+    }
+
+    /// A shared-memory table counts its holds as a file one does, outlives
+    /// the hold that made it, and goes with the last hold out.
+    #[test]
+    fn a_shm_table_outlives_its_maker_and_goes_with_the_last_hold() {
+        let name = ShmScratch::named("shm");
+        let hold = |on_last| {
+            RingHolders::create_or_attach_shm(&name.0, ShmNamespace::Session, None, 4, on_last)
+        };
+        let maker = hold(LastHolder::Unlink).expect("the first hold makes the table");
+        let mut other = hold(LastHolder::Unlink).expect("a second hold attaches");
+        assert_eq!(other.live(), 2);
+        drop(maker);
+
+        let later = hold(LastHolder::Unlink).expect("a hold after the maker has gone");
+        assert_eq!(later.live(), 2, "the later hold joins the table the maker made");
+        drop(later);
+
+        assert!(other.release(), "the only hold left is the last one out");
+        other.unlink_self().expect("the last hold removes the table");
+        match ShmFile::open_named_in(&name.0, holders_region_size(4), ShmNamespace::Session) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("the table's open failed for another reason: {e}"),
+            Ok(_) => panic!("the table is still there after its last hold removed it"),
+        }
+    }
+
+    /// A shared-memory table a process left half laid out, its holder count
+    /// written and its magic not, is finished by the next hold at once
+    /// rather than waited on; one an earlier SubEtha left in progress is
+    /// refused at once as another layout's magic.
+    #[test]
+    fn a_shm_layout_left_unfinished_is_finished_and_an_earlier_one_refused_at_once() {
+        for (tag, magic) in [("unfinished", 0u64), ("earlier", 1u64)] {
+            let name = ShmScratch::named(tag);
+            let mut left = ShmFile::create_or_open_named(&name.0, holders_region_size(4))
+                .expect("the region left behind");
+            let header = left.as_mut_slice().as_mut_ptr() as *mut HoldersHeader;
+            unsafe {
+                (*header).capacity = 4;
+                (*header).magic = magic;
+            }
+            let started = std::time::Instant::now();
+            let found = RingHolders::create_or_attach_shm(&name.0, ShmNamespace::Session, None, 4, LastHolder::Keep);
+            assert!(
+                started.elapsed() < crate::mmf_attach::INIT_WAIT / 2,
+                "{tag}: returned only after {:?}",
+                started.elapsed()
+            );
+            if magic == 0 {
+                let hold = found.expect("the next hold finishes the layout");
+                assert_eq!(hold.live(), 1, "and holds a slot in it");
+            } else {
+                match found {
+                    Ok(_) => panic!("a table another layout was building was attached"),
+                    Err(e) => assert!(
+                        matches!(&e, HoldersError::LayoutMismatch(m)
+                            if *m == crate::layout::Mismatch::new("magic", 1, HOLDERS_MAGIC)),
+                        "{e:?}"
+                    ),
+                }
+            }
+            drop(left);
+        }
+    }
+
+    #[test]
+    fn the_region_is_a_header_and_its_slots() {
+        assert_eq!(holders_region_size(0), 64);
+        assert_eq!(holders_region_size(1), 64 + 64);
+        assert_eq!(holders_region_size(8), 64 + 8 * 64);
+    }
+}

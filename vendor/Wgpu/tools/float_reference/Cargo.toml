@@ -1,0 +1,13 @@
+[package]
+name = "float-reference"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Writes src/float_reference.rs, littleCMS 2.19's float conversions the module's tests compare with"
+
+[dependencies]
+# The littleCMS source lcms2-sys vendors, 2.19, built here, never a system
+# library pkg-config finds.
+lcms2-sys = { version = "=4.0.7", default-features = false, features = ["static"] }
+
+[workspace]

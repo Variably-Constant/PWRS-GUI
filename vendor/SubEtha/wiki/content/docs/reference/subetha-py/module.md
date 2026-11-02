@@ -1,0 +1,55 @@
+---
+title: "Module functions, attributes and exceptions"
+weight: 20
+---
+
+# Module functions, attributes and exceptions
+
+What `import subetha` gives you besides the classes. Generated
+from the type stub and `python/subetha/sidecar.py` by
+`crates/subetha-py/tools/export_reference.py`.
+
+## Functions
+
+| Function | What it does |
+|---|---|
+| `boundary_note() -> str` | What this binding costs, reported by the binding itself so a caller can check the claim on its own machine rather than take the number in the documentation. |
+| `generate_self_signed_cert(name: str) -> tuple[bytes, bytes]` | Make a certificate and its key for a QUIC bridge, both as bytes. |
+| `lamport_pair(path: str, capacity: int) -> tuple[LamportProducer, LamportConsumer]` | Make a Lamport pair at `path`: one producer and one consumer over one ring. |
+| `lamport_pair_open(path: str, capacity: int) -> tuple[LamportProducer, LamportConsumer]` | Attach to a Lamport ring that already exists. |
+| `mpmc_grid(path: str, producers: int, consumers: int, capacity: int) -> tuple[list[MpmcProducer], list[MpmcConsumer]]` | Build an MPMC grid: a ring per producer, shared out among consumers. |
+| `mpmc_grid_open(path: str, producers: int, consumers: int, capacity: int) -> tuple[list[MpmcProducer], list[MpmcConsumer]]` | Attach to a grid that already exists, with the shape it was built at. |
+| `mpsc_pool(path: str, producers: int, capacity: int) -> tuple[list[MpscProducer], MpscConsumer]` | Build an MPSC pool: one ring per producer, drained by one consumer. |
+| `mpsc_pool_open(path: str, producers: int, capacity: int) -> tuple[list[MpscProducer], MpscConsumer]` | Attach to a pool that already exists, with the shape it was built at. |
+
+## The sidecar module
+
+`from subetha import sidecar` reaches the process's sidecar as a
+whole. An object registers with it through its own `observe`,
+which returns a `Registration`.
+
+| Function | What it does |
+|---|---|
+| `sidecar.instance_count() -> int` | How many objects are registered with the sidecar now. |
+| `sidecar.max_instances() -> int` | The most objects the sidecar holds at once, 10,000 unless changed. |
+| `sidecar.node_count() -> int` | The sidecar's scan threads, one per NUMA node. |
+| `sidecar.scan_now() -> None` | Have every scan thread scan now, and wait for it. |
+| `sidecar.set_max_instances(cap: int) -> None` | Raise or lower the most objects the sidecar holds at once. |
+
+## Attributes
+
+| Attribute | Type |
+|---|---|
+| `transports` | `list[str]` |
+| `free_threaded` | `bool` |
+| `OPTIONAL_BY_TRANSPORT` | `dict[str, tuple[str, ...]]` |
+
+## Exceptions
+
+| Exception | Raised when |
+|---|---|
+| `Contended` | Another live process holds the lease and has not been quiet long. |
+| `Lagged` | A subscriber fell behind and what it asked for was overwritten. |
+| `LayoutMismatch` | The file holds a structure of another shape than the call asked for. |
+| `WrongLane` | The key belongs to a different lane and must be written through it. |
+

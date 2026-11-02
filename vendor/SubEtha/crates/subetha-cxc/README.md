@@ -1,0 +1,194 @@
+# subetha-cxc
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/Variably-Constant/SubEtha/blob/main/crates/subetha-cxc/LICENSE-MIT)
+[![Wiki](https://img.shields.io/badge/wiki-variably--constant.github.io-blue)](https://variably-constant.github.io/SubEtha/docs/reference/subetha-cxc/)
+
+The MMF-backed cross-process primitive family for
+[SubEtha](https://github.com/Variably-Constant/SubEtha). More than
+sixty primitives, all sitting on a single mechanism: a memory-mapped
+file. The same byte layout serves
+cross-thread, cross-process, and disk-persistent.
+
+> **You probably want the [`subetha`](https://crates.io/crates/subetha)
+> umbrella crate instead.** It re-exports this crate as
+> `subetha::cxc`, beside `subetha::core`, `subetha::pointers` and
+> `subetha::sidecar`, and forwards this crate's capability features.
+
+## Why one mechanism
+
+A memory-mapped file gives the caller three things at once:
+
+1. **Cross-thread**. Two threads in one process both map the
+   same file. They get two virtual mappings pointing at the
+   same physical pages.
+
+2. **Cross-process**. Two *processes* map the same file. The OS
+   page cache aliases them onto identical physical pages. Atomic
+   CAS that worked between threads now works between processes.
+
+3. **Disk persistence**. The file is real. Modify the mapped
+   region; eventually dirty pages flush back to disk. Restart
+   the process and reopen the file - the bytes are right where
+   the writer left them.
+
+There is no separate "shared memory" abstraction versus a
+"disk" abstraction. The MMF is both at once.
+
+## The primitives
+
+| Category | Primitives |
+|---|---|
+| Rings, stacks | `SharedRing`, `SharedBroadcastRing`, `SharedTreiberStack` |
+| Hash maps, ordered maps | `SharedHashMap`, `SharedBTreeMap`, `SharedLRUCache` |
+| Atomics | `SharedAtomicU32`, `SharedAtomicU64`, `SharedAtomicBool` |
+| Cells | `SharedCell`, `SharedOnceCell` |
+| Pacing and time | `SharedRateLimiter`, `SharedFenceClock` |
+| Sketches | `SharedBloomFilter`, `SharedCountMinSketch`, `SharedHyperLogLog`, `SharedHistogram`, `SharedReservoirSampler` |
+| Arenas, handles | `SharedStringArena`, `SharedHandleTable`, `SharedRegion`, `SharedArray` |
+| Ownership | `SharedLeaderElection`, `LazyConfig` |
+| Coordination | `HeartbeatTable`, `EpochBarrier`, `FailoverWatchdog`, `EventStateLog`, `SharedVersionedChain`, `SharedTimePointTile`, `PriorityFanout`, `ProgressTask`, `BackgroundScheduler`, `SharedGraph`, `SharedTopologyMap`, `KTowerCascade`, `SharedAsyncPointer`, `pass_registry` |
+| Pointer variants | `SharedUmbraPointer`, `SharedUniversal`, `SharedNaNValue`, `SharedNaNTaggedValue`, `OffsetPtr`, `TaggedOffsetPtr` |
+| Polymorphic substrate (shape axis) | `SpscRingCore` (native primitive), `SharedRingMpsc`, `SharedRingMpmc`, `AdaptiveRing` (default ring; SPSC/MPSC/MPMC/Vyukov morph) |
+| Polymorphic substrate (locale axis) | `LocaleAdaptiveRing` (Anon/File/ShmFs morph), `ShmFile` (cross-platform named shared memory) |
+| Polymorphic substrate (protocol axis) | `AdaptiveIpc<T>` (ring + deque), `PubSubRing` + `PubSubSubscriber` (one-to-many fanout) |
+| Polymorphic substrate (identity + policy) | `VirtualEndpoint` + `VirtualEndpointRegistry`, `QosPolicy`, `SubscriberPosition` |
+| Bridges (Cargo feature flags) | `QuicBridgeClient` / `QuicBridgeServer` (`quic-bridge`), `TcpBridgeClient` / `TcpBridgeServer` (`tcp-bridge`) |
+| Platform-gated | `HugepageRegion` (Linux), `LargePageRegion` (Windows), `SuperPageRegion` (FreeBSD, macOS), `VsockSocket` (Linux, Windows), `DirectFileRing` (Unix, Windows), `fd_handoff` (`send_fd` / `recv_fd` on Unix, `send_handle` / `recv_handle` on Windows), `WireSocket` (`wire-locale` feature) |
+
+Full primitive catalog at the wiki:
+<https://variably-constant.github.io/SubEtha/docs/reference/subetha-cxc/catalog/>.
+
+## Cargo feature flags
+
+Optional substrate primitives that pull in additional dependencies
+or target a specific OS. Default features compile clean without any
+of these.
+
+| Feature | Pulls | Enables |
+|---|---|---|
+| `quic-bridge` | quinn, rcgen, rustls, tokio | `quic_bridge::{QuicBridgeClient, QuicBridgeServer, make_self_signed_pair, install_default_crypto_provider}` |
+| `tcp-bridge` | tokio (net + io-util + rt-multi-thread + macros) | `tcp_bridge::{TcpBridgeClient, TcpBridgeServer}` |
+| `wire-locale` | xsk-rs and libxdp-sys on Linux; nothing extra elsewhere | `locale_wire::WireSocket`: AF_XDP on Linux 4.18+, XDP on Windows, netmap on FreeBSD, BPF on macOS |
+| `tls` | rustls, rcgen | A TLS 1.3 record layer for the Sens-O-Matic / RLC transport: the rustls handshake carried over the transport's own reliable delivery, and AEAD on every item |
+| `tcp-tls-bridge` | tokio-rustls (with `tcp-bridge` and `tls`) | The TcpBridge wire protocol inside that record layer |
+| `linux-futex-raw` | (no extra dep; uses libc) | The direct futex syscall surface on `CrossProcessWaker` (`FUTEX_WAIT_BITSET`, `FUTEX_REQUEUE`) |
+| `residue-fec` | (no extra dep) | `residue_fec`, a residue-number erasure code recovered by the Chinese remainder theorem. Not part of the published API: it is correct, and about 210 times slower to encode than the sliding-window RLC |
+| `zmq-bench` | zmq (links C libzmq) | The ZeroMQ contender in the `cross_process_compare` bench |
+| `iceoryx-bench` | iceoryx2 | The iceoryx2 contender in the `cross_process_compare` bench |
+
+Modules gated on `cfg(target_os = "linux")` are compiled away on
+other platforms; modules gated on `cfg(unix)` are excluded on
+Windows.
+
+## Quick start
+
+A cross-process hash map:
+
+```rust,no_run
+use subetha_cxc::SharedHashMap;
+
+// Producer process:
+let m = SharedHashMap::<u32, u64>::create("/tmp/sessions.bin", 4096)
+    .unwrap();
+m.insert(42, 4242).unwrap();
+m.flush().unwrap();  // msync dirty pages to disk
+
+// Consumer process (different binary, same file):
+let m = SharedHashMap::<u32, u64>::open("/tmp/sessions.bin", 4096)
+    .unwrap();
+assert_eq!(m.get(&42), Some(4242));
+```
+
+A lock-free MPMC ring:
+
+```rust,no_run
+use subetha_cxc::SharedRing;
+
+let r = SharedRing::create("/tmp/queue.bin", 1024).unwrap();
+r.try_push(b"hello").unwrap();
+let mut buf = [0u8; subetha_cxc::PAYLOAD_BYTES];
+let n = r.try_pop(&mut buf).unwrap();
+```
+
+## Invariants
+
+Three invariants hold across the family:
+
+- **No absolute pointers.** Pointers between slots inside the
+  mapped region are file-relative offsets via `OffsetPtr` or
+  `TaggedOffsetPtr`, never raw pointers. The kernel can map the
+  file at any virtual base; offset arithmetic stays valid in
+  both mappings.
+
+- **Deterministic hashing.** Maps and sketches hash with FNV-1a
+  (`fnv1a_64` in the hash map; seeded FNV-1a finished by a
+  MurmurHash3 mixer in the sketches), never
+  `std::hash::RandomState`. The same key produces the same slot in
+  every process linking the crate.
+
+- **Power-of-2 capacity.** Rings and deques reduce a position to a
+  slot with `pos & (capacity - 1)`, one `AND` instead of a divide,
+  so they take only power-of-two capacities: `SharedRing::create`
+  panics on any other, and `SharedDeque::create` and the
+  capacity-adaptive rings return `InvalidCapacity`. `SharedHashMap`
+  takes any capacity of at least 2 and masks its probe only when the
+  capacity is a power of two.
+
+## Sidecar observation
+
+Most of the family implements
+`subetha_sidecar::AdaptiveInstance` and carries a
+`HandshakeHeader` plus `ObservationRing`; the deques, `SharedArc`,
+`SharedEpochs` and `SharedVersionedSlab` are among the exceptions. The bare
+`create` / `open` constructors return the unregistered type.
+Wrap in `SidecarBox` for sidecar observation:
+
+```rust,no_run
+use subetha_cxc::SharedHashMap;
+use subetha_sidecar::SidecarBox;
+
+let m = SidecarBox::new(
+    SharedHashMap::<u32, u64>::create("/tmp/sessions.bin", 4096).unwrap()
+);
+m.insert(42, 4242).unwrap();
+
+let stats = m.stats().unwrap();
+println!("ops_observed = {}", stats.ops_observed);
+```
+
+The default `Policy` for MMF primitives is `NoMigrationPolicy`
+because the strategy is the byte layout, which is not migrable
+in place.
+
+## Requirements
+
+SubEtha builds on **stable Rust** (edition 2024, MSRV 1.96). The
+`rust-toolchain.toml` at the workspace root pins the stable channel;
+downstream projects need only a recent stable toolchain.
+
+## Where it sits
+
+```text
+your code
+    -> subetha-cxc                  (this crate)
+       -> subetha-pointers           (pointer types)
+       -> subetha-sidecar            (control plane)
+       -> subetha-core               (substrate, under the other two as well)
+```
+
+## Documentation
+
+Category overview at the published wiki:
+<https://variably-constant.github.io/SubEtha/docs/reference/subetha-cxc/>,
+and every primitive in its catalog:
+<https://variably-constant.github.io/SubEtha/docs/reference/subetha-cxc/catalog/>.
+
+Architectural background:
+- [Frozen handshakes](https://variably-constant.github.io/SubEtha/docs/explanation/frozen-handshake/) -
+  the thesis behind topology-axis un-freezing.
+- [MMF substrate](https://variably-constant.github.io/SubEtha/docs/explanation/mmf-substrate/) -
+  why one byte layout serves three deployment modes.
+
+## License
+
+MIT. See [LICENSE-MIT](https://github.com/Variably-Constant/SubEtha/blob/main/crates/subetha-cxc/LICENSE-MIT).

@@ -1,0 +1,129 @@
+[package]
+name = "pwrs-gui-egui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "PWRS-GUI's egui renderer: draws each window the module opens in a viewport of its own and reports what people do in it."
+publish = false
+
+[dependencies]
+pwrs-gui-proto = { path = "../pwrs-gui-proto", features = ["typeface"] }
+pwrs-gui-dialogs = { path = "../pwrs-gui-dialogs" }
+# The fonts text is drawn in by default ([`system_fonts`]).
+pwrs-gui-fonts = { path = "../pwrs-gui-fonts" }
+pwrs-gui-gpu = { path = "../pwrs-gui-gpu" }
+arc-swap.workspace = true
+crossbeam-queue.workspace = true
+eframe.workspace = true
+# An Image's raster pictures through the image crate, GIF and WebP animated
+# ([`install_picture_loaders`]); none of egui_extras's file or network
+# loaders.
+egui_extras = { workspace = true, features = ["image", "gif", "webp"] }
+# The image crate's decoders for the raster formats an Image takes.
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico"] }
+# An Image's SVG pictures, drawn in the fonts the text is drawn in
+# ([`SvgLoader`]); fontdb is the version usvg takes, so both share one
+# database.
+resvg = { version = "0.49.0", default-features = false, features = ["text", "raster-images"] }
+# The database of the system's fonts proto reads ([`system_fonts`]), which
+# SVG pictures are drawn in, and the glyphs each face has, which the fonts
+# for scripts the UI font lacks are found by ([`fallback`]).
+fontdb = "0.24.0"
+ttf-parser = "0.25.1"
+# The https loader both helpers link, for a Markdown document's pictures
+# ([`web::WebLoader`]) and a media clip's header and stream ([`media`]).
+pwrs-gui-fetch = { path = "../pwrs-gui-fetch" }
+# wgpu's default features, so the OpenGL backend is built beside DirectX 12,
+# Vulkan and Metal whatever egui-wgpu enables.
+wgpu = "30.0.1"
+# A Chart's series, axes, legend, panning and zooming ([`chart`]).
+egui_plot = "0.38.0"
+# A Canvas's items ([`canvas`]): lyon_tessellation fills any path under
+# either fill rule and strokes it with caps, joins and miters, and
+# lyon_algorithms measures a path to cut a stroke's dashes and tells
+# whether a point is on an item.
+lyon_tessellation = "1.0.23"
+lyon_algorithms = "1.0.22"
+# eframe's winit, named here for its platform settings ([`loop_settings`]):
+# on Windows the event loop may run off the process's first thread, and on
+# macOS the application need not take the focus as it starts; and for the
+# X11 window a window opening without the focus is ([`unfocused_on_map`]).
+winit = "0.30.13"
+# The system's clipboard, which a test's input pastes from at Ctrl+V and
+# Shift+Insert, as egui-winit does for a person's keys ([`input`]): the
+# version egui-winit takes, for text alone.
+arboard = { version = "3.7.0", default-features = false }
+
+# windows-sys pins a GPU driver's hook library ([`keep_driver_hooks`]) and
+# brings a new window to the front ([`raise_window`]) and loads Media
+# Foundation's platform library ([`media`]); the windows crate drives Media
+# Foundation's media engine and copies its frames out through a WIC
+# bitmap, or writes them into Direct3D 11 textures that wgpu's Direct3D 12
+# or Vulkan device opens through their NT handles, and windows-core, whose implement
+# macro names it, makes the object the engine tells its events to
+# ([`media`]).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Imaging",
+    "Win32_Media_MediaFoundation",
+    "Win32_Security",
+    "Win32_System_Com",
+] }
+windows-core = "0.62.2"
+
+# libX11, loaded at run time as winit loads it, for where the pointer is
+# when files are dropped ([`routed`]) and the property a window opening
+# without the focus has ([`unfocused_on_map`]); dlopen2, the version tao
+# takes, loads GStreamer when the first media player opens ([`media`]).
+[target.'cfg(all(unix, not(target_vendor = "apple")))'.dependencies]
+x11-dl = "2.21.0"
+dlopen2 = "0.8.2"
+
+# AppKit, for where the pointer is when files are dropped ([`routed`]);
+# AVFoundation's player, its assets and their resource loader for https
+# clips, its legible output for a clip's own cues and its audio mix, Media
+# Toolbox's audio tap that measures the sound, Core Media's times, Core
+# Video's pixel buffers and the texture cache that hands them to wgpu's
+# Metal device, with the Foundation classes, Core Audio's buffer types,
+# Metal's texture types, blocks and CoreFoundation strings they take, for
+# media players ([`media`]).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-app-kit = { workspace = true, features = ["NSEvent", "NSScreen"] }
+block2.workspace = true
+objc2-foundation = { workspace = true, features = ["NSArray", "NSAttributedString", "NSData", "NSDictionary", "NSEnumerator", "NSError", "NSKeyValueObserving", "NSNotification", "NSString", "NSURL", "NSValue"] }
+objc2-core-foundation = { workspace = true, features = ["CFCGTypes", "CFString"] }
+objc2-av-foundation = { workspace = true, features = [
+    "AVAsset",
+    "AVAssetResourceLoader",
+    "AVAssetTrack",
+    "AVAudioMix",
+    "AVAudioProcessingSettings",
+    "AVError",
+    "AVMediaFormat",
+    "AVMediaSelection",
+    "AVMediaSelectionGroup",
+    "AVPlayer",
+    "AVPlayerItem",
+    "AVPlayerItemOutput",
+    "AVPlayerItemTrack",
+    "block2",
+    "objc2-core-foundation",
+    "objc2-core-media",
+    "objc2-core-video",
+    "objc2-media-toolbox",
+] }
+objc2-core-audio-types = { workspace = true, features = ["CoreAudioBaseTypes"] }
+objc2-core-media = { workspace = true, features = ["CMTime", "CMTimeRange"] }
+objc2-core-video = { workspace = true, features = ["CVBase", "CVBuffer", "CVImageBuffer", "CVMetalTexture", "CVMetalTextureCache", "CVPixelBuffer", "CVReturn", "objc2", "objc2-metal"] }
+objc2-media-toolbox = { workspace = true, features = ["MTAudioProcessingTap", "objc2-core-audio-types", "objc2-core-media"] }
+objc2-metal = { workspace = true, features = ["MTLPixelFormat", "MTLResource", "MTLTexture"] }

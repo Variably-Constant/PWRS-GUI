@@ -1,0 +1,1305 @@
+//! `LocaleAdaptiveRing`: same-host locale-axis morph for the ring
+//! family.
+//!
+//! Wraps two `AdaptiveRing` instances - one anon-backed (fast, in-
+//! process only), one file-backed (persistent, cross-process
+//! visible) - behind an MMF-resident locale tag. Callers send/recv
+//! through whichever locale is currently active; migration drains
+//! one backing and pushes into the other, bumps the pin generation,
+//! and flips the tag.
+//!
+//! The pin protocol mirrors `AdaptiveRing` (shape axis) and
+//! `AdaptiveIpc` (protocol axis): one Acquire load on
+//! `locale_generation`, captured at pin time, compared on every
+//! validity check. `PinnedLocale::as_anon()` /
+//! `PinnedLocale::as_file()` return `&AdaptiveRing` so the caller
+//! chains directly into the existing shape-axis pin.
+//!
+//! Locale-axis ordering in the substrate:
+//!
+//! ```text
+//!   LocaleAdaptiveRing                 (locale axis)
+//!         |
+//!         | pin_current_locale()
+//!         v
+//!   PinnedLocale { active = Anon | File }
+//!         |
+//!         | as_anon() / as_file() -> &AdaptiveRing
+//!         v
+//!   AdaptiveRing                       (shape axis)
+//!         |
+//!         | pin_current_shape()
+//!         v
+//!   PinnedRing { shape = Spsc | ... }
+//!         |
+//!         | spsc_try_push / mpmc_try_push / ...
+//!         v
+//!   SpscRingCore / SharedRing          (native primitive)
+//! ```
+
+use std::cell::Cell;
+use std::marker::PhantomData;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
+use crate::adaptive_ring::{AdaptiveError, AdaptiveRing, ADAPTIVE_SPSC_PAYLOAD_BYTES};
+use crate::cross_process_waker::CrossProcessWaker;
+use crate::move_watch::MoveWatch;
+use crate::ordering::{default_stamp_kind, OrderingMode};
+use crate::shared_atomic::{SharedAtomicU32, SharedAtomicU64};
+use crate::shared_ring::RingError;
+
+/// The three locales a `LocaleAdaptiveRing` can hold its bytes at.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Locale {
+    /// In-process anonymous memory. No syscalls, no file system,
+    /// no cross-process visibility. Cheapest send/recv.
+    Anon = 0,
+    /// MMF-backed file storage. Persisted to disk via the page
+    /// cache, visible to any process that opens the file.
+    File = 1,
+    /// Named RAM-resident shared memory (ShmFs). Cross-process
+    /// visible by name; never touches the page cache or disk.
+    /// Sits between Anon (no cross-process) and File (page-cached
+    /// + disk-persistent) on the locale axis.
+    ShmFs = 2,
+}
+
+impl Locale {
+    fn from_u32(tag: u32) -> Self {
+        match tag {
+            0 => Self::Anon,
+            1 => Self::File,
+            2 => Self::ShmFs,
+            _ => panic!("LocaleAdaptiveRing locale_tag corrupted: {tag}"),
+        }
+    }
+}
+
+/// Two-locale ring with cross-process pin invalidation.
+///
+/// Pre-allocates both an anon backing and a file backing at
+/// construction; the active locale is selected by a single
+/// MMF-resident `locale_tag` and flipped via `migrate_to`.
+pub struct LocaleAdaptiveRing {
+    /// MMF-resident locale tag; one Acquire load per dispatched op.
+    locale_tag: Arc<SharedAtomicU32>,
+    /// MMF-resident generation; bumped on every migrate_to.
+    locale_generation: Arc<SharedAtomicU64>,
+    /// Anon-backed AdaptiveRing. Active when locale_tag == 0.
+    anon: AdaptiveRing,
+    /// File-backed AdaptiveRing. Active when locale_tag == 1.
+    file: AdaptiveRing,
+    /// ShmFs-backed AdaptiveRing. Active when locale_tag == 2.
+    shmfs: AdaptiveRing,
+    /// Base path for the file backing + the locale-control MMFs.
+    /// The ShmFs backing derives its name prefix from this base.
+    base_path: PathBuf,
+    /// The blocking types' wakers this ring wakes after every migration,
+    /// shared with the three backings so a backing's reshape wakes them
+    /// too.
+    moves: Arc<MoveWatch>,
+}
+
+unsafe impl Send for LocaleAdaptiveRing {}
+unsafe impl Sync for LocaleAdaptiveRing {}
+
+impl LocaleAdaptiveRing {
+    /// Construct a two-locale ring. Both backings are pre-allocated.
+    /// Initial locale is `Anon`. The file backing lives at
+    /// `{base_path}.locale.file.ring.{spsc,mpsc.i,mpmc.i,vyukov}.bin`;
+    /// the locale tag at `{base_path}.locale.tag.bin`; the
+    /// generation at `{base_path}.locale.gen.bin`.
+    pub fn create(
+        base_path: impl Into<PathBuf>,
+        max_producers: usize,
+        max_consumers: usize,
+        capacity: usize,
+    ) -> Result<Self, RingError> {
+        let base_path: PathBuf = base_path.into();
+
+        let tag_path = with_suffix(&base_path, ".locale.tag.bin");
+        let gen_path = with_suffix(&base_path, ".locale.gen.bin");
+        let file_ring_prefix = with_suffix(&base_path, ".locale.file.ring");
+
+        let locale_tag = Arc::new(
+            SharedAtomicU32::create(&tag_path, 0)
+                .map_err(|_| RingError::PayloadTooLarge)?,
+        );
+        let locale_generation = Arc::new(
+            SharedAtomicU64::create(&gen_path, 0)
+                .map_err(|_| RingError::PayloadTooLarge)?,
+        );
+
+        let anon =
+            AdaptiveRing::create_anon(max_producers, max_consumers, capacity)?;
+        let file = AdaptiveRing::create(
+            &file_ring_prefix,
+            max_producers,
+            max_consumers,
+            capacity,
+        )?;
+        // ShmFs backing: derive a name prefix from the base path so
+        // a second process opening the same base_path resolves to
+        // the same named shm regions.
+        let shmfs_name_prefix = shmfs_name_prefix_for(&base_path);
+        let shmfs = AdaptiveRing::create_shmfs(
+            &shmfs_name_prefix,
+            max_producers,
+            max_consumers,
+            capacity,
+        )?;
+
+        Ok(Self::assemble(locale_tag, locale_generation, anon, file, shmfs, base_path))
+    }
+
+    /// As [`create`](Self::create) with ordering stamps on all
+    /// three locale backings (one stamp kind picked once so the
+    /// backings agree), letting the ordering axis compose with
+    /// locale migrations. The ordering mode is applied to all three
+    /// backings via [`set_ordering_mode`](Self::set_ordering_mode)
+    /// so the discipline follows the ring across migrations.
+    ///
+    /// Locale migration of a merge-mode ring re-stamps items as the
+    /// transfer drains them: under the merge the drain order is stamp
+    /// order, so the destination preserves global order. Under
+    /// `Unordered` the transfer's round-robin drain can reorder items
+    /// across producers, as a shape morph can. The
+    /// migrating thread auto-acquires the drainer lease; a live
+    /// drainer in another process makes `migrate_to` fail with the
+    /// transfer's `NotDrainer` error rather than corrupting order.
+    pub fn create_with_ordering_stamps(
+        base_path: impl Into<PathBuf>,
+        max_producers: usize,
+        max_consumers: usize,
+        capacity: usize,
+    ) -> Result<Self, RingError> {
+        let base_path: PathBuf = base_path.into();
+        let kind = default_stamp_kind();
+
+        let tag_path = with_suffix(&base_path, ".locale.tag.bin");
+        let gen_path = with_suffix(&base_path, ".locale.gen.bin");
+        let file_ring_prefix = with_suffix(&base_path, ".locale.file.ring");
+
+        let locale_tag = Arc::new(
+            SharedAtomicU32::create(&tag_path, 0)
+                .map_err(|_| RingError::PayloadTooLarge)?,
+        );
+        let locale_generation = Arc::new(
+            SharedAtomicU64::create(&gen_path, 0)
+                .map_err(|_| RingError::PayloadTooLarge)?,
+        );
+
+        let anon = AdaptiveRing::create_anon(max_producers, max_consumers, capacity)?
+            .with_ordering_stamps_kind(kind)?;
+        let file = AdaptiveRing::create(
+            &file_ring_prefix, max_producers, max_consumers, capacity,
+        )?
+        .with_ordering_stamps_kind(kind)?;
+        let shmfs_name_prefix = shmfs_name_prefix_for(&base_path);
+        let shmfs = AdaptiveRing::create_shmfs(
+            &shmfs_name_prefix, max_producers, max_consumers, capacity,
+        )?
+        .with_ordering_stamps_kind(kind)?;
+
+        Ok(Self::assemble(locale_tag, locale_generation, anon, file, shmfs, base_path))
+    }
+
+    /// Attach to the ring another handle created under `base_path` with
+    /// the same counts and capacity, without re-initializing any backing:
+    /// the locale tag and generation are opened, the file and
+    /// shared-memory backings are opened, and this handle's anonymous
+    /// backing is its own. With `stamped` the backings' ordering regions
+    /// are attached and the creator's stamp kind adopted. An absent
+    /// backing is an I/O error and one of another shape a
+    /// `LayoutMismatch`.
+    pub fn open(
+        base_path: impl Into<PathBuf>,
+        max_producers: usize,
+        max_consumers: usize,
+        capacity: usize,
+        stamped: bool,
+    ) -> Result<Self, RingError> {
+        let base_path: PathBuf = base_path.into();
+
+        let tag_path = with_suffix(&base_path, ".locale.tag.bin");
+        let gen_path = with_suffix(&base_path, ".locale.gen.bin");
+        let file_ring_prefix = with_suffix(&base_path, ".locale.file.ring");
+
+        let atomic_error = |e: crate::shared_atomic::SharedAtomicError| match e {
+            crate::shared_atomic::SharedAtomicError::LayoutMismatch(m) => RingError::LayoutMismatch(m),
+            crate::shared_atomic::SharedAtomicError::IoError(e) => RingError::IoError(e),
+        };
+        let locale_tag = Arc::new(SharedAtomicU32::open(&tag_path).map_err(atomic_error)?);
+        let locale_generation = Arc::new(SharedAtomicU64::open(&gen_path).map_err(atomic_error)?);
+
+        let anon = AdaptiveRing::create_anon(max_producers, max_consumers, capacity)?;
+        let file = AdaptiveRing::open(&file_ring_prefix, max_producers, max_consumers, capacity)?;
+        let shmfs_name_prefix = shmfs_name_prefix_for(&base_path);
+        let shmfs = AdaptiveRing::open_shmfs(&shmfs_name_prefix, max_producers, max_consumers, capacity)?;
+        let (anon, file, shmfs) = if stamped {
+            let file = file.with_ordering_stamps()?;
+            let kind = file.stamp_kind().unwrap_or_else(default_stamp_kind);
+            (
+                anon.with_ordering_stamps_kind(kind)?,
+                file,
+                shmfs.with_ordering_stamps_kind(kind)?,
+            )
+        } else {
+            (anon, file, shmfs)
+        };
+
+        Ok(Self::assemble(locale_tag, locale_generation, anon, file, shmfs, base_path))
+    }
+
+    /// The ring around its three backings, which share its move watch.
+    fn assemble(
+        locale_tag: Arc<SharedAtomicU32>,
+        locale_generation: Arc<SharedAtomicU64>,
+        mut anon: AdaptiveRing,
+        mut file: AdaptiveRing,
+        mut shmfs: AdaptiveRing,
+        base_path: PathBuf,
+    ) -> Self {
+        let moves = Arc::<MoveWatch>::default();
+        anon.share_moves(&moves);
+        file.share_moves(&moves);
+        shmfs.share_moves(&moves);
+        Self { locale_tag, locale_generation, anon, file, shmfs, base_path, moves }
+    }
+
+    /// Wake every waiter on `consumer` and `producer` after each migration
+    /// of this ring and each shape morph of a backing, whatever makes it.
+    /// A blocking type registers its wakers here; the ring holds them
+    /// weakly.
+    pub(crate) fn watch_moves(&self, consumer: &Arc<CrossProcessWaker>, producer: &Arc<CrossProcessWaker>) {
+        self.moves.watch(consumer, producer);
+    }
+
+    /// Whether the backings carry ordering stamps.
+    pub fn is_stamped(&self) -> bool {
+        self.anon.is_stamped()
+    }
+
+    /// Open what other handles have published into the shared-memory
+    /// backing since this handle last looked: a per-producer pair grown
+    /// past the hint, the payload region. The backing's own ops do this
+    /// first; a sidecar does it on every scan, because on Windows a
+    /// section lasts only while some handle holds it.
+    pub(crate) fn sync_shared_backing(&self) {
+        self.shmfs.ensure_synced();
+    }
+
+    /// Live ordering mode of the active locale backing (`None`
+    /// when unstamped).
+    pub fn ordering_mode(&self) -> Option<OrderingMode> {
+        match self.current_locale() {
+            Locale::Anon => self.anon.ordering_mode(),
+            Locale::File => self.file.ordering_mode(),
+            Locale::ShmFs => self.shmfs.ordering_mode(),
+        }
+    }
+
+    /// Flip the ordering mode on all three backings so the
+    /// discipline follows the ring across locale migrations.
+    pub fn set_ordering_mode(&self, mode: OrderingMode) -> Result<(), RingError> {
+        self.anon.set_ordering_mode(mode)?;
+        self.file.set_ordering_mode(mode)?;
+        self.shmfs.set_ordering_mode(mode)
+    }
+
+    /// Total cross-producer inversions observed across the three
+    /// locale backings (each accumulates while it is the active
+    /// locale).
+    pub fn inversions(&self) -> u64 {
+        self.anon.inversions() + self.file.inversions() + self.shmfs.inversions()
+    }
+
+    /// Current locale.
+    pub fn current_locale(&self) -> Locale {
+        Locale::from_u32(self.locale_tag.load(Ordering::Acquire))
+    }
+
+    /// Current pin generation. Pinned-locale handles capture this at
+    /// pin time and call `is_still_valid()` to see whether a
+    /// `migrate_to` has happened.
+    pub fn locale_generation(&self) -> u64 {
+        self.locale_generation.load(Ordering::Acquire)
+    }
+
+    /// Direct access to the anon backing.
+    pub fn anon_ring(&self) -> &AdaptiveRing { &self.anon }
+
+    /// Direct access to the file backing.
+    pub fn file_ring(&self) -> &AdaptiveRing { &self.file }
+
+    /// Direct access to the ShmFs backing.
+    pub fn shmfs_ring(&self) -> &AdaptiveRing { &self.shmfs }
+
+    /// Register a producer on all three locale backings so the
+    /// active locale always has the registration regardless of which
+    /// one is live. The id is claimed on the file backing, whose peer
+    /// directory every handle on this base path shares, and carried onto
+    /// the shared-memory and anonymous backings under the same id. A
+    /// backing that refuses it gives back the claims this call made.
+    pub fn register_producer(&self) -> Result<usize, AdaptiveError> {
+        let id = self.file.register_producer()?;
+        let shm_claimed = match self.shmfs.carry_producer(id) {
+            Ok(claimed) => claimed,
+            Err(e) => {
+                // A growth refusal leaves the carried claim in place.
+                if matches!(e, AdaptiveError::GrowthFailed(_)) {
+                    self.shmfs.unregister_producer(id);
+                }
+                self.file.unregister_producer(id);
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.anon.carry_producer(id) {
+            if matches!(e, AdaptiveError::GrowthFailed(_)) {
+                self.anon.unregister_producer(id);
+            }
+            if shm_claimed {
+                self.shmfs.unregister_producer(id);
+            }
+            self.file.unregister_producer(id);
+            return Err(e);
+        }
+        Ok(id)
+    }
+
+    /// Register a consumer on all three locale backings, the id claimed on
+    /// the file backing and carried onto the others as
+    /// [`register_producer`](Self::register_producer) does.
+    pub fn register_consumer(&self) -> Result<usize, AdaptiveError> {
+        let id = self.file.register_consumer()?;
+        let shm_claimed = match self.shmfs.carry_consumer(id) {
+            Ok(claimed) => claimed,
+            Err(e) => {
+                self.file.unregister_consumer(id);
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.anon.carry_consumer(id) {
+            if shm_claimed {
+                self.shmfs.unregister_consumer(id);
+            }
+            self.file.unregister_consumer(id);
+            return Err(e);
+        }
+        Ok(id)
+    }
+
+    /// Give back the producer id [`register_producer`](Self::register_producer)
+    /// returned, on all three locale backings: the carried claims on the
+    /// anonymous and shared-memory backings first, then the file backing's,
+    /// which hands the id out again. Each backing recycles the slot and
+    /// keeps its backlog until a consumer drains it.
+    pub fn unregister_producer(&self, producer_id: usize) {
+        self.anon.unregister_producer(producer_id);
+        self.shmfs.unregister_producer(producer_id);
+        self.file.unregister_producer(producer_id);
+    }
+
+    /// Give back the consumer id [`register_consumer`](Self::register_consumer)
+    /// returned, on all three locale backings in the order
+    /// [`unregister_producer`](Self::unregister_producer) uses. On each,
+    /// the rings the consumer owned pass to the consumers that remain, so
+    /// their items go on being read.
+    pub fn unregister_consumer(&self, consumer_id: usize) {
+        self.anon.unregister_consumer(consumer_id);
+        self.shmfs.unregister_consumer(consumer_id);
+        self.file.unregister_consumer(consumer_id);
+    }
+
+    /// Send a payload through the currently-active locale.
+    pub fn try_send(&self, producer_id: usize, payload: &[u8]) -> Result<(), RingError> {
+        let locale = Locale::from_u32(self.locale_tag.load(Ordering::Acquire));
+        match locale {
+            Locale::Anon => self.anon.try_send(producer_id, payload),
+            Locale::File => self.file.try_send(producer_id, payload),
+            Locale::ShmFs => self.shmfs.try_send(producer_id, payload),
+        }
+    }
+
+    /// Receive a payload from the currently-active locale.
+    pub fn try_recv(&self, consumer_id: usize, out: &mut [u8]) -> Result<usize, RingError> {
+        let locale = Locale::from_u32(self.locale_tag.load(Ordering::Acquire));
+        match locale {
+            Locale::Anon => self.anon.try_recv(consumer_id, out),
+            Locale::File => self.file.try_recv(consumer_id, out),
+            Locale::ShmFs => self.shmfs.try_recv(consumer_id, out),
+        }
+    }
+
+    /// Pin the current locale and return a [`PinnedLocale`] handle.
+    pub fn pin_current_locale(&self) -> PinnedLocale<'_> {
+        let captured_gen = self.locale_generation.load(Ordering::Acquire);
+        let locale = Locale::from_u32(self.locale_tag.load(Ordering::Acquire));
+        PinnedLocale {
+            parent: self,
+            pinned_generation: captured_gen,
+            locale,
+            _not_sync: PhantomData,
+        }
+    }
+
+    /// Flip the active locale to `target`. Bumps `locale_generation`
+    /// before flipping the tag so pin holders see invalidation on
+    /// their next validity check. Transfers in-flight items from the
+    /// old locale's backing into the new locale's backing.
+    pub fn migrate_to(&self, target: Locale) -> Result<(), RingError> {
+        let current = Locale::from_u32(self.locale_tag.load(Ordering::Acquire));
+        if current == target {
+            return Ok(());
+        }
+        self.locale_generation.fetch_add(1, Ordering::AcqRel);
+        self.transfer_items(current, target)?;
+        self.locale_tag.store(target as u32, Ordering::Release);
+        // Each handle's anonymous backing is its own, so a move into or out
+        // of it changes what a waiter in another process can find.
+        self.moves.moved();
+        Ok(())
+    }
+
+    fn transfer_items(&self, from: Locale, to: Locale) -> Result<(), RingError> {
+        let ring = |locale| match locale {
+            Locale::Anon => &self.anon,
+            Locale::File => &self.file,
+            Locale::ShmFs => &self.shmfs,
+        };
+        let (from, to) = (ring(from), ring(to));
+        let mut buf = [0u8; ADAPTIVE_SPSC_PAYLOAD_BYTES];
+        // Consumer_id 0 drains across the active shape; producer_id
+        // 0 pushes into the destination. For multi-consumer
+        // workloads the destination's shape-axis sidecar
+        // re-balances post-transfer.
+        loop {
+            // A stamped ring's receive strips the stamp and its send
+            // re-stamps in drain order; an unstamped ring's slot moves with
+            // its kind, so a frame lands a frame and a plain item plain.
+            let moved = if from.ordering_region().is_some() {
+                from.try_recv(0, &mut buf).and_then(|n| to.try_send(0, &buf[..n]))
+            } else {
+                from.take_slot(0, &mut buf).and_then(|(n, kind)| to.send_kind(0, &buf[..n], kind))
+            };
+            match moved {
+                Ok(()) => {}
+                // The old locale is drained: the migration is complete.
+                Err(RingError::Empty) => return Ok(()),
+                // The old locale refused the pop for another reason; the
+                // items still there would be left behind, so the caller
+                // hears why.
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+/// Remove one of the files the ring laid out. A file a peer already
+/// removed reads as absent and is fine; any other refusal is a file left
+/// behind, reported because a Drop has no caller to hand it to.
+fn remove_laid_out(path: &Path) {
+    match crate::region_file::remove(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!("subetha: locale ring file {} not removed: {e}", path.display()),
+    }
+}
+
+impl Drop for LocaleAdaptiveRing {
+    fn drop(&mut self) {
+        let file_prefix = with_suffix(&self.base_path, ".locale.file.ring");
+        let max_p = self.file.max_producers();
+
+        remove_laid_out(&with_suffix(&self.base_path, ".locale.tag.bin"));
+        remove_laid_out(&with_suffix(&self.base_path, ".locale.gen.bin"));
+        // Every region of the file backing, its peer directory and the
+        // per-producer pairs registration grew past the hint among them.
+        let report = AdaptiveRing::unlink(&file_prefix, max_p);
+        if report.failed != 0
+            && let Some((path, kind, text)) = &report.first_failure
+        {
+            eprintln!("subetha: locale ring file {} not removed: {kind:?} {text}", path.display());
+        }
+
+        // The shared-memory backing's names go with the files, as a plain
+        // shm ring's would go with its unlink. On Windows they go with the
+        // last handle and this removes nothing.
+        let shm_prefix = shmfs_name_prefix_for(&self.base_path);
+        let report = AdaptiveRing::unlink_shmfs(&shm_prefix, max_p);
+        if report.failed != 0
+            && let Some((name, kind, text)) = &report.first_failure
+        {
+            eprintln!("subetha: locale ring shared memory {} not removed: {kind:?} {text}", name.display());
+        }
+    }
+}
+
+fn with_suffix(base: &Path, suffix: &str) -> PathBuf {
+    let mut s = base.as_os_str().to_owned();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+fn shmfs_name_prefix_for(base: &Path) -> String {
+    // Derive a logical name from the base path: strip directory
+    // separators and use the final component as the shm name root.
+    let stem = base.file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "locale_ring".to_string());
+    format!("locale_{stem}")
+}
+
+/// Handle pinned to one locale of the parent [`LocaleAdaptiveRing`].
+///
+/// `as_anon()` / `as_file()` return `&AdaptiveRing` so the caller
+/// chains directly into the shape-axis pin via
+/// `AdaptiveRing::pin_current_shape()`.
+pub struct PinnedLocale<'a> {
+    parent: &'a LocaleAdaptiveRing,
+    pinned_generation: u64,
+    locale: Locale,
+    _not_sync: PhantomData<Cell<()>>,
+}
+
+impl<'a> PinnedLocale<'a> {
+    /// Locale this pin was captured at.
+    pub fn locale(&self) -> Locale { self.locale }
+
+    /// Pin generation captured at pin time.
+    pub fn pinned_generation(&self) -> u64 { self.pinned_generation }
+
+    /// One Acquire load comparing captured generation to the live
+    /// one. `false` means a `migrate_to` has happened and the holder
+    /// should release + re-acquire via `pin_current_locale()`.
+    pub fn is_still_valid(&self) -> bool {
+        self.parent.locale_generation.load(Ordering::Acquire)
+            == self.pinned_generation
+    }
+
+    /// Returns `Some(&AdaptiveRing)` when the pin captured the anon
+    /// locale, `None` otherwise.
+    pub fn as_anon(&self) -> Option<&AdaptiveRing> {
+        match self.locale {
+            Locale::Anon => Some(&self.parent.anon),
+            _ => None,
+        }
+    }
+
+    /// Returns `Some(&AdaptiveRing)` when the pin captured the file
+    /// locale, `None` otherwise.
+    pub fn as_file(&self) -> Option<&AdaptiveRing> {
+        match self.locale {
+            Locale::File => Some(&self.parent.file),
+            _ => None,
+        }
+    }
+
+    /// Returns `Some(&AdaptiveRing)` when the pin captured the
+    /// ShmFs locale, `None` otherwise.
+    pub fn as_shmfs(&self) -> Option<&AdaptiveRing> {
+        match self.locale {
+            Locale::ShmFs => Some(&self.parent.shmfs),
+            _ => None,
+        }
+    }
+}
+
+// ===================================================================
+// Sidecar locale policy: serialized locale migrations with
+// hysteresis. Mirrors the shape-morph
+// `AdaptiveRingSidecar` / `DefaultRingShapePolicy` design and the
+// capacity-morph `CapacityAdaptiveRingSidecar` /
+// `DefaultCapacityPolicy`.
+//
+// Locale migrations are normally caller-driven: the application
+// knows when it needs cross-process visibility (-> File / ShmFs)
+// vs in-process only (-> Anon). The sidecar lets the application
+// express that intent through a target-locale setter and the
+// policy serializes the migration under a cooldown so rapid
+// oscillation does not thrash the underlying transfer (every
+// migration copies the in-flight items across backings).
+// ===================================================================
+
+use std::sync::atomic::{AtomicU32 as StdAtomicU32, AtomicU64 as StdAtomicU64};
+
+/// A snapshot of the locale-adaptive ring's observable state
+/// passed to a [`LocalePolicy`] on every sidecar scan.
+#[derive(Debug, Clone, Copy)]
+pub struct LocalePolicyObservation {
+    /// Current active locale.
+    pub current_locale: Locale,
+    /// Locale the application has asked for. The default sidecar
+    /// reads this through a per-sidecar atomic that the
+    /// application updates via
+    /// [`LocaleAdaptiveRingSidecar::request_locale`].
+    pub requested_locale: Locale,
+    /// Time since the last successful migration.
+    pub since_last_migrate: std::time::Duration,
+}
+
+/// Policy that decides when (and to which locale) the sidecar
+/// should migrate the [`LocaleAdaptiveRing`]. Returning
+/// `Some(locale)` triggers `migrate_to(locale)`. Returning `None`
+/// leaves the locale alone.
+pub trait LocalePolicy: Send + Sync + 'static {
+    fn decide(&self, observation: &LocalePolicyObservation) -> Option<Locale>;
+}
+
+/// Default locale policy: honor the application's requested
+/// locale once `since_last_migrate >= hysteresis`. Default
+/// hysteresis 250 ms (locale migrations cost more than shape
+/// morphs because every in-flight item is copied across backings,
+/// so the cooldown is longer than the shape-morph default).
+pub struct DefaultLocalePolicy {
+    pub hysteresis: std::time::Duration,
+}
+
+impl Default for DefaultLocalePolicy {
+    fn default() -> Self {
+        Self { hysteresis: std::time::Duration::from_millis(250) }
+    }
+}
+
+impl LocalePolicy for DefaultLocalePolicy {
+    fn decide(&self, obs: &LocalePolicyObservation) -> Option<Locale> {
+        if obs.since_last_migrate < self.hysteresis {
+            return None;
+        }
+        if obs.requested_locale == obs.current_locale {
+            None
+        } else {
+            Some(obs.requested_locale)
+        }
+    }
+}
+
+/// Background scanner thread that drives locale migrations on a
+/// [`LocaleAdaptiveRing`] from a [`LocalePolicy`].
+///
+/// The sidecar exposes a `request_locale(...)` setter that the
+/// application calls to express intent ("I want this on shmfs
+/// now"). The scanner samples this on every tick, builds a
+/// [`LocalePolicyObservation`], asks the policy, and only migrates
+/// when the policy returns `Some` and the hysteresis cooldown has
+/// elapsed. Each tick first opens what other handles have published
+/// into the shared-memory backing since the last one.
+pub struct LocaleAdaptiveRingSidecar {
+    handle: Option<std::thread::JoinHandle<()>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    requested_locale: Arc<StdAtomicU32>,
+    migrations_triggered: Arc<StdAtomicU64>,
+}
+
+impl LocaleAdaptiveRingSidecar {
+    /// Spawn a sidecar thread that migrates `ring` according to
+    /// `policy` decisions sampled every `scan_interval`. Initial
+    /// requested locale is the ring's current locale (no migration
+    /// until the application calls `request_locale`).
+    pub fn spawn<P: LocalePolicy>(
+        ring: Arc<LocaleAdaptiveRing>,
+        policy: P,
+        scan_interval: std::time::Duration,
+    ) -> Self {
+        Self::spawn_gated(
+            ring,
+            policy,
+            scan_interval,
+            crate::policy_gate::GateConfig::default(),
+        )
+    }
+
+    /// As [`spawn`](Self::spawn) with a confidence gate between
+    /// the locale policy's recommendation and the migration -
+    /// defends against application-side request flapping (every
+    /// migration copies the in-flight items across backings, so a
+    /// flapping `request_locale` is expensive). Disabled (the
+    /// default config) reproduces `spawn` exactly.
+    pub fn spawn_gated<P: LocalePolicy>(
+        ring: Arc<LocaleAdaptiveRing>,
+        policy: P,
+        scan_interval: std::time::Duration,
+        gate_cfg: crate::policy_gate::GateConfig,
+    ) -> Self {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let requested_locale = Arc::new(StdAtomicU32::new(ring.current_locale() as u32));
+        let migrations_triggered = Arc::new(StdAtomicU64::new(0));
+
+        let stop_c = Arc::clone(&stop);
+        let requested_c = Arc::clone(&requested_locale);
+        let migrations_c = Arc::clone(&migrations_triggered);
+        let handle = std::thread::spawn(move || {
+            let mut last_migrate = std::time::Instant::now();
+            let mut gate = crate::policy_gate::ConfidenceGate::new(gate_cfg);
+            while !stop_c.load(Ordering::Acquire) {
+                // Keep the shared-memory backing's view current whether or
+                // not the caller is making calls, so this handle holds what
+                // other handles publish into it.
+                ring.sync_shared_backing();
+                let req = Locale::from_u32(requested_c.load(Ordering::Acquire));
+                let obs = LocalePolicyObservation {
+                    current_locale: ring.current_locale(),
+                    requested_locale: req,
+                    since_last_migrate: last_migrate.elapsed(),
+                };
+                if let Some(target) = gate.observe(policy.decide(&obs))
+                    && ring.migrate_to(target).is_ok()
+                {
+                    last_migrate = std::time::Instant::now();
+                    migrations_c.fetch_add(1, Ordering::Relaxed);
+                }
+                std::thread::sleep(scan_interval);
+            }
+        });
+
+        Self {
+            handle: Some(handle),
+            stop,
+            requested_locale,
+            migrations_triggered,
+        }
+    }
+
+    /// Set the locale the application wants the ring to run at.
+    /// The sidecar's policy decides when to actually migrate
+    /// (typically: once the hysteresis cooldown elapses).
+    pub fn request_locale(&self, target: Locale) {
+        self.requested_locale.store(target as u32, Ordering::Release);
+    }
+
+    /// Number of successful migrations triggered by this sidecar
+    /// since `spawn`.
+    pub fn migrations_triggered(&self) -> u64 {
+        self.migrations_triggered.load(Ordering::Relaxed)
+    }
+
+    /// Stop the sidecar thread and wait for it to exit.
+    pub fn shutdown(mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(h) = self.handle.take() {
+            drop(h.join());
+        }
+    }
+}
+
+impl Drop for LocaleAdaptiveRingSidecar {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(h) = self.handle.take() {
+            drop(h.join());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::RingShape;
+
+    fn tmp(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        let pid = std::process::id();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        p.push(format!("subetha_locale_{pid}_{nonce}_{name}"));
+        p
+    }
+
+    #[test]
+    fn create_starts_in_anon_locale() {
+        let path = tmp("init");
+        let r = LocaleAdaptiveRing::create(&path, 1, 1, 64).expect("create");
+        assert_eq!(r.current_locale(), Locale::Anon);
+        assert_eq!(r.locale_generation(), 0);
+    }
+
+    /// Removes whatever shared-memory names a ring under test leaves, so a
+    /// failing run leaves nothing in the host's shared memory either.
+    struct Leftovers<'a>(&'a str);
+
+    impl Drop for Leftovers<'_> {
+        fn drop(&mut self) {
+            let report = AdaptiveRing::unlink_shmfs(self.0, 1);
+            if report.failed != 0 {
+                eprintln!("the test ring {} kept names it could not remove: {:?}", self.0, report.first_failure);
+            }
+        }
+    }
+
+    /// A locale ring's shared-memory backing goes when the ring drops, as
+    /// its files do, whichever locale it ran in, so a ring leaves nothing
+    /// in the host's shared memory.
+    #[test]
+    fn dropping_a_locale_ring_removes_its_shared_memory_names() {
+        let path = tmp("drop_shm");
+        let prefix = shmfs_name_prefix_for(&path);
+        let _leftovers = Leftovers(&prefix);
+        let r = LocaleAdaptiveRing::create(&path, 1, 1, 64).expect("create");
+        let live = AdaptiveRing::open_shmfs(&prefix, 1, 1, 64);
+        assert!(live.is_ok(), "the shm backing is there while the ring lives: {:?}", live.as_ref().err());
+        drop(live);
+        drop(r);
+        let after = AdaptiveRing::open_shmfs(&prefix, 1, 1, 64);
+        assert!(
+            matches!(&after, Err(RingError::IoError(e)) if e.kind() == std::io::ErrorKind::NotFound),
+            "an attach after the ring dropped reported {:?}",
+            after.as_ref().err()
+        );
+    }
+
+    /// The names in `path`'s directory that begin with its file name: the
+    /// files a ring under that base path laid out.
+    fn files_under(path: &Path) -> Vec<String> {
+        let dir = path.parent().expect("the test path has a directory");
+        let stem = path.file_name().expect("the test path names a file").to_string_lossy().into_owned();
+        std::fs::read_dir(dir)
+            .expect("the temp directory lists")
+            .map(|entry| entry.expect("the directory entry reads").file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(&stem))
+            .collect()
+    }
+
+    /// A locale ring's drop removes every file it laid out, the file
+    /// backing's peer directory and the per-producer pairs registration
+    /// grew past the construction hint among them.
+    #[test]
+    fn dropping_a_locale_ring_removes_every_file_it_laid_out() {
+        let path = tmp("drop_files");
+        let prefix = shmfs_name_prefix_for(&path);
+        let _leftovers = Leftovers(&prefix);
+        let r = LocaleAdaptiveRing::create(&path, 1, 1, 64).expect("create");
+        for _ in 0..4 {
+            r.register_producer().expect("a producer registers, growing the backings past the hint");
+        }
+        assert!(!files_under(&path).is_empty(), "the ring laid out its files under {}", path.display());
+        drop(r);
+        assert_eq!(files_under(&path), Vec::<String>::new(), "files the dropped ring left behind");
+    }
+
+    /// A ring created under the base path of one that dropped starts with
+    /// no registrations on any backing: its first producer is 0 on all
+    /// three.
+    #[test]
+    fn a_locale_ring_created_where_one_dropped_starts_with_no_registrations() {
+        let path = tmp("recreate");
+        let prefix = shmfs_name_prefix_for(&path);
+        let _leftovers = Leftovers(&prefix);
+        let first = LocaleAdaptiveRing::create(&path, 1, 1, 64).expect("create");
+        for _ in 0..4 {
+            first.register_producer().expect("a producer registers");
+        }
+        drop(first);
+        let second = LocaleAdaptiveRing::create(&path, 1, 1, 64).expect("create where the first ring was");
+        assert_eq!(second.register_producer().expect("the first producer registers"), 0);
+    }
+
+    /// A handle opened beside one that registered a producer registers its
+    /// own under the next id the shared directory hands out, held on its
+    /// anonymous and shared-memory backings as well.
+    #[test]
+    fn a_second_handle_registers_a_producer_after_the_owners() {
+        let path = tmp("second_handle_producer");
+        let prefix = shmfs_name_prefix_for(&path);
+        let _leftovers = Leftovers(&prefix);
+        let owner = LocaleAdaptiveRing::create(&path, 1, 1, 64).expect("create");
+        assert_eq!(owner.register_producer().expect("the owner's producer registers"), 0);
+        let peer = LocaleAdaptiveRing::open(&path, 1, 1, 64, false).expect("a peer attaches");
+        let id = peer.register_producer().expect("the peer's producer registers");
+        assert_eq!(id, 1, "the peer's producer takes the next id the shared directory hands out");
+        assert!(peer.anon.producer_ids().contains(&id), "the peer's anonymous backing holds producer {id}");
+        assert!(peer.shmfs.producer_ids().contains(&id), "the shared-memory backing holds producer {id}");
+    }
+
+    /// A handle opened beside one that registered a consumer registers its
+    /// own under the next id the shared directory hands out, held on its
+    /// anonymous and shared-memory backings as well.
+    #[test]
+    fn a_second_handle_registers_a_consumer_after_the_owners() {
+        let path = tmp("second_handle_consumer");
+        let prefix = shmfs_name_prefix_for(&path);
+        let _leftovers = Leftovers(&prefix);
+        let owner = LocaleAdaptiveRing::create(&path, 1, 1, 64).expect("create");
+        assert_eq!(owner.register_consumer().expect("the owner's consumer registers"), 0);
+        let peer = LocaleAdaptiveRing::open(&path, 1, 1, 64, false).expect("a peer attaches");
+        let id = peer.register_consumer().expect("the peer's consumer registers");
+        assert_eq!(id, 1, "the peer's consumer takes the next id the shared directory hands out");
+        assert!(peer.anon.consumer_ids().contains(&id), "the peer's anonymous backing holds consumer {id}");
+        assert!(peer.shmfs.consumer_ids().contains(&id), "the shared-memory backing holds consumer {id}");
+    }
+
+    /// A consumer and a producer given back hold no claim on any of the
+    /// three backings, every item sent afterward reaches the consumer that
+    /// remains, and the shared directory hands both ids out again.
+    #[test]
+    fn a_consumer_and_a_producer_given_back_leave_every_backing() {
+        let path = tmp("unregister");
+        let prefix = shmfs_name_prefix_for(&path);
+        let _leftovers = Leftovers(&prefix);
+        let ring = LocaleAdaptiveRing::create(&path, 2, 2, 64).expect("create");
+        let kept_producer = ring.register_producer().expect("a first producer");
+        let gone_producer = ring.register_producer().expect("a second producer");
+        let kept_consumer = ring.register_consumer().expect("a first consumer");
+        let gone_consumer = ring.register_consumer().expect("a second consumer");
+        ring.unregister_consumer(gone_consumer);
+        ring.unregister_producer(gone_producer);
+        for (name, backing) in [("anonymous", &ring.anon), ("shared-memory", &ring.shmfs), ("file", &ring.file)] {
+            assert!(!backing.consumer_ids().contains(&gone_consumer), "the {name} backing still holds consumer {gone_consumer}");
+            assert!(!backing.producer_ids().contains(&gone_producer), "the {name} backing still holds producer {gone_producer}");
+            assert!(backing.consumer_ids().contains(&kept_consumer), "the {name} backing lost consumer {kept_consumer}");
+            assert!(backing.producer_ids().contains(&kept_producer), "the {name} backing lost producer {kept_producer}");
+        }
+        for n in 0..16u64 {
+            ring.try_send(kept_producer, &n.to_le_bytes()).expect("a send");
+        }
+        let mut out = [0u8; 64];
+        let mut got = Vec::new();
+        loop {
+            match ring.try_recv(kept_consumer, &mut out) {
+                Ok(len) => {
+                    assert!(len >= 8, "an item of {len} bytes");
+                    got.push(u64::from_le_bytes(out[..8].try_into().expect("eight bytes")));
+                }
+                Err(RingError::Empty) => break,
+                Err(e) => panic!("a receive failed: {e:?}"),
+            }
+        }
+        assert_eq!(got, (0..16u64).collect::<Vec<_>>(), "the remaining consumer reads every item");
+        assert_eq!(ring.register_consumer().expect("a consumer again"), gone_consumer, "the consumer's id is handed out again");
+        assert_eq!(ring.register_producer().expect("a producer again"), gone_producer, "the producer's id is handed out again");
+    }
+
+    /// An id past the consumer ceiling names no consumer on any backing:
+    /// one that truncates to a live consumer's slot, or to the no-owner
+    /// mark, moves no ring and releases nothing.
+    #[test]
+    fn a_consumer_id_past_the_ceiling_changes_nothing() {
+        let path = tmp("unregister_past_ceiling");
+        let prefix = shmfs_name_prefix_for(&path);
+        let _leftovers = Leftovers(&prefix);
+        let ring = LocaleAdaptiveRing::create(&path, 2, 2, 64).expect("create");
+        ring.register_producer().expect("a first producer");
+        ring.register_producer().expect("a second producer");
+        let first = ring.register_consumer().expect("a first consumer");
+        ring.register_consumer().expect("a second consumer");
+        let backings = [("anonymous", &ring.anon), ("shared-memory", &ring.shmfs), ("file", &ring.file)];
+        let before: Vec<_> = backings.iter().map(|(_, b)| (b.consumer_ids(), b.ownership_snapshot())).collect();
+        assert!(
+            before.iter().all(|(_, owners)| owners.iter().any(|&(_, owner, _)| usize::from(owner) == first)),
+            "consumer {first} owns a ring on every backing: {before:?}"
+        );
+        ring.unregister_consumer((1 << 16) + first);
+        ring.unregister_consumer(usize::from(u16::MAX));
+        for ((name, backing), was) in backings.iter().zip(&before) {
+            assert_eq!(&(backing.consumer_ids(), backing.ownership_snapshot()), was, "the {name} backing changed");
+        }
+    }
+
+    /// A consumer that leaves hands the ring it owned to one that remains,
+    /// and the hand-off wakes that consumer while it waits on its own empty
+    /// rings, though the ring keeps its shape: one producer and three
+    /// consumers, then two, is the multi-consumer shape both times.
+    #[test]
+    fn a_consumer_leaving_wakes_the_waiter_it_hands_its_ring_to() {
+        use crate::blocking_locale_ring::{BlockingLocaleRing, MAX_WAITERS_DEFAULT};
+        use crate::test_races::LOST;
+
+        let path = tmp("unregister_wakes");
+        let prefix = shmfs_name_prefix_for(&path);
+        let _leftovers = Leftovers(&prefix);
+        let ring = Arc::new(LocaleAdaptiveRing::create(&path, 1, 3, 64).expect("create"));
+        let blocking = Arc::new(BlockingLocaleRing::anon(Arc::clone(&ring), MAX_WAITERS_DEFAULT).expect("its wakers"));
+        let producer = ring.register_producer().expect("a producer");
+        let consumers: Vec<usize> = (0..3).map(|_| ring.register_consumer().expect("a consumer")).collect();
+        let owners = ring.anon.ownership_snapshot();
+        let leaver = owners
+            .iter()
+            .find(|&&(r, _, _)| r == 0)
+            .map(|&(_, owner, _)| usize::from(owner))
+            .expect("the producer's ring is published");
+        assert!(consumers.contains(&leaver), "a registered consumer owns the producer's ring: {owners:?}");
+        let heir = *consumers.iter().find(|&&c| c != leaver).expect("another consumer remains");
+        ring.try_send(producer, &7u64.to_le_bytes()).expect("a send");
+        let waiter = {
+            let blocking = Arc::clone(&blocking);
+            std::thread::spawn(move || {
+                let mut out = [0u8; 64];
+                blocking
+                    .recv_blocking(heir, &mut out, Some(LOST))
+                    .map(|_| u64::from_le_bytes(out[..8].try_into().expect("eight bytes")))
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let shape = ring.anon.current_shape();
+        ring.unregister_consumer(leaver);
+        assert_eq!(ring.anon.current_shape(), shape, "the ring kept its shape, so no morph woke the waiter");
+        let received = waiter.join().expect("the waiter finished");
+        assert_eq!(received.expect("the waiter received within the bound"), 7, "the heir reads the item it was handed");
+    }
+
+    /// A locale ring's sidecar opens what another handle publishes into
+    /// the shared-memory backing, so a per-producer pair a peer grew there
+    /// is held when the peer drops, and the owner receives what the peer
+    /// sent into it. Unopened, the pair would be gone: on Windows its
+    /// sections go with the peer's handles, and on Unix the peer's drop
+    /// removes its names.
+    #[test]
+    fn a_locale_rings_sidecar_holds_a_pair_a_peer_grew_in_shared_memory() {
+        use crate::test_races::{within_lost, LOST};
+
+        let path = tmp("sidecar_shm_pair");
+        let prefix = shmfs_name_prefix_for(&path);
+        let _leftovers = Leftovers(&prefix);
+        let owner = Arc::new(LocaleAdaptiveRing::create(&path, 1, 1, 64).expect("create"));
+        owner.migrate_to(Locale::ShmFs).expect("the ring runs in shared memory");
+        let consumer = owner.register_consumer().expect("the owner consumes");
+        // The cadence managed mode is driven at in the adaptive ring's
+        // sidecar tests.
+        let sidecar = LocaleAdaptiveRingSidecar::spawn(
+            Arc::clone(&owner),
+            DefaultLocalePolicy::default(),
+            std::time::Duration::from_micros(1000),
+        );
+        let peer = LocaleAdaptiveRing::open(&path, 1, 1, 64, false).expect("a peer attaches");
+        peer.register_producer().expect("the first producer registers");
+        let grown = peer.register_producer().expect("registration past the hint grows the backing");
+        peer.try_send(grown, b"kept").expect("send into the grown pair");
+        assert!(
+            within_lost(|| owner.shmfs.held_pairs() == 2),
+            "the owner's sidecar did not open the grown pair within {LOST:?}"
+        );
+        drop(peer);
+
+        let mut out = [0u8; ADAPTIVE_SPSC_PAYLOAD_BYTES];
+        owner.try_recv(consumer, &mut out).expect("the owner receives what the peer sent");
+        assert_eq!(&out[..4], b"kept");
+        sidecar.shutdown();
+    }
+
+    #[test]
+    fn round_trip_in_anon_locale() {
+        let path = tmp("rt_anon");
+        let r = LocaleAdaptiveRing::create(&path, 1, 1, 64).expect("create");
+        r.register_producer().expect("p");
+        r.register_consumer().expect("c");
+
+        let payload = 0xDEADBEEFu64.to_le_bytes();
+        let mut buf = [0u8; ADAPTIVE_SPSC_PAYLOAD_BYTES];
+        r.try_send(0, &payload).expect("send");
+        let n = r.try_recv(0, &mut buf).expect("recv");
+        assert!(n >= 8);
+        assert_eq!(&buf[..8], &payload);
+    }
+
+    #[test]
+    fn migrate_invalidates_outstanding_pin() {
+        let path = tmp("migrate_invalidate");
+        let r = LocaleAdaptiveRing::create(&path, 1, 1, 64).expect("create");
+        r.register_producer().expect("p");
+        r.register_consumer().expect("c");
+        let pin = r.pin_current_locale();
+        assert!(pin.is_still_valid());
+        assert_eq!(pin.locale(), Locale::Anon);
+        assert!(pin.as_anon().is_some());
+        assert!(pin.as_file().is_none());
+
+        r.migrate_to(Locale::File).expect("migrate");
+        assert!(!pin.is_still_valid(), "pin must invalidate on locale flip");
+        assert_eq!(r.current_locale(), Locale::File);
+
+        let pin2 = r.pin_current_locale();
+        assert!(pin2.is_still_valid());
+        assert_eq!(pin2.locale(), Locale::File);
+        assert!(pin2.as_file().is_some());
+        assert!(pin2.as_anon().is_none());
+    }
+
+    #[test]
+    fn migrate_to_same_locale_does_not_bump_generation() {
+        let path = tmp("migrate_noop");
+        let r = LocaleAdaptiveRing::create(&path, 1, 1, 64).expect("create");
+        let pin = r.pin_current_locale();
+        let gen_before = pin.pinned_generation();
+        r.migrate_to(Locale::Anon).expect("noop migrate");
+        assert_eq!(r.locale_generation(), gen_before);
+        assert!(pin.is_still_valid());
+    }
+
+    #[test]
+    fn migrate_transfers_in_flight_items() {
+        let path = tmp("migrate_transfer");
+        let r = LocaleAdaptiveRing::create(&path, 1, 1, 64).expect("create");
+        r.register_producer().expect("p");
+        r.register_consumer().expect("c");
+
+        // Push three items into the anon backing.
+        for i in 0u64..3 {
+            r.try_send(0, &i.to_le_bytes()).expect("send");
+        }
+
+        // Migrate to file - items should transfer.
+        r.migrate_to(Locale::File).expect("migrate");
+        assert_eq!(r.current_locale(), Locale::File);
+
+        // Drain three items from the file backing.
+        let mut got = Vec::new();
+        let mut buf = [0u8; ADAPTIVE_SPSC_PAYLOAD_BYTES];
+        for _ in 0..3 {
+            let n = r.try_recv(0, &mut buf).expect("recv");
+            assert!(n >= 8);
+            got.push(u64::from_le_bytes(buf[..8].try_into().unwrap()));
+        }
+        got.sort();
+        assert_eq!(got, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn pinned_chain_into_shape_axis() {
+        let path = tmp("pin_chain");
+        let r = LocaleAdaptiveRing::create(&path, 1, 1, 64).expect("create");
+        r.register_producer().expect("p");
+        r.register_consumer().expect("c");
+
+        let pin_locale = r.pin_current_locale();
+        let ring = pin_locale.as_anon().expect("pinned at anon");
+        let pin_shape = ring.pin_current_shape();
+        assert_eq!(pin_shape.shape(), RingShape::Spsc);
+        assert!(pin_locale.is_still_valid() && pin_shape.is_still_valid());
+
+        let payload = 0x12345678u64.to_le_bytes();
+        pin_shape.spsc_try_push(&payload).expect("native push");
+        let mut buf = [0u8; ADAPTIVE_SPSC_PAYLOAD_BYTES];
+        let n = pin_shape.spsc_try_pop(&mut buf).expect("native pop");
+        assert!(n >= 8);
+        assert_eq!(&buf[..8], &payload);
+    }
+
+    #[test]
+    fn migrate_to_shmfs_works() {
+        let path = tmp("migrate_shmfs");
+        let r = LocaleAdaptiveRing::create(&path, 1, 1, 64).expect("create");
+        r.register_producer().expect("p");
+        r.register_consumer().expect("c");
+        let pin = r.pin_current_locale();
+        assert_eq!(pin.locale(), Locale::Anon);
+        assert!(pin.as_shmfs().is_none());
+
+        r.migrate_to(Locale::ShmFs).expect("migrate to shmfs");
+        assert!(!pin.is_still_valid());
+        assert_eq!(r.current_locale(), Locale::ShmFs);
+
+        let pin2 = r.pin_current_locale();
+        assert_eq!(pin2.locale(), Locale::ShmFs);
+        assert!(pin2.as_shmfs().is_some());
+        assert!(pin2.as_anon().is_none());
+        assert!(pin2.as_file().is_none());
+    }
+
+    #[test]
+    fn round_trip_in_shmfs_locale() {
+        let path = tmp("rt_shmfs");
+        let r = LocaleAdaptiveRing::create(&path, 1, 1, 64).expect("create");
+        r.register_producer().expect("p");
+        r.register_consumer().expect("c");
+        r.migrate_to(Locale::ShmFs).expect("migrate");
+
+        let payload = 0xABCDEF12u64.to_le_bytes();
+        let mut buf = [0u8; ADAPTIVE_SPSC_PAYLOAD_BYTES];
+        r.try_send(0, &payload).expect("send");
+        let n = r.try_recv(0, &mut buf).expect("recv");
+        assert!(n >= 8);
+        assert_eq!(&buf[..8], &payload);
+    }
+
+    #[test]
+    fn migrate_anon_to_shmfs_to_file_transfers_items() {
+        let path = tmp("triple_morph");
+        let r = LocaleAdaptiveRing::create(&path, 1, 1, 64).expect("create");
+        r.register_producer().expect("p");
+        r.register_consumer().expect("c");
+
+        // Push at anon, morph to shmfs, push more, morph to file, drain.
+        for i in 0u64..3 {
+            r.try_send(0, &i.to_le_bytes()).expect("anon send");
+        }
+        r.migrate_to(Locale::ShmFs).expect("anon -> shmfs");
+        for i in 100u64..103 {
+            r.try_send(0, &i.to_le_bytes()).expect("shmfs send");
+        }
+        r.migrate_to(Locale::File).expect("shmfs -> file");
+
+        // All 6 items should now be in the file backing.
+        let mut got = Vec::new();
+        let mut buf = [0u8; ADAPTIVE_SPSC_PAYLOAD_BYTES];
+        for _ in 0..6 {
+            let n = r.try_recv(0, &mut buf).expect("recv");
+            assert!(n >= 8);
+            got.push(u64::from_le_bytes(buf[..8].try_into().unwrap()));
+        }
+        got.sort();
+        assert_eq!(got, vec![0, 1, 2, 100, 101, 102]);
+    }
+
+    #[test]
+    fn stamped_locale_ring_mode_follows_migrations() {
+        let path = tmp("stamped_locale");
+        let r = LocaleAdaptiveRing::create_with_ordering_stamps(&path, 1, 1, 64)
+            .expect("create stamped");
+        assert!(r.is_stamped());
+        r.register_producer().expect("p");
+        r.register_consumer().expect("c");
+        r.set_ordering_mode(OrderingMode::MergeByStamp).expect("mode");
+        assert_eq!(r.ordering_mode(), Some(OrderingMode::MergeByStamp));
+
+        // Stamped round trip at the anon locale (stamp stripped).
+        let payload = 0xFEEDu64.to_le_bytes();
+        let mut buf = [0u8; ADAPTIVE_SPSC_PAYLOAD_BYTES];
+        r.try_send(0, &payload).expect("send");
+        let n = r.try_recv(0, &mut buf).expect("recv");
+        assert_eq!(n, crate::ordering::STAMPED_PAYLOAD_BYTES);
+        assert_eq!(&buf[..8], &payload);
+
+        // In-flight items survive the locale migration (re-stamped
+        // in drain order) and the mode follows the active backing.
+        for i in 0u64..3 {
+            r.try_send(0, &i.to_le_bytes()).expect("send pre-migrate");
+        }
+        r.migrate_to(Locale::ShmFs).expect("migrate");
+        assert_eq!(r.ordering_mode(), Some(OrderingMode::MergeByStamp),
+                   "mode must follow the ring to the new locale");
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            let n = r.try_recv(0, &mut buf).expect("recv post-migrate");
+            assert_eq!(n, crate::ordering::STAMPED_PAYLOAD_BYTES);
+            got.push(u64::from_le_bytes(buf[..8].try_into().unwrap()));
+        }
+        assert_eq!(got, vec![0, 1, 2],
+                   "merge-mode drain order must survive the locale transfer");
+    }
+
+    #[test]
+    fn four_axis_pin_chain_at_shmfs_locale() {
+        let path = tmp("four_axis_shmfs");
+        let r = LocaleAdaptiveRing::create(&path, 1, 1, 64).expect("create");
+        r.register_producer().expect("p");
+        r.register_consumer().expect("c");
+        r.migrate_to(Locale::ShmFs).expect("migrate");
+
+        let pin_locale = r.pin_current_locale();
+        let adaptive = pin_locale.as_shmfs().expect("pinned at shmfs");
+        let pin_shape = adaptive.pin_current_shape();
+        assert_eq!(pin_shape.shape(), RingShape::Spsc);
+        assert!(pin_locale.is_still_valid() && pin_shape.is_still_valid());
+
+        let payload = 0xCAFEBABEu64.to_le_bytes();
+        pin_shape.spsc_try_push(&payload).expect("native push");
+        let mut buf = [0u8; ADAPTIVE_SPSC_PAYLOAD_BYTES];
+        let n = pin_shape.spsc_try_pop(&mut buf).expect("native pop");
+        assert!(n >= 8);
+        assert_eq!(&buf[..8], &payload);
+    }
+}

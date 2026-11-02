@@ -1,0 +1,2690 @@
+# Changelog
+
+What changed in each version. The repository ships as a single root
+commit that is rewritten on every release, so this file is the record
+of what came before it; the commit log is not.
+
+The six crates are published together at one version: `PoWerRuSt`
+(imported as `pwrs`), `pwrs-sys`, `pwrs-macros`, `pwrs-build`,
+`pwrs-host` and `cargo-pwrs`.
+
+Each version after 0.5.0 groups its changes by where they show. A
+section named Every surface lists a change that the other four all see.
+Rust lists what changed for Rust code built on PWRS: a module's, in
+`PoWerRuSt` and its macros, and a program's, in `pwrs-host` and
+`pwrs-build`; cargo pwrs what changed in the tool and the manifest keys
+it reads; PowerShell what changed in what a built module does in a
+session; C ABI what changed in `pwrs-sys`'s host table and native
+exports. Each lists what changed for it even when the cause is
+elsewhere, so a reader of one surface finds everything that touches it
+in one place. Documentation lists changes to the documentation alone. Within each,
+changes are listed as Breaking, Added, Changed, Removed and Fixed.
+0.5.0 and earlier list their changes by kind alone.
+
+## Unreleased
+
+### Every surface
+
+#### Changed
+
+- A helper executable stages once per build of a module folder, in `<staging>/helpers/<key>/<file>.<mark>/`. Every process of the user starts it from that one copy, and `pwrs::helper_path` returns that path in every session. Windows keeps a notification-area icon's settings by the executable's path, so a tray icon a helper shows keeps where the person put it and whether they chose to show it. The first time a process stages a helper, it removes the copies the helper's other builds left, except one still running on Windows. The library, `native-files` copies and the module's .NET files stay per process.
+- Outside Windows the staging folder is `pwrs-load-<uid>` in the temporary folder, where it was `pwrs-load`. The module's script stages in it only once the FileSystem provider's stat shows a folder owned by the user, not a link, and clears group and other permissions from it. Any other file or folder by that name gives the session a private folder of its own and a warning. On a machine where two users ran PWRS, the second could not stage at all unless the two shared a group: the first made `pwrs-load` with their own umask, 0755 on the FreeBSD test guest and 0775 on the Ubuntu one.
+- Every dependency requirement names its newest stable release: zip 9.2.0. `Cargo.lock`, which `cargo install cargo-pwrs --locked` builds from, takes the newest compatible releases besides, among them aws-lc-rs 1.19.0 and aws-lc-sys 0.47.0 in the tls example, log 0.4.35, and wasmtime 49.0.5 and cranelift 0.136.5 for the `parallel` feature. generic-array stays at 0.14.7, which crypto-common 0.1.7 requires exactly.
+
+### PowerShell
+
+#### Breaking
+
+- In Windows PowerShell 5.1, a module built against this version is refused when a module built by 0.8.0 or earlier was imported into the session first: `pwrs_module_init failed with status 4 (runtime ABI 1)`. A module it bundles is refused the same way, in a warning, before the import fails. Windows PowerShell has one PWRS runtime per process, the first module's, and that runtime's host table has no entries 85 to 101. In the other order both modules import, and PowerShell 7, which gives each module a runtime of its own, imports them in either order.
+
+#### Added
+
+- A proxy class has .NET events: those its `events` key declares, and every abstract event of its base or of an interface it implements, so a class implementing `INotifyPropertyChanged`, `INotifyCollectionChanged` or `ICommand` builds. A script adds a handler with `add_<Event>` or `Register-ObjectEvent`. An event Rust raises during a call into the object, as a setter's `PropertyChanged`, reaches its handlers once the call returns, so a handler reads the new value; a handler's exception is then the call's. A script block handler of an event raised from a thread the module started fails with "There is no Runspace available to run scripts in this thread"; `Register-ObjectEvent` receives such an event, and queues it through the thread pool, so not in the order raised.
+- A proxy class implements a member of its base or of an interface that takes arguments passed `out`, `ref` or `in`, or that is generic, so `IDictionary<TKey, TValue>.TryGetValue` and `Binder.BindToMethod` work from a script through `[ref]` and from .NET. A generic member's result is converted to its type argument as PowerShell converts a value, `$null` giving the type's default. A member the class's `stubs` names throws `NotSupportedException` naming the class and the member, so a class implements a large interface by backing the members it uses.
+- A class converts from and to other types in casts and in parameter binding: through C# conversion operators its `implicit` and `explicit` keys declare, which PowerShell finds by the value's exact type, and through a `PSTypeConverter` its `converter` key declares, which PowerShell asks before a constructor. `[double][Hello.Fraction]::new(1, 2)` is 0.5, and `Get-RustCelsius -Temperature 212F` binds a `Hello.Temperature` from text.
+- A PowerShell class derives from a class marked `inheritable`, overriding its methods: a call through the object, from a script, .NET code or Rust's `object().call(...)`, reaches the override, and the object passes back to Rust as the class with the Rust value its base constructor made. `class Square : Hello.Shape` works in both hosts. A class without the mark stays sealed.
+- A cmdlet pages as a compiled cmdlet declaring `SupportsPaging` does: it has `-First`, `-Skip` and `-IncludeTotalCount`, and the count `-IncludeTotalCount` asks for is the engine's own object, which shows as `Total count: 10`, `Estimated total count: 10` or `Unknown total count` in the session's language.
+- A parameter's argument is checked by a Rust function while it is bound, after the binder converts it: a refusal is the binder's validation failure naming the parameter, with the function's message, and a piped value it refuses fails that record alone.
+- A credential parameter takes a user name in place of a credential and asks the host for the password, as `Get-Credential -Credential` does.
+- A cmdlet names the page `Get-Help -Online` opens, and declares the `RemotingCapability` `Get-Command` reports.
+- A cmdlet runs Rust work as a background job, a `RustJob`, which `Get-Job`, `Wait-Job`, `Receive-Job`, `Stop-Job` and `Remove-Job` work on as on any job: `Receive-Job` reads every stream the work wrote, `Stop-Job` ends it Stopped, a failed job is Failed with the work's error as its reason, and `Receive-Job -AutoRemoveJob` removes it. A cmdlet can take `-AsJob`, and given it writes the job.
+- In Windows PowerShell 5.1 a cmdlet takes part in a PowerShell transaction. One that declares it has `-UseTransaction`, and inside `Start-Transaction` the work it enlists lands at `Complete-Transaction` and is dropped by `Undo-Transaction`. Work that refuses to commit fails `Complete-Transaction` with `The transaction has aborted.`, its error inside, and rolls the whole transaction back. A provider declaring `Transactions` gets the same for its commands. PowerShell 7 gives no compiled cmdlet or provider `-UseTransaction`, so there such a cmdlet makes its change at once. The memfs example's MemFs declares `Transactions`. A command in a transaction works on the transaction's own copy of the drive's tree, which the commands using the transaction see and others do not, and which becomes the drive's tree at commit unless the tree changed outside the transaction since.
+- A cmdlet wraps another command as a compiled cmdlet does with a steppable pipeline: the records piped to it reach the command, and what the command writes is its output. The `-WhatIf`, `-Confirm`, `-Verbose`, `-Debug`, `-ErrorAction`, `-WarningAction` and `-InformationAction` given to the wrapper reach the command where it takes them, so `-WhatIf` on a wrapper of `New-Item` makes nothing. A wrapped `Select-Object -First 2` ends the wrapper quietly after two records, and a throw in the wrapped command ends the wrapper with that throw's own exception and error id. Hello's `Select-RustFirst`, `Invoke-RustEach` and `New-RustFile` wrap `Select-Object`, `ForEach-Object` and `New-Item`.
+
+#### Changed
+
+- A cmdlet decides whether a verbose record or a warning goes somewhere as PowerShell decides for a compiled cmdlet: `-Debug` shows verbose records and warnings and asks after each one whether to go on, and `-Verbose` shows warnings whatever `$WarningPreference` says. A cmdlet called with `-Debug` alone left out its verbose records.
+- An exception that passes through a cmdlet's write or question ends the command, as it ends a compiled cmdlet, and `-ErrorAction` is not applied to it: a later command's throw coming back through an output write, or a question `-Debug` or `-Confirm` makes the engine ask that the host cannot ask. The cmdlet writes and asks nothing more after it. Such an exception became a `PwrsRuntimeError` the pipeline went on past, and under `-ErrorAction SilentlyContinue` a later command's throw disappeared. The engine's refusal of a progress record is still the cmdlet's own error, which `-ErrorAction` decides.
+- A module's script starts by looking for a module of its own name already loaded from another folder, as a copy another module bundles is. A copy of the same version stands down: it loads nothing, the loaded copy's commands stay in place, and `Get-Module` lists it with no commands. A verbose line names both folders. PowerShell does not pass `Import-Module -Verbose` into a module's script, so the line shows when the session's `$VerbosePreference` is `Continue`. A copy of another version stops the import with a `PwrsOtherVersionLoaded` record, category `ResourceExists`, naming both versions and both folders.
+
+#### Fixed
+
+- A phase whose error could not be written ends with that error's message, where it showed "pwrs runtime call failed with status 1": Windows PowerShell 5.1 under `-Debug`, whose questions follow error records too, ended so when no host could ask them.
+- In PowerShell 7, a PWRS module imported from one folder while the same version was loaded from another, as when another module bundles it, failed with `A cmdlet named '<name>' already exists. Cmdlets must have unique names.`, and `Get-Module` listed a second, half-loaded copy. It now stands down, so a bundled module and the same module installed on its own import in either order.
+- A provider's default drive is registered with the instance its `default_drives` made. PowerShell hands each default drive back to the provider before registering it, and the provider passed it on to Rust's `new_drive` with the root PowerShell shows, such as `shm:\`. So a provider whose `new_drive` opens its root as a path failed at import, as did a provider with no `new_drive`, and every default drive got a second instance, the first one freed without `remove_drive` whenever .NET collected it. The memfs example's MemNotes has no `new_drive`: `notes:` comes from `default_drives` alone, and `New-PSDrive -PSProvider MemNotes` is refused.
+
+### Rust
+
+#### Added
+
+- `#[on_remove]` also goes on a `fn(removal: &Removal) -> PsResult<()>`, which is told why it runs, `RemovalCause::RemoveModule` or `RemovalCause::RunspaceClosed`, a runspace that broke counting as closed, and in `removal.runspace` the `InstanceId` of the runspace whose import it removes. A hook can now release only what the runspace being removed made, where it could not tell that runspace from any other; a process-wide resource still belongs in `on_unload`. A hook with no argument compiles and runs as before.
+- `Pipeline::runspace_id` gives a command the `InstanceId` of the runspace it runs in, which is the id the removal hook is given for that runspace's import, so a module can record which runspace made something, such as a window, and release it at that runspace's removal.
+- `pwrs::testing::run_removal_hook::<H>(removal)` runs a removal hook as the runtime runs it for `removal`.
+- `#[psclass(events = ["Changed", "Progress: System.EventHandler<T>"])]` declares a proxy class's own events, each a name with its delegate type after a colon, `System.EventHandler` when it gives none.
+- A `#[psmethods]` method with a receiver may take `this: &PsThis`, the object it runs on, which its .NET signature does not have. `PsThis::raise(event, args)` and `PsProxy::raise` raise an event of the object: for a delegate `(object sender, T e)` the object is the sender and `args` is `e`, and for any other delegate `args` gives every argument. A clone of `PsThis` is `Send` and `Sync`, so a thread raises after the call returns. A raise inside a call or a `PsProxy::with` or `with_mut` borrow is delivered once it returns, and the borrow returns a handler's exception.
+- `PsObject::subscribe(event, callback)` gives a closure to an event of any object, or to a type's static event, as C#'s `+=` does: it runs on the raising thread, and its `Err` or panic is thrown to the raiser. Dropping the `PsSubscription` removes it without waiting for a call running elsewhere, which finishes with its own share of the closure.
+- `PsEvents::subscribe(source, event, id)` queues each raise of an object's event in the runspace's event queue under `id`, from the raising thread and so in the order raised, shaped as `Register-ObjectEvent` shapes a record; `PsEvents::take(id)` and `PsEvents::wait(id, timeout)` read it back in a phase as `PsEventRecord`s. Dropping the `PsEventSubscription` ends it.
+- `pwrs::testing::object_raised()` lists the events of objects a test raised through the fake host.
+- A `#[member]` method backs a member with `out`, `ref` and `in` arguments: it returns the member's out arguments after its result, as a tuple, or as `Option<V>` for `bool M(.., out V v)`, whose `None` gives `false` and `v`'s default; it takes a ref argument as `&mut T`, whose value the member copies back, and an in argument by value. A generic member's method takes the member's type arguments first, as `types: &[PsType]`, each named as a script writes it, and each value whose type names one of them as a `PsObject`. A tuple result, a `&mut` argument and a `&[PsType]` argument are compile errors on a method not marked `#[member]`.
+- `#[psclass(stubs = ["Insert", "RemoveAt"])]` names abstract members of a proxy class's base and interfaces that no method backs; each throws `NotSupportedException`.
+- `#[psclass(implicit = [from_int], explicit = [to_double])]` lists the `#[psmethods]` methods behind conversion operators: a static `fn(T) -> PsResult<Self>` converts from `T`, and a method `fn(&self) -> PsResult<T>`, or a static taking the class first, converts to `T`. `#[psclass(converter = [from_any, to_any])]` names the two functions behind a `PSTypeConverter`: `fn(PsObject) -> PsResult<Option<Self>>` and `fn(&self, PsType) -> PsResult<Option<PsObject>>`, `None` meaning it cannot convert.
+- A `#[psmethods]` method takes a `PsType` argument, declared `string`: the type's name as a script writes it.
+- `#[psclass(inheritable)]` on a proxy or copied class lets PowerShell classes derive from it. An inheritable proxy class must implement `Default`, which its protected constructor makes the Rust value from, unless its `new` takes nothing.
+- `Pipeline` asks in every confirmation form the engine has: `should_process_target`, `should_process_described`, `should_process_reason`, which returns the `ShouldProcessReason` (`WhatIf` when `-WhatIf` answered), `should_continue_all` and `should_continue_all_with_impact`, whose Yes to All or No to All holds for the rest of the invocation's records.
+- `#[cmdlet(supports_paging)]`, with `Pipeline::paging`, which returns a `PsPaging` of `first`, `skip` and `include_total_count`, whose `window(len)` is the positions to write out of `len` records, and `Pipeline::write_total_count(total, accuracy)`. A cmdlet without `supports_paging` that calls `paging` gets an error naming it.
+- `#[cmdlet(help_uri = "https://...", remoting_capability = "None")]`. A `help_uri` that is not an http or https address, and a `remoting_capability` that is not a `RemotingCapability` member, are compile errors. There is no `positional_binding`: `PositionalBinding` is a script function's, and a compiled cmdlet's parameters are positional only where they declare a position.
+- `#[param(credential)]` on a `PsCredential` parameter, and `#[param(validate_with = f)]` naming a `fn(&PsObject) -> PsResult<()>` that checks the argument after the binder converts it. `CmdletBind` gains `validate`, which `#[cmdlet]` generates for a cmdlet with such a parameter; a function of another signature is a compile error at its path.
+- `Pipeline::start_job(name, work)` runs a closure `FnOnce(&JobContext) -> PsResult<()>` as a job on a thread of its own, and `start_job_body(name, body)` a value of a type implementing `JobBody`; both return the job for the cmdlet to write, `None` naming it `Job<n>`. `JobContext` writes the job's output, errors, message streams and progress, and has `stopping` and `on_stop` for Stop-Job. `Streams` is implemented by `Pipeline` and `JobContext`, so work taking `&impl Streams` runs inline or in a job.
+- `#[cmdlet(supports_transactions)]`, with `Pipeline::transaction`, which returns the `PsTransaction` the cmdlet runs in, or `None` outside one and always in PowerShell 7; a provider's `Call` gains `transaction`. `PsTransaction::enlist` takes an `Enlistment`, whose `prepare` can refuse and so roll the transaction back, and then exactly one of whose `commit` and `rollback` runs, the refusing enlistment's included, on the thread that completes or rolls back the transaction. `on_complete(commit, rollback)` enlists two closures, and `id` gives the transaction's `LocalIdentifier`. A cmdlet without `supports_transactions` that calls `transaction` gets an error naming it. `pwrs::testing::start_transaction`, `complete_transaction` and `undo_transaction` drive a fake transaction in unit tests.
+- `#[cmdlet(as_job)]` declares `-AsJob`, which `Pipeline::as_job` reads. `#[cmdlet(as_job = "runtime")]` has the runtime run it for a `Clone` cmdlet implementing `CmdletJob`: one job runs `begin_job`, then `process_job` for each record with that record's parameters moved into its one instance, then `end_job`, and is the command's output. `CmdletBind` gains `take_params` and `CmdletMeta` `job_runner`, which `#[cmdlet]` generates for it.
+- `Pipeline::steppable(command, parameters)` begins another command as a `PsSteppable`, kept in a field from `begin` to `end`: `process(&input)` hands it a record, `process_empty()` steps it without one, and `end()` runs its end blocks and disposes it; dropping one that has not ended disposes it. A wrapped command that takes `-WhatIf` counts as the cmdlet asking, for `cargo pwrs test`'s check of a `supports_should_process` cmdlet. `pwrs::testing::steppable_calls()` lists the calls a unit test's wrapper made.
+
+#### Fixed
+
+- An argument of a `#[psmethods]` method named `this` shadowed the generated dispatch's own binding of the receiver, so the method was looked up on the argument.
+- `Provider::new_drive` runs only for `New-PSDrive`, as its documentation says. It also ran at import for each drive `default_drives` made, given the root as PowerShell shows it (`name:\` on Windows, `name:/` elsewhere), and the instance it returned replaced the one `default_drives` made. A drive of the provider's own handed to it again, as `$ExecutionContext.SessionState.Drive.New` hands one, reaches it with the root its provider gave, without the drive's prefix.
+- `PsSecureString::new` zeroes the UTF-16 copy of its text once the host has built the `SecureString`, whether the host takes it or fails, as `reveal` does with its copy. The copy stayed in a buffer the thread reuses, readable in the process's memory until a later conversion overwrote it.
+
+#### Changed
+
+- `Pipeline::stream_enabled`, `verbose_enabled` and `warning_enabled` follow the engine's preference for a compiled cmdlet: `-Debug` turns verbose records and warnings on, and `-Verbose` warnings.
+- `Pipeline::stream_enabled` reads a stream's answer from .NET once per cmdlet instance, and the instance's later phases and records take the stored answer, as the managed cmdlet does. A cmdlet that checks a stream on every record of a pipeline makes one call into .NET for it, not one per record.
+- A plain `String` parameter is read into the buffer it already holds, through `pwrs::text::try_assign_str16`, so one bound again for every record of a pipeline makes one allocation for all of them rather than one per record. A buffer more than four times the new text, and over 4 KiB, is given up first.
+- A string written to the output or a stream, up to 512 UTF-8 bytes, is converted to UTF-16 on the stack, so writing it allocates nothing, a new cmdlet instance's first write included. `pwrs::text::with_utf16` converts such a string without reaching its thread-local.
+- An output write, `write_error`, a stream record, `write_host`, `should_process` or `should_continue` that an exception passes through returns it, and every later write and question of the phase returns it again without reaching the engine; the command ends with it once the phase returns.
+
+### cargo pwrs
+
+#### Changed
+
+- An abstract event of a class's `base` or of an interface it `implements` no longer stops the build: the shell declares the event, public under its name, explicitly when the class has that name already, or as an override of the base's, with the delegate type the reference assemblies give, which `members.ps1` now reads. Each event of a class, its own or one it implements, keeps its handlers in a field `__pwrsEvent_<name>`, through helpers the class declares, so the class needs nothing new of `Pwrs.Runtime` for them.
+- The build reads the delegate type of each event a class's `events` key declares from the reference assemblies of both compiles, with the module's own classes in its type arguments read as `System.Object`, and refuses one that is not a delegate, a name the class or its base already has, and an event an interface or the base already declares for the class.
+- A member taking `ref`, `out` or `in` arguments, or a generic one, no longer fits no method: the build declares it with its own signature, modifiers and type parameters, copies a ref argument back and writes each out argument from what the Rust method returns, and passes a generic member's type arguments by name. An interface's generic method with a constrained type parameter is implemented explicitly, which keeps the constraint. `members.ps1` reads a generic method's type parameters by name, with whether each is constrained or allows a ref struct; a member whose type parameter allows a ref struct fits no method.
+- An abstract member left without a method that the class's `stubs` names is declared to throw `NotSupportedException`, and the build lists those members in a note; a name in `stubs` that leaves nothing to throw on either target framework is refused. A `#[member]` qualifier with no namespace of its own may name its type arguments without theirs, as `IEnumerable<KeyValuePair<string,long>>.GetEnumerator`.
+- A class's `implicit` and `explicit` methods become C# conversion operators, and its `converter` a `PSTypeConverter` nested in the class as `PwrsConverter`, named by `[TypeConverter]`, which keeps each answer on its thread for the conversion that follows. The build refuses a conversion method of another shape, one converting to or from `object`, `IDictionary` or the class's base, and two converting the same way between the class and one type. In PowerShell 7 the `<Module>.psm1` a build writes registers each converter as type data once the shell is imported, since PowerShell 7 does not look a `[TypeConverter]`'s type up in the shell's load context; it runs `Update-TypeData` through a `CmdletInfo` made from the cmdlet's type, so the import still imports no module and starts no search of the module path.
+- An inheritable class is declared without `sealed`, its public instance methods and public interface implementations `virtual`, and on a proxy a `protected` parameterless constructor that asks Rust for the Default value through the static-call path's reserved method id `pwrs::class::DEFAULT_CONSTRUCTOR`, so no host-table entry changes. `Pwrs.Runtime` finds an object's event field through its base types, so an object of a derived script class raises its events.
+- `[Cmdlet]` carries `SupportsPaging`, `HelpUri` and `RemotingCapability` when the cmdlet declares them, a `credential` parameter `[Credential]`, and a `validate_with` parameter the module's `PwrsValidateWith` attribute with the cmdlet id and the parameter's index. The module declares that class once, deriving from `Pwrs.ValidateWithBase`, when a parameter needs it.
+- `[Cmdlet]` carries `SupportsTransactions` when the cmdlet declares `supports_transactions`. `Pwrs.Runtime` gains `Pwrs.RustEnlistment`, the volatile enlistment behind `PsTransaction::enlist`. It reads whether a cmdlet declared `SupportsTransactions` from the attribute's metadata, since PowerShell 7's `CmdletAttribute` reads it false. On Windows PowerShell it reads a cmdlet's `CurrentPSTransaction` by reflection, since the PowerShellStandard reference the netstandard2.0 runtime compiles against leaves it out.
+- Every module's shell declares `<module class>JobSourceAdapter`, deriving from `Pwrs.RustJobSourceAdapter`, which `Import-Module` registers with the job manager under that name and through which the module's jobs are registered, so two modules' adapters never share a name. A cmdlet declaring `as_job` gets `[Parameter] SwitchParameter AsJob`, and its help lists `-AsJob`.
+
+- The `<Module>.psm1` a build writes starts with a step that looks for a module of its own name already loaded from another folder, by the name and the package version it was built with: the same version stands down and another version is refused, as the PowerShell entry says. Its verbose line is called as `Microsoft.PowerShell.Utility\Write-Verbose`, which loads that module only when a copy stands down.
+- The notices beside a native library give each crate from crates.io the address of the version published there, after its repository: `Source: https://crates.io/crates/<name>/<version>`. A crate from git or a local path gets no such line, since its source may be private.
+- `cargo pwrs new --pwrs` takes one of three forms: a TOML dependency value, such as `{ path = "../pwrs/crates/pwrs" }` or `"0.8.0"`; the path of the PoWerRuSt crate's folder; or a version, such as `0.8.0`. It writes each naming the package, `package = "PoWerRuSt"`, and a path as an absolute one, since cargo reads a relative path from the new crate's folder. Any other value is refused, naming the three forms and what is wrong with it, before any file is written. A bare path was written as it was given, `pwrs = C:\...`, which is not TOML, so the new crate's first build failed far from the cause.
+- MPL-2.0 joins the licenses a module may link without listing them, for a crate from crates.io: the notices quote its license and name the exact version published there, which is what MPL-2.0 asks of a binary built from an unchanged copy. An MPL-2.0 crate from a local path, a `[patch]`, git or another registry is refused, naming the crate and its source, since MPL-2.0 requires a changed copy's files to be published under it; listing MPL-2.0 under `allowed-licenses` lets it through. The refusal of a crate under a license the module does not allow names MPL-2.0 for a crate from crates.io among the defaults.
+
+### C ABI
+
+#### Breaking
+
+- The host table gains `lifecycle_removal` as entry 85, appended after `native_file_path`; the ABI version stays 1. A module built with this version refuses a table shorter than its own, so it needs the runtime this version's cargo-pwrs embeds in the module folder: built by an earlier cargo-pwrs, or imported into Windows PowerShell 5.1 after a module built by 0.8.0 or earlier, it fails to import with `pwrs_module_init failed with status 4`. `lifecycle_removal(cause, runspace, has_runspace, err)` gives the removal hook running on the calling thread its cause, `REMOVAL_REMOVE_MODULE` (0) or `REMOVAL_RUNSPACE_CLOSED` (1), and the runspace's `InstanceId` as the 16 bytes of `Guid.ToByteArray`, with `has_runspace` 0 for an import made on a thread with no default runspace; on a thread running no removal hook it fails with status 1. On .NET Framework every module's copy of the table has the same entry.
+- The host table gains `object_event_raise`, `object_event_subscribe`, `object_event_unsubscribe` and `proxy_exit_raising` as entries 86 to 89, under the same condition. `object_event_raise` raises an event of a generated proxy object through its `__pwrsEvent_` field, queued until the gate's last entry leaves when the raising thread is inside it. `object_event_subscribe` builds a handler of the event's delegate type that calls a native callback on the raising thread and releases the callback's context once, after the handler is removed and no call runs, which `object_event_unsubscribe` begins. `proxy_exit_raising` ends a borrow and delivers the raises made during it, with a handler's exception through `err`; `proxy_exit` delivers none.
+- The host table gains `should_process_form` and `should_continue_all` as entries 90 and 91, under the same condition. `should_process_form(cmdlet, form, a, b, caption, out_yes, out_reason, err)` asks `ShouldProcess(target)` for form 0, `(verboseDescription, verboseWarning, caption)` for 1, and the same with its reason, written 1 for `WhatIf` and 0 for `None`, for 2. `should_continue_all(cmdlet, query, caption, impact, out_yes, err)` asks `ShouldContinue` with the invocation's yes-to-all and no-to-all flags, with `hasSecurityImpact` false for `impact` 1 and true for 2.
+- The host table gains `paging` and `write_total_count` as entries 92 and 93, under the same condition. `paging(cmdlet, out_first, out_skip, out_include_total_count, err)` reads the cmdlet's `PagingParameters`, and fails with an error naming a cmdlet that does not declare `SupportsPaging`. `write_total_count(cmdlet, total, accuracy, err)` writes `PagingParameters.NewTotalCount(total, accuracy)` as an output write does.
+- The host table gains `job_new`, `job_write`, `job_write_stream`, `job_write_error`, `job_write_progress` and `job_finish` as entries 94 to 99, under the same condition. `job_new` makes a `Pwrs.RustJob` registered through the cmdlet's `JobManager`, which owns the caller's context from then on: Stop-Job calls the caller's `stop` with it, and `job_finish`, which ends the job Completed, Failed or Stopped, calls `release` with it once. The other four add to the job's streams from any thread.
+- The host table gains `transaction_current` and `transaction_enlist` as entries 100 and 101, under the same condition. `transaction_current(cmdlet, out, err)` gives the `System.Transactions.Transaction` the cmdlet runs in, or null, and fails for a cmdlet whose `[Cmdlet]` does not declare `SupportsTransactions`. `transaction_enlist(transaction, prepare, end, context, err)` enlists a volatile enlistment that owns the context once enlisted: when the transaction is completed it calls `prepare`, whose failure rolls the transaction back, and it calls `end(context, committed)` once, from the thread that completes or rolls back the transaction. A provider operation's context arguments are six: the call's transaction follows the credential, null without one.
+- The host table gains `steppable_begin`, `steppable_process`, `steppable_end` and `steppable_dispose` as entries 102 to 105, under the same condition. `steppable_begin(cmdlet, name, parameters, out, out_delegates, err)` begins the command `name` as a `SteppablePipeline` whose output and streams are the cmdlet's, the caller's preference common parameters added where the command takes them, and says whether the command takes `-WhatIf`. The other three call `Process`, `End`, and `Clean` where the engine has it then `Dispose`. An exception passing through any of the four ends the command as one passing through a write does.
+
+#### Added
+
+- The export `pwrs_validate_invoke(cmdlet_id, parameter, value, err)` runs a parameter's `validate_with` function during binding, over the argument converted to the parameter's type. The runtime binds it optionally, so a library built before it existed still loads.
+
+#### Changed
+
+- The output and question entries keep an exception the engine raises in them, other than a stopped pipeline, and every later write or question of the phase returns status 1 with it; the runtime throws it once `pwrs_cmdlet_invoke` returns. No entry or status code changes.
+
+### Documentation
+
+- The Pipeline and ABI references, How To Write A Cmdlet and the Hello tour say how the streams decide under `-Debug` and `-Verbose`, and what an exception passing through a write does.
+- How To Bundle A Module and Two Hosts describe the step that reuses or refuses a copy loaded from another folder, quote it as generated, and say when its verbose line shows. Two Hosts' quote of the script names the bootstrap stamp the current source gives, where it named an earlier source's.
+- How To Publish and the cargo pwrs Reference say what the published-source line and the MPL-2.0 default are, with the refusal of an MPL-2.0 crate from a local path; the notices quoted in How To Publish and How To Bundle A Module show the line, and the tutorial's Shipping chapter names it.
+- How To Raise And Handle Object Events is new: a class's events and its interfaces', raising through `PsThis`, when handlers run, a callback on any object's event, and an object's events read back from the queue. The Attribute Reference (`events`, `&PsThis`), the Pipeline Reference (`PsThis`, `PsObject::subscribe`, `PsEvents::subscribe`, `take` and `wait`), the ABI Reference and docs/ABI.md (entries 86 to 89), the README's surface table, the Hello tour and How To Fix A Failure (a script block handler off a runspace's thread) say what each does.
+- How To Return Objects gains "Out, ref and generic members, and stubs", with `Hello.Ledger`'s `TryGetValue` and `Hello.ReverseBinder`'s ref argument. The Attribute Reference (`stubs`, and what `#[member]` maps of out, ref, in and generic members) and the README's surface table say what each does.
+- How To Return Objects gains "Classes a script class derives from", with `Hello.Shape` and a `Square` deriving from it; the Attribute Reference (`inheritable`), the README's surface table and PWRS and PyO3 (a row pairing `#[pyclass(subclass)]` with it) say what it does.
+- How To Return Objects gains "Conversions to and from other types", with `Hello.Fraction`'s operators and `Hello.Temperature`'s converter. The Attribute Reference (`implicit`, `explicit`, `converter`, a `PsType` argument), the Conversions Reference ("A class's own conversions"), the README's surface table and PWRS and PyO3 (a row pairing `__int__` and `__float__` with the keys, where it listed conversion methods as missing) say what each does.
+- The README's Features list gains a Beyond PyO3 sub-list: classes deriving from .NET classes and implementing .NET interfaces, which moves there, and .NET events. PWRS and PyO3 gains "What PWRS does that PyO3 has no counterpart for", each row checked against PyO3's guide, which the sub-list and the README's PyO3 map link, and its row pairing `#[pyclass(extends = Base)]` with `base` says how the two bases differ.
+- The Pipeline Reference, How To Write A Cmdlet, the ABI Reference, docs/ABI.md (entries 90 and 91) and the README's Confirmation row say what each confirmation form asks and returns.
+- The cargo pwrs Reference's `--pwrs` row gives the three forms the value takes, what each is written as, and that anything else is refused before a file is written.
+- How To Write A Provider, docs/ABI.md and `Provider::new_drive`'s documentation say that `new_drive` runs only for `New-PSDrive`, that a default drive keeps the instance `default_drives` made, and that a provider with only default drives leaves `new_drive` out, as MemNotes does.
+- How To Write A Cmdlet gains Transactions, with hello's `Set-RustSetting`. How To Write A Provider gains Transactions, with memfs's copies of the tree, and quotes MemFs as it is now, its tree in a `Files` value behind a lock. The Attribute Reference (`supports_transactions`, the `Transactions` capability), the Pipeline Reference (`transaction`, `PsTransaction`, `Enlistment`), the ABI Reference and docs/ABI.md (entries 100 and 101, a provider call's sixth context argument), How To Test A Module (the transaction helpers) and the README's surface table say what each does. The surface table's count, thirty-six since 0.8.0, is forty.
+- How To Run Work As A Job is new: starting a job with a closure or a `JobBody` type, what the job cmdlets do with it, work written once for the pipeline and a job, and `-AsJob` in both modes. The Attribute Reference (`as_job`), the Pipeline Reference (`start_job`, `start_job_body`, `as_job`, `JobContext`, `JobBody`, `CmdletJob`, `Streams`), the ABI Reference and docs/ABI.md (entries 94 to 99) and the README's surface table say what each does.
+- How To Write A Cmdlet gains Paging and Checking an argument in Rust, says what `credential` does, and says why there is no `positional_binding` key. The Attribute Reference (`supports_paging`, `help_uri`, `remoting_capability`, `credential`, `validate_with`), the Pipeline Reference (`paging`, `write_total_count`, `CmdletBind::validate`), the ABI Reference and docs/ABI.md (entries 92 and 93, `pwrs_validate_invoke`), The Bridge, How To Fix A Failure's list of optional exports and the README's surface table say what each does.
+- PoWerRuSt's API documentation builds with every rustdoc warning an error. The CI workflow's linux-rustdoc job checks it, and the other published crates' documentation, that way on Linux x86_64, the target docs.rs builds for. Three of its links rendered as plain text. The decimal layout's documentation now says that `PsObject::pin` checks the layout at the first decimal pin in a process, where it said `init` checks it.
+- The Attribute Reference, the Pipeline Reference, the Glossary, Two Hosts and the README's Lifecycle row say what a removal hook taking a `&Removal` is told and how a command reads the same runspace id. The Hello tour shows hello's removal hook, `Get-RustRunspaceId` and `Get-RustLastRemoval`, with their output in pwsh 7.6.9. The ABI Reference and docs/ABI.md describe `lifecycle_removal`, How To Fix A Failure quotes the refusal in Windows PowerShell 5.1 of a module built by this version after one built by 0.8.0, and How To Test A Module names `run_removal_hook`.
+- The README, docs/PERF.md and the Benchmarks page give the PWRS-against-C# comparison as measured on the Ubuntu VM, with the C# cmdlet taking `Get-Greeting`'s five parameters and both building the greeting by concatenation: 1.05x and 1.04x in the loop shape, 1.08x and 1.07x per pipeline record, over 24 rotated repetitions with controls within 0.4%. PERF.md adds what each side allocates natively per call and per record. The figures they replace, 1.15x and 1.24x, came from a Windows desktop and a C# cmdlet with two parameters.
+- How To Write A Cmdlet gains Wrap another command, with hello's `Select-RustFirst`. The Pipeline Reference (`steppable`, `PsSteppable`), the ABI Reference and docs/ABI.md (entries 102 to 105) and How To Test A Module (`steppable_calls`) say what each does.
+
+## 0.8.0
+
+### Every surface
+
+#### Changed
+
+- Every dependency requirement names its newest stable release:
+  serde_json 1.0.154, syn 3.0.9, sha2 0.11.1 and zip 9.1.2, and rustls
+  0.23.46 and webpki-roots 1.0.11 in the tls example. `Cargo.lock`,
+  which `cargo install cargo-pwrs --locked` builds from, takes the
+  newest compatible releases besides, among them aws-lc-rs 1.18.2, cc
+  1.10.0, libc 0.2.191, and wasmtime 49.0.4 and cranelift 0.136.4 for
+  the `parallel` feature.
+
+### Rust
+
+#### Breaking
+
+- The `Provider` trait's `set_content(path, content)` is
+  `write_content(path, lines)`, which appends the objects of one write
+  to the item and makes the item when there is none. `Set-Content` and
+  `Add-Content` write their input in one or more batches, each a call,
+  as each batch comes. `Set-Content` empties an item that exists
+  through `clear_content` before its first batch, so a provider whose
+  items `Set-Content` replaces implements `clear_content` as well.
+- The `Provider` trait's `normalize_relative_path` returns
+  `PsResult<Option<String>>`. With `None`, the default, PowerShell works
+  out the relative path itself from `get_parent_path`, `get_child_name`
+  and `make_path`. With `Some`, the provider gives its own. The method
+  was never called before, so an override had no effect.
+- `pwrs_build::DebugSymbols` has a third variant, `EmitWindows`: a
+  Windows `.pdb`, the format .NET Framework reads for a stack trace's
+  file and line in Windows PowerShell. A compile with it runs the
+  toolset's .NET Framework compiler, which only Windows runs. A `match`
+  over `DebugSymbols` needs an arm for it.
+- `PsObject::pin` refuses a second pin of an array that a view on the
+  same thread still has, with `PwrsArrayPinned`. Two such views could
+  both write, and two writable references to the same memory are what
+  Rust forbids. Code that pinned one array twice at once, even only to
+  read, uses its first view instead.
+
+#### Added
+
+- A proxy `#[psclass]` derives from a .NET class with `base =
+  "System.IO.Stream"`, and implements .NET interfaces with `implements =
+  ["System.IFormattable"]`. A `#[psmethods]` method marked `#[member =
+  "Read"]` backs that member of the base or of an interface, which the
+  shell declares with the member's own signature. `#[base(message)]` on
+  `new` passes those arguments to the base class's constructor, and a
+  method marked `#[base]` gives them for an object Rust makes outside
+  `new`. hello's `Hello.ByteStream` is a `System.IO.Stream` a
+  `StreamReader` reads, `Hello.Fraction` an `IFormattable` that `-f`
+  formats, `Hello.Descending` an `IComparer` that `[Array]::Sort` orders
+  by, and `Hello.Failure` an `Exception` a script throws and catches.
+- `PsArrayMut<T>`, a parameter or method argument that the shell
+  declares as `T[]`, for the element types `PsObject::pin` takes. It is
+  the caller's own array, and `pin(&mut self)` reads and writes it in
+  place. hello's `Set-RustBytes` and `Hello.ByteStream.Read` take one.
+
+- `pwrs-host` is published, for a program that runs PowerShell 7 inside
+  its own process. `pwrs_host::find_pshome()` returns the installed
+  pwsh's PSHOME without starting it: the folder `PWRS_PSHOME` names, the
+  first pwsh on PATH followed through its links (a Store install's
+  execution alias to its package folder on Windows, a snap's command to
+  the snaps' `current/opt/powershell` on Linux), or the platform's
+  default install folder, each counting when it has `pwsh.dll` and
+  hostfxr; a `PWRS_PSHOME` folder without them is refused, and when
+  none is found the error lists every folder looked in.
+  `pwrs_host::Runtime::start(pshome)` starts pwsh's .NET runtime once
+  per process, returning it to every later call and refusing one that
+  names another PSHOME, and `Runtime::bind(assembly, type, method)`
+  returns the address of an `[UnmanagedCallersOnly]` method for the
+  program to call through the signature the method declares. The
+  `run_script` example runs a script given on its command line through
+  a C# entry point and exits with what it returns. On Windows it reads
+  the alias with windows-sys 0.61.2.
+- `pwrs_build::Toolchain::compile_exe` compiles C# into an executable
+  for .NET Framework 4.7.2, taking what `compile` takes, for any CPU,
+  its entry point the one `Main` the sources declare.
+  `Toolchain::framework_exe_references()` returns what an executable for
+  Windows PowerShell 5.1 compiles against: the .NET Framework 4.7.2
+  reference assemblies (`Microsoft.NETFramework.ReferenceAssemblies.net472`
+  1.0.3) and their facades, and `Microsoft.PowerShell.5.1.ReferenceAssemblies`
+  1.0.0's full `System.Management.Automation` and
+  `Microsoft.PowerShell.ConsoleHost`, both 3.0.0.0 as in the GAC. With
+  them an executable registers cmdlets through `RunspaceConfiguration`
+  and starts Windows PowerShell's console host with `ConsoleShell.Start`.
+  Both packages are fetched the first time and checked against the
+  toolchain's lock. `pwrs_build::toolchain::FRAMEWORK_DEFINES` lists
+  net472's preprocessor symbols.
+- Every executable `compile_exe` makes has
+  `pwrs_build::toolchain::FRAMEWORK_TARGET`, the `TargetFramework`
+  attribute a .NET SDK build of net472 has, so .NET Framework runs
+  it with 4.7.2's defaults rather than 4.0's. In the console host, TLS
+  versions are then the system's, an escaped `/` in a URL's path stays
+  escaped and long paths open, as in powershell.exe. Without it they
+  read `Tls, Tls11, Tls12`, the path decoded, and long paths blocked.
+  Sources that declare a `TargetFramework` of their own fail with CS0579.
+- `Toolchain::pester()` returns the manifest of the Pester
+  `pwrs_build::toolchain::PESTER_VERSION` names, 6.2.0, fetched from
+  nuget.org into the toolchain the first time and checked against its
+  lock like the other packages. nuget.org's package contains the module
+  the PowerShell Gallery ships, file for file, under `tools/`.
+- `#[param]` declares six more of PowerShell's parameter attributes:
+  `validate_length(min, max)` on a string parameter,
+  `validate_count(min, max)` on an array parameter,
+  `validate_script = "..."`, `validate_not_null`, `allow_null` and
+  `supports_wildcards`, which also marks the parameter in the help as
+  taking wildcards. PowerShell's `[ValidateScript]` takes a script
+  block, and a C# attribute argument cannot be one, so the runtime has
+  `Pwrs.ValidateScriptText`, which takes the script's text and refuses
+  an element with the message `ValidateScript` gives. Bounds PowerShell
+  refuses, a key on a type it cannot apply to, and `validate_not_null`
+  with `allow_null` are compile errors, and `allow_null` or
+  `validate_not_null` on an enum stops `cargo pwrs build`.
+- `#[psclass]` takes `add`, `sub`, `mul`, `div` and `rem`, each naming
+  a `#[psmethods]` method, and the class declares the C# operator
+  PowerShell's `+`, `-`, `*`, `/` or `%` calls for it.
+  On a proxy class the method takes `&self`, or `&Self` first as a static
+  method. On a copied class it is a static method taking `Self` first.
+  The other operand and the result may be of any type. An operator on a
+  psobject class, or a method of another shape, is a compile error, and
+  `cargo pwrs build` refuses one whose method returns nothing.
+- The `Provider` trait has a method for each of the eight
+  `*-ItemProperty` cmdlets and for `Get-Acl` and `Set-Acl`.
+  `get_property`, `set_property`, `clear_property`, `new_property`,
+  `remove_property`, `rename_property`, `copy_property` and
+  `move_property` take and return properties as name and value pairs,
+  `Vec<(String, PsObject)>`. Each that changes a property returns it as
+  it now is, which `-PassThru` writes, and `new_property` gets the text
+  of `-PropertyType`; whether `-Force` was given reaches it through
+  `pwrs::provider::call()`.
+  `get_security_descriptor(path, sections)` returns a
+  `SecurityDescriptor`: SDDL text and a `SecurityKind` of `File`,
+  `Directory`, `RegistryKey` or `Other`. `SecuritySections` lists the
+  parts the call covers. `set_security_descriptor(path, sddl)` takes
+  SDDL text. Each method defaults to a `PwrsProviderUnsupported` error,
+  and the three types are in the prelude.
+- `Provider::copy_item_to`, `copy_property_to` and `move_property_to`
+  take both drives' values for a `Copy-Item`, `Copy-ItemProperty` or
+  `Move-ItemProperty` between two drives of one provider: the source
+  drive's as `self` and the destination's as `dest_drive`. Each
+  defaults to a `PwrsProviderUnsupported` error.
+- The `Provider` trait has `move_item(path, dest)` for `Move-Item`,
+  `move_item_to(path, dest_drive, dest)` for a move to another drive of
+  the provider, and `invoke_default_action(path)` for `Invoke-Item`.
+  A move returns the item at its new path. Each defaults to a
+  `PwrsProviderUnsupported` error.
+- `pwrs::provider::call()` returns the `Call` of the provider operation
+  running on the thread: its `filter`, its `include` and `exclude`
+  patterns, `force` and `credential`, the values PowerShell's own
+  providers read from `this.Filter`, `this.Include`, `this.Exclude`,
+  `this.Force` and `this.Credential`. An operation inside another has its
+  own, and outside one every field is empty. `Call` is in the prelude.
+- `Provider::expand_path(path)` returns the paths a path with wildcards
+  names, for a provider that declares `ExpandWildcards`, and PowerShell
+  runs the command once for each. It defaults to the path as given.
+- `pwrs::testing`'s fake host reads a note property of a fake `PSObject`
+  through `PsObject::get`, so a value read by property name, such as a
+  `PsCredential`, converts from one in a unit test.
+- `#[on_load]` and `#[on_unload]` mark a `fn() -> PsResult<()>` that runs
+  when a module goes from imported in no runspace of the process to
+  imported in one, and when it goes back. `export_module!` names them
+  under `on_load` and `on_unload`, and takes its four hook keys in the
+  order `on_load`, `on_import`, `on_remove`, `on_unload`. The runtime
+  counts a module's imports across every runspace of the process, so a
+  removal in one runspace leaves what the load hook made for the others.
+  A reload of a rebuilt library runs the old copy's unload hook and then
+  the new copy's load hook. Both attributes are in the prelude. hello's
+  process-wide registration moves to them, `Get-RustLifecycle -Hook`
+  reads each hook's count, and `Set-RustLifecycleFailure` makes a hook's
+  next run fail.
+
+- `pwrs_build::Toolchain::pkcs()` returns the .NET 8 build of
+  `System.Security.Cryptography.Pkcs` `PKCS_VERSION` names, 8.0.2, and
+  `Toolchain::openauthenticode()` the manifest of the OpenAuthenticode
+  `OPENAUTHENTICODE_VERSION` names, 0.6.3, fetched from the PowerShell
+  Gallery. Each is fetched the first time and checked against the
+  toolchain's lock. `pwrs_build::pwsh::stream_pwsh_tool` runs a script
+  in pwsh with its output streamed, in a cache folder of its own on Unix.
+- A `#[cmdlet]` struct takes any number of `#[param]` fields, a
+  `#[psmethods]` method any number of arguments, and a `#[psclass]`
+  struct any number of fields, where each took at most 64. A block marks
+  its items with a bit each, in one 64-bit word for each 64 items, so a
+  block of 64 items or fewer is laid out as before.
+  `CmdletMeta::MASK_WORDS` is a cmdlet's number of words, which is how
+  many dirty words the runtime reads to find whether to bind again.
+  hello's `declare_wide!` declares `Hello.Wide`, a copied class of 130
+  optional numbers, its constructor of 130 arguments, and
+  `New-RustWide`, a cmdlet of 130 parameters.
+
+#### Changed
+
+- Every crate declares `rust-version = "1.88"`, where it declared
+  `"1.98"`, so a module needs Rust 1.88 or later. 1.88 is the oldest
+  Rust every crate builds and passes its tests with. The sha2, zip and
+  libloading crates PWRS depends on declare 1.88, and PWRS's code uses
+  let chains, which are stable from 1.88. The hello example declares
+  1.89, the first Rust its AVX-512 kernel builds with. CI tests each
+  version on Linux.
+
+- `#[on_remove]` runs once for each import: at `Remove-Module`, and also
+  when the runspace that imported the module closes without removing it.
+  A runspace closes when it is disposed, when a thread job or a
+  `ForEach-Object -Parallel` run ends, when its pool is disposed, and
+  when PowerShell exits. A module's four hooks run one at a time, never
+  two at once, so they can share state without synchronizing it.
+
+- `PsType::new` and `PsType::call_static` try .NET's own binding first,
+  as before. When no overload takes the arguments as they are, each
+  overload with as many parameters is tried, every argument converted as
+  PowerShell converts a value, and the one needing the fewest conversions
+  is called, the first declared among equals. A static method's name
+  then matches without regard to case. So a `WildcardPattern` made with
+  the text `"IgnoreCase"` matches as `-like` does, as
+  `[WildcardPattern]::new('a*', 'IgnoreCase')` does in a script, where it
+  failed with `MissingMethodException`. hello's `Test-RustDynamic` shows
+  both with `-Round` and `-Like`.
+
+- PoWerRuSt's own error messages and the errors the macros report at
+  compile time are worded in plain language, and every error id and
+  category is as it was. A refused allocation reads `cannot reserve the
+  memory requested`, a negative choice from a host's prompt `the host
+  returned choice <n>`, and `ps.workers(0)` ends `0 was requested`.
+- `Provider::make_path`'s default joins a parent that has no separator
+  to its child with the system's separator, `\` on Windows and `/` on
+  Linux, macOS and FreeBSD, in place of `\` everywhere. A parent with
+  one kind of separator gives its own, as before.
+- `PsObject::from_slice`, which a `Vec` of numbers goes through when a
+  cmdlet returns it, and `PsMemory::from_slice` copy 1 MiB or more from
+  the last byte to the first, with non-temporal stores, on x86 and
+  x86-64 when the destination starts less than 2 KiB after the source
+  within its 4 KiB page. That is where a large `Vec` lands in a .NET 10
+  array, and memcpy there ran up to ten times slower in some pwsh 7.6.7
+  processes: 32 MiB took memcpy 1.7 to 8.9 ms and this copy 1.6 to
+  2.1 ms on a Ryzen 9 7900X. Every other copy is memcpy, as before.
+- The fake host in `pwrs::testing` copies an object with its element
+  type, so a copy of an array pins as the array does. A second pin of
+  an array on the thread that pinned it shares the first's buffer, as
+  .NET gives a pinned array one address, and the last release writes
+  it back.
+- `pwrs_build::pwsh::stream_pwsh_script`, `stream_winps_script` and
+  `stream_pwsh_tool` read the host's error stream on a thread of their
+  own, which ends before they return, and write it to the caller's.
+  Plain text passes on as it arrives. The CLIXML that a PowerShell the
+  script starts may put there comes out as plain lines, as the cargo
+  pwrs entry below describes.
+
+#### Fixed
+
+- A `#[psmethods]` method with an argument named after a word C#
+  reserves, such as `operator`, failed `cargo pwrs build` when it
+  compiled the shell, with `CS1001: Identifier expected`. The shell
+  writes such a name with an `@`, and PowerShell shows it as written. A
+  raw identifier, such as `r#type`, names the argument `type` and the
+  method `Type`, and a `#[psenum]` variant `r#in` names the value `in`;
+  each reached the shell with its `r#` before.
+- An exception a .NET constructor or static method throws when Rust
+  calls it, through `PsType::new` or `PsType::call_static`, or an
+  instance method reached through reflection, is the error's own:
+  `UriFormatException: Invalid URI: ...` for a `System.Uri` made from
+  text that is not a URI. It read `TargetInvocationException: Exception has
+  been thrown by the target of an invocation.`, the wrapper reflection
+  puts around it.
+- An `Option<String>` or `Option<PathBuf>` parameter given `$null`, on
+  the command line or from a piped object's null property, is `None`, as
+  a parameter that was not given is. It read as `Some("")`, so `$null`
+  and an empty string were the same to the cmdlet. A `String` given
+  `$null` is still empty.
+
+### cargo pwrs
+
+#### Breaking
+
+- Every command refuses each flag it does not use, naming the flags
+  and the command, and exits 2 with the usage text. A flag had been
+  taken and ignored, so `cargo pwrs merge --dry-run` merged and `cargo
+  pwrs build --cpu-tiers x86-64` built as if it were not there. `build`
+  takes the build options (`--release`, `--target`, `--features`,
+  `--all-features`, `--debug-symbols`, `--package`, `--manifest-dir`);
+  `test` those and `--cpu-tiers`; `publish` those, `--dry-run` and the
+  signing settings; `publish --folder` only `--release` and
+  `--dry-run`; `sign` the build options and the signing settings;
+  `sign --folder` only `--manifest-dir`, `--package` and the signing
+  settings; `new` only `--pwrs`; `merge` and `toolchain` none.
+
+#### Added
+
+- `cargo pwrs build` reads the .NET classes and interfaces a module's
+  proxy classes name from the reference assemblies each of its shell's
+  compiles takes, desktop references included, through
+  `crates/cargo-pwrs/scripts/members.ps1` in pwsh. It declares each member a method backs
+  with that member's signature, under `#if NET` when only .NET has it in
+  a form the method fits. It refuses what the shell cannot declare,
+  naming the class, the method and the member: a sealed or missing base,
+  an abstract member without a method, a member the method does not fit,
+  a name the base already has, and the rest the attribute reference
+  lists. What it reads is written to the work folder, so a build naming
+  the same types reads it back without starting pwsh.
+- `cargo pwrs sign` signs a module folder with Authenticode signatures
+  that Windows accepts, on Windows, Linux, FreeBSD and macOS: every
+  `.ps1`, `.psm1`, `.psd1`, `.ps1xml`, `.psc1`, `.cdxml` and `.mof`, and
+  every `.dll` and `.exe` that is a Windows image, bundled modules
+  included. It builds and signs `target/pwrs/<Name>`, or with `--folder`
+  signs a built or merged folder as it is. The settings are
+  `[package.metadata.pwrs.signing]`: one key, from `pfx`, `pem`, `store`
+  (the Windows store or the macOS keychain), `command` or `pkcs11`, and
+  `password-env`, `certificate`, `timestamp-url`, `hash`, `catalog` and
+  `signer`. Each has a flag of the same name, which takes its value as
+  `Cargo.toml` writes it. Paths in `Cargo.toml` are taken from the
+  crate's folder and a flag's from the current folder, and a `command`
+  runs in that folder, its program included when named by a relative
+  path. A file whose signature is still valid is left as it is, a file
+  whose signature no longer matches its contents is signed again, and
+  every file's outcome is a line on standard error. `catalog = true`
+  makes and signs `<Name>.cat` over every file. `signer =
+  "openauthenticode"` signs through OpenAuthenticode 0.6.3. See How To
+  Sign A Module.
+- `cargo pwrs publish` signs the module after its build when the crate
+  has a signing table, and takes the signing flags. `publish --folder`
+  signs nothing: it refuses the signing flags and names `cargo pwrs sign
+  --folder`, which signs a merged folder before it is published.
+- `[package.metadata.pwrs] description` and `tags` give the module
+  manifest a Description and Tags other than the package's
+  `description` and `keywords`, so a crate on crates.io can show one
+  line and at most five keywords there while the PowerShell Gallery
+  shows a paragraph and every tag. Without them the manifest takes the
+  package's own. A value of another shape stops the build, and
+  `publish` takes either description as the module's own.
+- `cargo pwrs publish --folder <module dir>` publishes a module folder as
+  it stands, such as one `merge` joined from several platforms' builds,
+  and builds nothing. It refuses what any runtime's build recorded as
+  `publish` refuses its own build's, naming the runtime (`its <rid>
+  native library`, or `the <rid> native library of its bundled module
+  <Name>`), every refusal at once with the missing `[package]` keys
+  first, and a runtime whose build left no record. With `--release` it
+  refuses a runtime that is not a release build. With `--folder`, every
+  flag but `--release` and `--dry-run` is refused, and `--folder` with
+  another command is a usage error. A dry run packages into
+  `publish/<Module>/` beside the folder.
+- Every build writes its record, `runtimes/<rid>/pwrs-build.json`: the
+  cargo-pwrs that built it, whether it was a release build, the
+  `[package]` keys the manifest has a placeholder for, the
+  extensions it warned about and the crates it named without a license
+  text. `merge` copies it with the runtime. A record with a field this
+  cargo-pwrs does not read is refused rather than read without it.
+- The `netstandard2.0` compile references the netstandard2.0 builds of
+  `System.Security.AccessControl`, `System.Security.Principal.Windows`,
+  `System.IO.FileSystem.AccessControl` and `Microsoft.Win32.Registry`
+  4.5.0, the assembly versions PowerShell Standard's engine reference
+  names. So a provider's security descriptors build for Windows
+  PowerShell, and hand-written C# there can use `FileSecurity`,
+  `RegistrySecurity`, `RegistryKey` and the rest of those types.
+
+#### Changed
+
+- The `.psd1`, `.psm1` and `.Format.ps1xml` a build writes are UTF-8
+  with a byte order mark, so a signature over them reads alike on every
+  machine.
+- `cargo pwrs merge` compares the two manifests without a byte order
+  mark or a signature block, so a signed folder still takes another
+  platform's runtimes.
+- Every module ships the four access-control packages' .NET Framework
+  builds in `netstandard2.0`, each of which only points its types to
+  mscorlib's, and the module's script copies them beside the staged
+  shell. The toolchain fetches the four packages the first time, and
+  checks them against its lock like the others. Their nuspecs declare no
+  `license`, so the module's `THIRD-PARTY-NOTICES.txt` quotes each
+  package's own `LICENSE.TXT`, once its first line names the MIT License
+  and it has MIT's terms word for word.
+- The refusal of a library linking a crate without a license text says
+  the module can supply it under `[package.metadata.pwrs]
+  license-files`, as well as depending on a release that ships it.
+- `cargo pwrs test` runs a module's suites under Pester 6.2.0, which the
+  toolchain fetches the first time, before anything builds, and both
+  hosts import, so nothing is installed first and pwsh and Windows
+  PowerShell run one Pester. It no longer reads a project's
+  `target/pester/Pester` or takes the host's own Pester 4 or later;
+  `PWRS_PESTER_PATH` still names another to run under, and with it set
+  nothing is fetched. A Pester that does not load is reported with the
+  path it was imported from. `cargo pwrs toolchain` fetches it too and
+  prints `pwrs: Pester at <manifest>`.
+- Every message `cargo pwrs` and `pwrs-build` print is worded in plain
+  language, and none refuses anything it did not refuse before. A folder
+  without a manifest `has no .psd1`, two classes under one name are
+  refused because `PowerShell allows one type per name`, and a clean
+  surface check ends `every ShouldProcess cmdlet called should_process`.
+  The notices say that a crate's source `has no license file`.
+- The `Cargo.toml` that `cargo pwrs new` writes explains the keys under
+  `[package.metadata.pwrs]` in plain words.
+- A build that writes symbols, a debug build or one with
+  `--debug-symbols`, puts the `.pdb` the library and each helper records
+  in `runtimes/<rid>/native/` for a Windows target, under the name
+  recorded. A `.pdb` the build did not leave beside the file that
+  records it is reported.
+- On Windows, a build that writes symbols compiles the `netstandard2.0`
+  assemblies with `/debug:full`, through the toolset's .NET Framework
+  compiler, so their `.pdb` files are in the Windows format. Windows
+  PowerShell reads a stack trace's file and line only from that format.
+  The `net10.0` ones, and every one a build on Linux, macOS or FreeBSD
+  writes, stay portable.
+- A shell declares a mask word of each kind for each 64 parameters,
+  arguments or fields, and names the words after the first with their
+  number: `_bound1`, `Dirty1`, `Bound1`, `Mask1` and so on. The shell of
+  a block of 64 items or fewer is generated as before. The surface check
+  reads what was piped into a cmdlet past 64 parameters as one number
+  for each 64, joined by commas.
+
+#### Fixed
+
+- The usage text names `--release` for `cargo pwrs publish --folder`,
+  which takes it.
+- The surface check left out a line of a host's file that it could not
+  read, such as the last line of a host killed while it wrote, and
+  printed nothing about it. It still leaves that line's counts out, and
+  prints a note
+  naming the file, the line and what it could not read.
+- How To Publish told a module built on several platforms to join its
+  folders with `merge` and then publish, but `publish` builds first,
+  which clears `target/pwrs/<Module>`, so it packaged the publishing
+  platform's runtime alone, with no error, and its refusals had checked
+  that one build only. `publish --folder` publishes the joined folder and
+  checks every platform's build.
+- The surface check of `cargo pwrs test` skipped a `literal_path`
+  parameter, though the module declares it to bind a piped object's
+  `PSPath` by property name, so a suite that never piped a file into
+  `-LiteralPath` reported nothing. It is checked as a parameter declared
+  `value_from_pipeline_by_property_name` is, and hello's suite pipes a
+  file into `Get-RustRoute -LiteralPath`, the one such parameter it had
+  not.
+- The surface check counted an argument given on the command line as a
+  record piped in, for every cmdlet whose `begin` is the trait's empty
+  default, from its second invocation in a session on: the shell skips
+  that `begin`, and the arguments' dirty bits reached the first
+  `process`, which is where the check reads what was piped. So a
+  pipeline parameter a suite only ever named was reported only when the
+  suite called the cmdlet once. The shell clears those bits when it
+  skips `begin`; the first `process` still binds every argument. The
+  corrected check found one such parameter in hello's suite,
+  `Get-RustTypeTag -InputObject`, which a test now pipes into.
+- A provider declaring `capabilities` did not build: the shell gave them
+  to `[CmdletProvider]` as a named argument, which its read-only
+  `ProviderCapabilities` property does not accept (CS0617). They join
+  `ShouldProcess` in the attribute's constructor argument.
+- A hand-written C# cmdlet whose `[Cmdlet]` verb was a constant of a
+  class other than PowerShell's `Verbs*` classes was exported under the
+  constant's field name, `Fetch-Thing` for `[Cmdlet(MyVerbs.Fetch,
+  "Thing")]`, which is not the cmdlet's name, so the cmdlet was not
+  exported and nothing said so. The verb and noun are read only as
+  string literals and `Verbs*` constants, as How To Add Hybrid C# says;
+  any other `[Cmdlet]` is counted, and the build's warning names both
+  reasons an attribute exports nothing.
+- `cargo pwrs publish --dry-run` printed a `packaged` line for every
+  package in `target/pwrs/publish/<Module>/`, so after a version change
+  it named the old version's package too, which that run had not made.
+  It removes the packages an earlier run left there before packaging, as
+  `build` clears the module folder, and names only the one it made.
+- The surface check's summary said `1 of the module's declarations were
+  not exercised` for one finding. It says `was` for one.
+- A suite that started a child host with `-EncodedCommand`, as hello's
+  does, left that host's records on `cargo pwrs test`'s error stream as
+  CLIXML: a `#< CLIXML` line, then an XML document with no line break
+  after it. A PowerShell reading that stream with `2>&1` dropped what
+  followed on the document's line, which was the surface check's line.
+  Each host's error stream now goes through cargo-pwrs, which passes
+  plain text on as it arrives and writes each record as the host writes
+  it as text. An error's lines are written as they are, and a warning,
+  verbose or debug record after `WARNING: `, `VERBOSE: ` or `DEBUG: `.
+  Progress records are left out, and so are information records, which
+  the host also writes to its output stream. A line another process
+  writes into the middle of a document comes out whole, as a line of its
+  own. The signing step's pwsh script runs the same way.
+
+### PowerShell
+
+#### Breaking
+
+- In Windows PowerShell, where every module in a process uses the
+  runtime loaded first, a module that declares lifecycle hooks is
+  refused after a module built by 0.7.0 or earlier, with
+  `Method not found: 'Void Pwrs.NativeModule.Imported()'.` In the other
+  order both import and run. Rebuild both with the same `cargo-pwrs`, as
+  How To Fix A Failure says.
+- In Windows PowerShell, a module with a proxy class that names a `base`
+  is refused the same way after a module built by 0.7.0 or earlier, with
+  `Could not load type 'Pwrs.IProxy' from assembly 'Pwrs.Runtime,
+  Version=0.0.0.0, Culture=neutral, PublicKeyToken=null'.` In the other
+  order both import, and the class works. A module whose classes name
+  only `implements` imports and works in either order.
+
+#### Added
+
+- `Pwrs.ProxyCore` is what a proxy object has of its Rust value: the
+  gate its calls take turns at, the check for a value an earlier load
+  made, the native bytes reported to the garbage collector, Dispose and
+  the finalizer. `Pwrs.ProxyBase` has one for a class with no base of
+  its own, and a class with a `base` has one in a field. Both are
+  reached through `Pwrs.IProxy`, so `PsProxy<T>` borrows either.
+- A PWRS provider's drives take `Get-ItemProperty`,
+  `Get-ItemPropertyValue`, `Set-ItemProperty`, `Clear-ItemProperty`,
+  `New-ItemProperty`, `Remove-ItemProperty`, `Rename-ItemProperty`,
+  `Copy-ItemProperty` and `Move-ItemProperty`. Each change runs under
+  `ShouldProcess` with the registry drive's wording. On Windows they take
+  `Get-Acl` and `Set-Acl` too. `Get-Acl` returns a `FileSecurity`,
+  `DirectorySecurity` or `RegistrySecurity`, whose rights PowerShell
+  shows by name, or a `Pwrs.ItemSecurity`, whose rules give the rights
+  as a number. `InvokeProvider.SecurityDescriptor.NewOfType` makes an
+  empty one of the kind named `File`, `Directory`, `RegistryKey` or
+  `Other`. memfs implements all of them, and its suite checks each in
+  pwsh and Windows PowerShell.
+- A PWRS provider's drives take `Move-Item`, on one drive and to another
+  drive of the provider, and `Invoke-Item`. They take
+  `Get-ChildItem -Depth` too, which the provider's base class walks one
+  level at a time through `get_child_items`. memfs implements each. Its
+  `Invoke-Item` adds one to a file's `Invocations` property, and its
+  suite checks that `-Depth 0` to `2`, with and without `-Name`, give
+  what a FileSystem drive gives.
+- A PWRS provider that declares `Filter` gets the text of `-Filter`, and
+  one that declares `Credentials` the credential of `-Credential` and of
+  `New-PSDrive -Credential`, through `pwrs::provider::call()`. The
+  provider's base class runs `has_child_items` without the filter, and
+  adds to `get_child_names` the folders PowerShell walks into whatever
+  the filter. So `-Recurse` with `-Include` or `-Name`, and a wildcard
+  path, reach every folder, as on a FileSystem drive. A provider that
+  declares `ExpandWildcards` resolves a path with wildcards through
+  `expand_path`. Declaring `Include` or `Exclude` changes nothing:
+  PowerShell applies `-Include` and `-Exclude` itself whatever a
+  provider declares, in pwsh 7.6.7 and Windows PowerShell 5.1.
+- memfs declares `Filter` and `Credentials`. Its `-Filter` is a name
+  pattern, matched by PowerShell's own wildcard rules without regard to
+  case, or a property test such as `Color=red`, and its suite checks the
+  filter against a FileSystem folder of the same shape. Each item it
+  makes has a `CreatedBy` property naming the user of `-Credential`, or
+  of the drive's `New-PSDrive -Credential`.
+- The memfs example has a second provider, MemNotes, which declares
+  `ExpandWildcards`. Its `notes:` drive has notes at its root. Its
+  `expand_path` matches names and applies `-Include` and `-Exclude`, and
+  its `get_item` reports a note that is not there.
+- A module's cmdlet may have more than 64 parameters, a method of one of
+  its classes more than 64 arguments, and a copied class more than 64
+  fields. hello's `New-RustWide` binds each of its 130 parameters from
+  the command line or by property name, and again for each record piped
+  in. Its suite checks a parameter in each of the three words in pwsh
+  and Windows PowerShell.
+
+#### Changed
+
+- A PWRS drive's root, as `Get-PSDrive` shows it, is the drive's name,
+  a colon and the separator PowerShell writes paths with on the system,
+  followed by the root the provider gave: for memfs's default drive,
+  whose provider gives an empty root, `mem:\` on Windows and `mem:/` on
+  Linux, macOS and FreeBSD. PowerShell takes a path as a drive's root
+  only when it ends in that separator. Rust still gets paths without
+  that prefix.
+- A table a module's class shows by default aligns its columns of
+  numbers to the right, as PowerShell's own tables do.
+- A `PsHashtable` parameter is declared `System.Collections.IDictionary`:
+  it takes a hashtable, an `[ordered]` table or any other dictionary as
+  it is, with no copy, so a module reads an `[ordered]` table's keys in
+  the order they were given. `Get-Help` and `Get-Command` show the
+  parameter's type as `IDictionary`.
+- The runtime's own messages are worded in plain language, and each
+  exception type is as it was. A change to a read-only table is refused
+  because `it was passed as a shared view, not a copy`, and a Windows
+  load failure that could not check API sets says that this version of
+  Windows `does not report which API sets it implements`. A class
+  declared under the name of a class `export_module!` lists is refused
+  saying that PowerShell's type names are `compared without regard to
+  case`, as the build's refusal of two such classes says.
+- Importing a module copies each `.pdb` the module folder has beside
+  the copy of its file: each .NET assembly's, the Rust library's and
+  each helper's. Each copy of the Rust library is in a folder of its
+  own, `native/<name>.<mark>/`, with its `.pdb`, so two builds' copies
+  never share one. Visual Studio finds a library's symbols in its
+  folder.
+- memfs's `Copy-Item` follows a FileSystem drive's rules: a copy onto a
+  folder goes inside it, and a file replaces a file of the same name. A
+  folder copied onto a name already there, or a file onto a folder of
+  its name, is refused. It refused every destination that existed.
+- memfs's `Move-Item` of a file onto a file replaces it under `-Force`,
+  as on a FileSystem drive, and refuses it without.
+- A module with lifecycle hooks runs its removal and unload hooks from
+  its script's `OnRemove` block, and its shell implements
+  `IModuleAssemblyInitializer` alone. A runspace that closes with the
+  module still imported runs the removal hook for that import, and the
+  unload hook when no other runspace has the module. That covers a
+  disposed runspace, a thread job or `ForEach-Object -Parallel` run that
+  ends, a disposed pool and PowerShell's own exit. An error from a hook
+  there goes to standard error, as
+  `pwrs: the unload hook of Hello failed as runspace <id> closed: [<id>] <message>`.
+- An exception that fails an import, such as an error from a load or
+  import hook or the CPU check's refusal, reaches the user as its own
+  record, with the record's id and category: a hook's error gives
+  `HelloLifecycleFailure,Microsoft.PowerShell.Commands.ImportModuleCommand`
+  and `InvalidOperation`. Its id was the exception's message. The
+  message is as it was.
+
+#### Fixed
+
+- Windows PowerShell reads text beyond ASCII in a module's manifest,
+  script and format file as written: an author `José Núñez ©` was read
+  as `JosÃ© NÃºÃ±ez Â©`, since those files had no byte order mark and
+  Windows PowerShell reads such a file in the system's code page.
+- `New-Item`, `Copy-Item` and `Clear-Content` on a PWRS drive made their
+  change under `-WhatIf` and gave no prompt under `-Confirm`, since the
+  provider's base class never called `ShouldProcess` for them, and
+  neither did `Set-Item` and `Clear-Item`. Each now calls it before Rust
+  runs, as `Remove-Item` and `Rename-Item` did. Every item and content
+  change is worded as an action on a target, such as `Copy Item` on
+  `Item: mem:\a.txt Destination: mem:\b.txt`.
+- A stack trace through a module's shell had no file or line, even in
+  a debug build, since its `.pdb` files were never beside the copies
+  that run. Now it gives each frame's file and line in pwsh, and in
+  Windows PowerShell for a module built on Windows.
+- An error from a PWRS provider's content writer never reached the
+  command. The writer gathered every line and called Rust only when
+  PowerShell closed it, and PowerShell drops what a writer throws while
+  the command ends. So `Set-Content` under a missing parent wrote nothing and
+  reported nothing, even with `-ErrorAction Stop`. Each batch now
+  reaches Rust as it is written, and its error is the command's.
+- `Add-Content` failed on every PWRS provider with `Specified method is
+  not supported`, since the writer refused its move to the end of the
+  item. The writer accepts that move and refuses any other.
+- An item piped from one command to another on a PWRS drive did not
+  reach it, since the item's `PSPath` named no drive. Piped from
+  `Get-ChildItem mem:\docs`, `Get-Item`, `Get-ItemProperty`,
+  `Get-Content`, `Get-Acl` and `Rename-Item` reported `PathNotFound`.
+  In Windows PowerShell 5.1, `Rename-Item` reported `InvalidOperation`.
+  `Remove-Item` removed nothing, and `Get-Item -LiteralPath $item.PSPath`
+  failed. Now every path on a PWRS drive names its drive, and the path
+  methods return it written with the system's separator, whichever one
+  it was given with. A path that comes with no drive set goes to the
+  drive whose root starts it. memfs's suite pipes into each of those
+  commands, in both hosts on Windows and in pwsh on Linux and FreeBSD.
+  It also checks that `Split-Path`, `Join-Path`, `Resolve-Path -Relative`
+  and `Set-Location ..` return what they return on a FileSystem drive.
+- `Get-ChildItem mem:\docs\* -Exclude a*` returned nothing on a PWRS
+  drive. It now returns what it returns on a FileSystem drive.
+- An error from a PWRS provider's method reached PowerShell as
+  `Pwrs.PwrsException,<command>`, category `NotSpecified`, with no
+  target and its id inside the message, as `[ItemExists] docs/a.txt
+  already exists`. Its record now has the Rust error's id, category and
+  message, and as target the error's own or the path the command was on,
+  drive included: `ItemExists,Microsoft.PowerShell.Commands.NewItemCommand`,
+  `ResourceExists`, `mem:\docs\a.txt`, `docs/a.txt already exists`. An
+  error from the content writer has the method's id too, where it read
+  `ProviderContentWriteError`. Whether a command stops at the error is as
+  it was. `Pwrs.PwrsException` gives PowerShell its record through
+  `IContainsErrorRecord`, and one not from a provider has the record
+  PowerShell made for it before. memfs's suite checks the ids in both
+  hosts.
+- memfs's `New-Item` replaced any item already at the path, and a file
+  made where a folder was left the folder's items below a file. It now
+  follows a FileSystem drive's rules: an item already there is refused
+  without `-Force`. With `-Force`, a file replaces a file, and
+  `-ItemType Directory` returns a folder that is there as it is, or
+  changes nothing where a file is. A file is never made where a folder
+  is.
+- `Copy-Item`, `Copy-ItemProperty` and `Move-ItemProperty` to another
+  drive of the same provider wrote into the source drive's tree, under
+  the destination's path. They now write into the destination drive's
+  tree.
+- Importing a module made PowerShell analyze every module on
+  `PSModulePath` that its analysis cache did not have, because the
+  module's script found its type with `Select-Object`, the one command
+  it ran outside `Microsoft.PowerShell.Core`. With 1500 script modules
+  first on the path and a cold cache, that first `Select-Object` took
+  418 ms in Windows PowerShell 5.1 and 5.6 s in pwsh 7.6.7, and real
+  modules cost more each. Windows PowerShell saved the cache 13 s after
+  the lookup that filled it, so a process that imports a module and
+  exits sooner paid it again every time. The script finds the type with
+  a `foreach`, and a bundled module's failure warning calls
+  `Microsoft.PowerShell.Utility\Write-Warning`, which loads that module
+  by name. Importing a module now leaves `Microsoft.PowerShell.Utility`
+  unloaded, which hello's suite checks in a fresh process of each
+  edition. `benches/import_cost.ps1 -ColdPath` times the import and the
+  control in fresh processes with a cold path.
+- A cmdlet whose `Drop` panicked ended the PowerShell process when the
+  engine disposed it, since the panic left the native call that frees
+  the instance. The panic is caught and written to standard error with
+  the cmdlet's name, as a proxy object's already was.
+- An error from a module's removal hook stopped `Remove-Module`: the
+  module and its commands stayed imported, and the next `Remove-Module`
+  ran the hook again, in pwsh 7.6.7 and Windows PowerShell 5.1. The pages
+  said the removal went ahead. It is now written as an error of
+  `Remove-Module`, with the Rust error's id and category, and the removal
+  finishes under any error preference.
+- hello's process-wide registration vanished from a runspace that still
+  had the module when another runspace removed it, since PowerShell runs
+  a removal hook at each runspace's `Remove-Module`; measured in pwsh
+  7.6.7 and Windows PowerShell 5.1. hello makes and releases it in its
+  load and unload hooks, and its suite checks it with two runspaces.
+
+### C ABI
+
+#### Changed
+
+- `pwrs_provider_invoke` and `pwrs_module_lifecycle` return an error
+  through `err` as the `object[]` `[message, id, category, details,
+  target]`, details and target null when the error has none, from which
+  the runtime makes the error's record. They returned its `[id] message`
+  text, or an exception when it had details. `pwrs_module_lifecycle`
+  takes op 2 for the load hook and op 3 for the unload hook.
+- A parameter block starts with its dirty words and then its bound
+  words, one 64-bit word of each for each 64 parameters, and at least
+  one. A method's block starts with its bound words, and a copied
+  class's field block ends with its mask words, by the same count. A
+  block of 64 items or fewer has one word of each, as before.
+
+#### Fixed
+
+- `parameter_is_bound` returns status 3 when it is called from another
+  thread, as every other entry reading the cmdlet does, and returns
+  status 1 for an exception rather than letting it end the process.
+
+### Documentation
+
+#### Added
+
+- How To Run PowerShell In A Rust Program shows `pwrs-host` from finding
+  the PSHOME to calling a C# entry point, with the `run_script`
+  example's output on Windows and the errors a missing pwsh gives.
+  `pwrs-host` has a README of its own, and the crate tables and every
+  sentence naming the crates published together name it.
+- The tutorial: nine chapters that build one module, FileFacts, from
+  `cargo pwrs new` to a package for the PowerShell Gallery, each example
+  run in PowerShell 7 and in Windows PowerShell 5.1. `examples/file-facts`
+  is the module as the last chapter leaves it, with 26 Pester tests, and
+  `tools/tutorial_gate.ps1` builds each chapter's module and checks that
+  every example prints what its page shows.
+- Each example whose console output is in color or formatted shows a
+  picture of the console from the run the page quotes, after the same
+  output as text. `tools/console_capture.ps1` and
+  `tools/console_session.ps1` take the pictures.
+- How To Use A Module In Runspaces, Jobs And Remote Sessions: a module
+  imported in each runspace, the same objects shared between runspaces
+  of one process, a proxy's calls from several runspaces running one at
+  a time, and objects copied as their properties into and out of
+  `Start-Job` and remote sessions, measured over WinRM, SSH and a
+  session to Windows PowerShell. hello's `Runspaces.Tests.ps1` checks
+  the runspace, pool and background job results in both hosts. Its
+  `ForEach-Object -Parallel` and thread job cases run in pwsh. The
+  thread job case runs only where pwsh has the
+  `Microsoft.PowerShell.ThreadJob` module.
+- How To Debug A Module: WinDbg in pwsh and Windows PowerShell, gdb and
+  lldb on Linux, lldb on FreeBSD, and Apple's lldb on macOS. Each stops
+  at a line of hello's Rust code and where a panic starts, attached to a
+  running shell as well as starting one, and reads values there. Apple's
+  lldb has no plugin for Rust, so it printed `self` as its pointer
+  alone. On macOS, lldb attached to a running pwsh stops at a breakpoint
+  only when that pwsh was started with `PAL_MachExceptionMode=2`, and
+  the page says why. It also says where
+  the symbols are, that a debugger names the library after its copy, and
+  what a panic reports without a debugger.
+- How To Return Objects has a section on a proxy class with a .NET base
+  class and .NET interfaces: `base`, `implements`, `#[member]`, the
+  conversions a member's arguments and result take, `#[base(...)]` and
+  `#[base]` for the base constructor, and Dispose. The Attribute
+  Reference has the keys and both marks, the Conversions Reference has
+  `PsArrayMut<T>` and the refusal of a second pin, How To Fix A Failure
+  has a module with such a class beside one built by 0.7.0 in Windows
+  PowerShell, and the Hello Tour has the four classes. PWRS and PyO3
+  sets `base` beside PyO3's `extends`, and the README has the surface.
+  `docs/ABI.md` has the descriptor's new keys, `Pwrs.ProxyCore` and the
+  slot of `PsArrayMut<T>`. The Bridge names `Pwrs.ProxyCore` among the
+  runtime's parts, and Two Hosts points to How To Fix A Failure for a
+  module that uses what an earlier runtime lacks.
+
+#### Changed
+
+- How To Write A Provider covers `Move-Item`, `Invoke-Item` and
+  `Get-ChildItem -Depth`, memfs's rules for a copy or a move onto an
+  item that is already there, and each method that runs only after
+  `ShouldProcess`. It has sections on the call's filter, patterns,
+  `-Force` and credential, with what each capability changes in pwsh
+  and Windows PowerShell, on expanding wildcards in the provider, with
+  MemNotes, and on memfs's `New-Item` rules.
+- How To Call .NET From Rust, the Pipeline Reference, the Conversions
+  Reference, the Hello Tour, `docs/ABI.md` and the README say how
+  `PsType::new` and `PsType::call_static` choose an overload and convert
+  arguments. They said the CLR binder was used, and `dynamic.rs` said
+  PowerShell's.
+- The README's provider row names the two keys `#[provider]` takes,
+  `name` and `capabilities`. It named a `drive` key, which the macro
+  refuses.
+- The Attribute Reference says how a method's arguments are named: in
+  lower camel case, without a raw identifier's `r#`, and with an `@` in
+  the shell for a word C# reserves. The Hello Tour shows `Apply`, whose
+  argument is named `operator`.
+- The cargo pwrs Reference, How To Publish, How To Add Hybrid C# and Two
+  Hosts say which `.pdb` files a build writes, in which format, and
+  where importing a module copies them. The reference's listing of a
+  debug build's folder comes from a new run.
+- Every wiki page, the README, `docs/` and the crate READMEs say what
+  the code does in plain words, rather than what it asks, answers,
+  hands over, learns or decides. Where they said kept, held or carried,
+  they say what is stored, passed on or left as it was. The source and
+  doc comments, the messages of cargo pwrs, the macros and memfs, the
+  comments `cargo pwrs new` writes in `Cargo.toml`, the examples' help
+  and test names, and the tools' messages are worded the same way. Long
+  sentences are split, and runs of facts are lists, so no sentence on
+  the wiki, in the READMEs or in `docs/` is longer than 50 words.
+- The hello example's `Get-RustTableEntry` writes `present:` before the
+  value of a key the table has, where it wrote `held:`; a missing key is
+  `absent:` as before.
+- Each item of the memfs example has a `FullName` property, its path
+  with the drive, in place of `Path`, its path inside the drive. How To
+  Write A Provider says why an item should have no `Path` property.
+  PowerShell passes a piped item's `Path` as `-Path`, which reads `[`
+  and `]` in a name as wildcards.
+- PWRS and PyO3 names PyO3's `IntoPyObject`, `Python::initialize` and
+  `&Bound<'py, PyAny>`, in place of `IntoPy`, which PyO3 has removed,
+  `prepare_freethreaded_python`, which PyO3 0.26 renamed, and `PyAny`
+  taken by reference, which PyO3 0.23 removed. It no longer calls
+  maturin a cargo subcommand that runs the tests in the host. The
+  README's and the home page's PyO3 tables name `Py<PyAny>` in place of
+  the `PyObject` alias PyO3 0.26 deprecated. The page listed PyO3's
+  sequence, iterator, ordering and hashing methods and a class's buffer
+  as missing from PWRS. It now pairs them with the `#[psclass]` keys that
+  give a proxy class the same and with `PsMemory<T>`, and lists base
+  classes, conversion operators and buffers with a shape as what PWRS
+  lacks.
+- The Hello Tour is a reference page. The home page and every index list
+  every page, and each card's text fits its three lines; the docs
+  landing page's cards had described the tutorial as Getting Started and
+  the Hello Tour.
+- A link followed by punctuation renders with no space before the
+  punctuation, in 95 places.
+- Corrected against the source: the PoWerRuSt crate README said the
+  scaffold writes one Pester test, and it writes two; `docs/ABI.md`
+  named two of the five host-table entries each module gets its own
+  copy of on Windows PowerShell; the ABI reference had `DROP_DRIVE`
+  run for a drive the engine collected, and it runs when a drive that
+  was never removed is finalized; the Attribute Reference said any call
+  that uses a proxy object again on the same thread is refused, and only
+  a call where one of the two is exclusive is; the README left strings
+  out of the values written through direct host-table entries.
+- The README, the Attribute Reference, How To Write A Cmdlet and How To
+  Return Objects say that a cmdlet, a method and a class take any number
+  of parameters, arguments and fields, where they said at most 64.
+  `docs/ABI.md`, the ABI Reference, The Bridge, The Call Path and the
+  Glossary describe a block's words, and the README's call path a dirty
+  bit per parameter. The Hello Tour has `New-RustWide` and `Hello.Wide`.
+- How To Publish gains A Module Built On Several Platforms, the build,
+  merge and `publish --folder` sequence, and its What Ships names the
+  build's record. The cargo pwrs reference lists `--folder`, a tenth
+  build step writing the record, and `publish --folder`; How To Bundle A
+  Module, the README and cargo-pwrs's README name it beside `merge`.
+- The cargo pwrs reference's toolchain table lists `ps51ref-1.0.0/` and
+  that `netfxref472-1.0.3/` is also fetched for an executable, and the
+  compile options describe the executable's compile. Its build listing
+  shows the record and what it contains, and its toolchain, build and test
+  listings come from one run of this checkout's cargo-pwrs. pwrs-build's
+  README names the executable compile.
+- Two Hosts and How To Bundle A Module quote the module script as it is
+  now generated, and Two Hosts lists its steps, every command of which
+  is in `Microsoft.PowerShell.Core`.
+- The README and `docs/PLATFORMS.md` say what tests publishing and
+  signing, which hello's and memfs's suites do not. `tools/publish_gate.ps1`
+  packages hello and file-facts as `cargo pwrs publish --release
+  --dry-run` does and checks each package against its module folder, and
+  the release gates on Windows, Linux and FreeBSD run it. So that they
+  can be packaged, the examples declare an author, and calc and memfs a
+  description. The README's table of surfaces counts its Signing row.
+- The README, `docs/PLATFORMS.md`, the Hello Tour and How To Fix A
+  Failure give each suite's count from this release's gates: hello's
+  472 tests in pwsh on Windows and 468 in Windows PowerShell, 467 on
+  Linux and 466 on FreeBSD, and memfs's 95 on Windows and 86 elsewhere.
+  They said FreeBSD runs the same tests as Linux, and the pwsh built for
+  FreeBSD has no `Start-ThreadJob`, so the thread job's test is skipped
+  there. The README's memfs row names its item properties and ACLs.
+- How To Make A Module Fast says that on Windows PowerShell every
+  module's first import in a process copies the four access-control
+  assemblies the module ships beside the staged shell, and a module with
+  hand-written C# four more. It said only a module with hand-written C#
+  copied any. Measured again on hello, the step adds 5.9 ms to Windows
+  PowerShell's first import by minimum and 2.2 ms by median, against a
+  noise of 2.5% and 0.7%, and memfs does not import there without it.
+  The page and `docs/PERF.md` say what hello's 36 views add to an
+  import, measured in fresh processes against a second copy of the same
+  format file: about 1 ms of a warm re-import in pwsh, half of one in
+  Windows PowerShell, and 2.6 to 4.6 ms of pwsh's first import.
+- `tools/wire_audit.py` counts a method marked `#[member]` or `#[base]`
+  as reached, since the generated class declares it under no name of
+  its own. How To Test A Module says what the audit reads: the C# and
+  PowerShell files outside `target`, the suites among them. It said the
+  generated C#, which the audit does not read.
+- `tools/signing_gate.ps1` starts its timestamp server on a loopback
+  port Windows gives, and stops before any case, with the listener's
+  own error, when the server cannot start. It picked a port at random
+  from the range Windows takes for outgoing connections, so on a
+  machine where another program held that port, every timestamped case
+  failed saying only that the server could not be reached.
+
+## 0.7.0
+
+### Rust
+
+#### Added
+
+- `pwrs::native_file_path(name)` answers where to load a file
+  `native-files` ships beside the library: a copy staged for the process
+  by the rules a helper is staged by, `name` being the file's own name,
+  extension included. A name the module ships no file of is an error
+  naming the file and the folder searched.
+
+#### Changed
+
+- `pwrs::helper_path` answers, for a helper a macOS build ships as an
+  app bundle, its executable inside a staged copy of the whole bundle,
+  so the helper starts with the bundle's identity.
+
+### cargo pwrs
+
+#### Added
+
+- `[package.metadata.pwrs.native-files]` ships prebuilt files beside the
+  library: each key a file's name in `runtimes/<rid>/native/`, each value
+  a table with `url`, `sha256`, and optionally `path`, `licenses` and
+  `license-files`, with tables of the same under `cfg(...)` keys, as
+  `license-files` scopes its own. The build downloads each file's archive
+  once with the system's curl into `<CARGO_HOME>/pwrs/downloads/<sha256>/`,
+  refuses one whose SHA-256 differs from the pin, naming both, and takes
+  the file from the zip or gzip-compressed tar archive at `path`, or uses
+  the download itself when there is no `path`. `licenses` names license
+  files inside the archive and `license-files` files in the crate
+  directory, and the runtime's `THIRD-PARTY-NOTICES.txt` quotes them after
+  the library's crates, under the file's name, address and SHA-256. An
+  entry with no license file, a name Windows cannot hold or one the
+  library or a helper takes, and two entries naming one file for a target
+  stop the build. `merge` and `publish` carry the files with their
+  runtime. cargo-pwrs reads the archives with zip 9.0.1, flate2 1.1.10 and
+  tar 0.4.46, and hashes with sha2 0.11.0.
+
+- `[package.metadata.pwrs.macos-bundles]` ships a helper on macOS as an
+  app bundle: a table from a helper's name to a table with `name` and
+  `identifier`, and optionally `display-name` and `icon`, an `.icns`
+  file from the crate directory. A macOS build lays out
+  `runtimes/<rid>/native/<name>.app` with the executable under
+  `Contents/MacOS`, the icon under `Contents/Resources`, and an
+  `Info.plist` giving the bundle its name, display name, identifier,
+  executable, icon, the package's version and high resolution. Other
+  platforms ship the plain executable. An entry for a target `helpers`
+  does not list, a key the table does not take, a name Windows, Linux or
+  macOS cannot hold as a folder, an identifier that is not parts of
+  letters, digits and hyphens joined by periods, or an icon that is not
+  an existing `.icns` file stops the build on every platform. `merge` and
+  `publish` carry the bundle's folder whole.
+
+### PowerShell
+
+#### Added
+
+- A helper shipped as an app bundle is staged with its whole bundle, at
+  `<temp>/pwrs-load/<pid>/<key>/native/<name>.app.<mark>/<name>.app`, by
+  the rules a single helper is: copied under a temporary name and moved
+  into place, named by its files' latest write time and total length, its
+  executable made readable and executable by its owner. The path
+  answered is the executable inside the copy, and macOS reads the bundle a
+  process runs in from the folders around its executable, so the helper
+  runs as the bundle the manifest declares.
+- A file `native-files` ships is staged on request at
+  `<temp>/pwrs-load/<pid>/<key>/native/<file>.<mark>/<file>`, as a helper
+  is, with its mode kept.
+
+### C ABI
+
+#### Added
+
+- Host table entry 84, `native_file_path`, appended after `write_host`;
+  the ABI version stays 1. On .NET Framework each module's own table
+  answers it, as it answers `helper_path`.
+
+### Documentation
+
+#### Added
+
+- How To Ship A Prebuilt Native File shows `native-files` from an entry
+  to the files a build writes, the notices that quote them and the
+  staged copy `pwrs::native_file_path` answers, measured on ripgrep's
+  Windows release. The cargo pwrs reference lists `native-files`, and
+  docs/ABI.md lists `native_file_path`.
+
+- How To Ship A Helper Executable shows a helper shipped as an app bundle
+  on macOS, from the hello example's CI run: the build's files and
+  `Info.plist`, the package's entries, the saved helper without execute
+  permission, and the staged copy it started from with the bundle's
+  identifier. The cargo pwrs reference lists `macos-bundles`.
+
+## 0.6.0
+
+### Every surface
+
+#### Changed
+
+- Every dependency requirement names its newest stable release:
+  serde_json 1.0.152, syn 3.0.7, and Flynnel 0.6.0 for the `parallel`
+  feature, whose default features bring wasmtime 49.0.2 and cranelift
+  0.136.2 in place of 25.0.3 and 0.112.3. `Cargo.lock`, which
+  `cargo install cargo-pwrs --locked` builds from, takes the newest
+  compatible releases besides: cc 1.7.0, libc 0.2.190, smallvec 1.16.3,
+  zerocopy and zerocopy-derive 0.8.62, zeroize 1.9.1, either 1.19.0 and
+  arbitrary 1.5.0.
+
+### Rust
+
+#### Added
+
+- `Pipeline::write_host(text, foreground, background, no_new_line)` writes
+  to the host as `Write-Host` does: a `HostInformationMessage` tagged
+  `PSHOST` on the information stream, so the engine shows it whatever the
+  information preference says unless it is Ignore or a `6>` redirection
+  takes it, `-InformationVariable` keeps it, and a transcript records each
+  call as a line. A color given as `None` is the host's current one, read
+  from its `RawUI` as `Write-Host` reads it. It crosses through the host
+  table's new `write_host` entry, under C ABI.
+- `pwrs::ConsoleColor`, the sixteen `System.ConsoleColor` values, which a
+  cmdlet takes as a parameter the binder converts and completes.
+- `pwrs::testing::take_host()` and `HostWrite`, the host writes a test
+  made through the fake host.
+- The example module's `Write-RustHost` takes Write-Host's own parameters,
+  and `HostWrite.Tests.ps1` runs it and Write-Host with the same arguments
+  in a host that records every write with its colors and checks the two
+  match, then checks the record, its redirections and its transcript.
+
+#### Fixed
+
+- A `#[psmethods]` method that takes a `PsTask<Option<T>>` compiles. The
+  macro read the task as an optional argument, an
+  `Option<PsTask<Option<T>>>`, so no such method compiled; it now reads
+  the task as given, and `Option` makes only the task's result nullable:
+  the generated method returns `Task<T?>`, which `complete(None)`
+  completes with `$null`. The example module's `Hello.Timer` takes one of
+  each kind, `StartedAsync` a `PsTask<Option<i64>>` and `CopyAsync` a
+  `PsTask<Option<Self>>`.
+
+### cargo pwrs
+
+#### Added
+
+- `[package.metadata.pwrs.license-files.'cfg(...)']` tables hold
+  `"name@version" = "path"` entries for the targets a cfg expression
+  matches, as cargo scopes `[target.'cfg(...)'.dependencies]`, so one
+  manifest supplies the license files a module needs on every platform
+  when its dependencies differ by target. A build takes the entries of
+  each table whose expression the target satisfies, matched against
+  what `rustc --print cfg --target <triple>` prints, and skips the
+  other tables; an entry in a table it takes is refused as an unscoped
+  one is, so the build for a target the table covers still catches a
+  stale entry. Expressions are read with cargo's grammar: a table under
+  any other key, an expression cargo would not parse, and one naming
+  `test`, `debug_assertions`, `proc_macro` or `feature`, which describe
+  the compilation rather than the target, stop the build on every
+  target. A `bundled-modules` entry's `license-files` takes the same
+  tables.
+- A `license-files` entry whose value is a table with `add`,
+  `"name@version" = { add = ["path", ...] }`, quotes the files it lists
+  in the notices under that crate, after the crate's own license files,
+  as the notices of code the crate links that is not its own, such as a
+  C or C++ library its build script compiles or downloads. The notices
+  say so and name the module that adds them. Unlike a path entry, it is
+  taken for a crate that ships its own license file, and a crate can take
+  both. The build refuses an `add` list that names a crate or version the
+  library does not link, lists no file or one file twice, names a file
+  that is missing or empty, or is a second one for the same crate and
+  version; the terms of the code it adds are not checked against the
+  allowed licenses. It is taken in a `cfg(...)` table and in a
+  `bundled-modules` entry's `license-files` as a path entry is.
+- A `self` entry in `license-files`, `self = { add = ["path", ...] }`,
+  quotes the files it lists as the notices of code the module's own crate
+  compiles that is not its own, such as a C or C++ library its build
+  script builds from vendored sources, which belongs to no crate the
+  library links. They come after every crate, under a section for the
+  module's own crate. The build refuses a `self` entry that is not a
+  table with `add`, and refuses its list as an `add` list's: no file, one
+  file twice, a file missing or empty, or a second `self` list for the
+  same target. It names no version, so a new version of the module needs
+  no change to it. A `cfg(...)` table scopes it, and in a
+  `bundled-modules` entry's `license-files` it is the bundled module's
+  own crate.
+
+#### Fixed
+
+- `cargo pwrs publish --dry-run` under a pwsh whose PSResourceGet has no
+  `Compress-PSResource`, such as FreeBSD's pwsh 7.5.5 package with
+  PSResourceGet 1.0.3, failed with PowerShell's "is not recognized". It
+  now names the PSResourceGet it found and the `Install-PSResource`
+  command that installs a release with the command.
+
+### PowerShell
+
+#### Fixed
+
+- A module whose native library Windows would not load failed to import
+  with an exception that did not say why: on PowerShell 7 a
+  `DllNotFoundException` saying the library "or one of its dependencies"
+  could not be loaded, or for a bad image a `BadImageFormatException`
+  saying only that a program had an incorrect format, and on Windows
+  PowerShell a `DllNotFoundException` giving the path of the library's
+  staged copy and nothing else. Each host throws the type it threw, and
+  the message now names the library, the Windows error and its text,
+  and what the library lacks: each DLL it imports, directly or through
+  another DLL, that the process cannot find, with a file of that name in
+  a folder the process does not search when there is one; each API set
+  it imports that this Windows does not implement; and for error 193 the
+  machine the library or such a DLL is built for, or the DLL that is not
+  a DLL at all. The runtime reads the import graph from the PE headers
+  and looks for each DLL with a data-file load, which searches as the
+  process's loads do and runs no code, so a pwsh installed from its MSIX
+  package, which does not search `PATH`, is described as it behaves. On
+  Linux, FreeBSD and macOS the message names the library before the
+  runtime's text, which ends with the dynamic linker's.
+  `LoadFailure.Tests.ps1` imports copies of the bundled Calc whose
+  library is edited to need a file no system has, on every platform, and
+  on Windows a DLL whose own import is missing, the same DLL only on
+  `PATH`, an API set no Windows implements, another machine, and a file
+  that is not a DLL.
+
+### C ABI
+
+#### Breaking
+
+- The host table gains `write_host` as slot 83. A module built with this
+  version refuses a table shorter than its own, so it needs the runtime
+  cargo-pwrs 0.6.0 embeds in the module folder: built by an earlier
+  cargo-pwrs, it fails to import with `pwrs_module_init failed with
+  status 4`.
+
+### Documentation
+
+#### Changed
+
+- Each crate's README, the page crates.io shows for it, opens as the
+  repository's README does, with the logo, badges and documentation
+  links, then says what the crate is, gives a quick start and links the
+  documentation pages for it. PoWerRuSt's is a README of its own, about
+  a seventh the length of the repository's, which crates.io showed whole
+  before.
+
+#### Fixed
+
+- How To Bundle A Module rendered everything after its last example as
+  code: the fence closing that example shared a line with the next
+  paragraph.
+- The cards on the wiki's section index pages named each page in its
+  file's case, as `Why-Pwrs/`, while Hugo writes every page at its
+  lowercased path, so on GitHub Pages, which serves paths as cased,
+  each of the 33 cards answered 404. They name the lowercased paths.
+- pwrs-build's README said the toolset is fetched under a lock, which
+  0.5.0 took out: each package is extracted into a folder of its own and
+  renamed into place, its hash recorded in `toolchain.lock`. The ABI
+  document and the ABI reference said a module checks `size` before
+  using each entry newer than its own; it refuses, at
+  `pwrs_module_init`, a table smaller than the one it was compiled
+  against. The README counted seventeen how-to guides; there are
+  eighteen.
+
+## 0.5.0
+
+### Added
+
+- `Pipeline::on_stop(waker)` registers a closure that `StopProcessing`
+  runs on the engine's thread when the pipeline stops, or runs at once
+  when the stop already came, so a phase blocked on a channel, a ring
+  or a parked thread of its own wakes on Ctrl+C with no poll. It returns
+  a `StopWaker` guard that unregisters the waker when dropped. The waker
+  runs at most once, a phase holds one at a time (a second registration
+  answers `PwrsStopWakerHeld`), and a waker that panics is caught on the
+  stopping thread and reported on standard error. The waker lives in a
+  slot appended to the instance header, so the C ABI is unchanged.
+- The example module's `Wait-RustStop` parks with no timeout until its
+  waker unparks it, and `Handles.Tests.ps1` checks in both hosts that
+  stopping the pipeline wakes it.
+- `PWRS_TRACE` traces `cargo pwrs` as well as a running module: set to
+  anything but empty or `0`, every command prints a line to stderr when
+  each process it starts begins, with its pid, a timestamp, the command
+  line, the variables set for it (a secret's value withheld) and its
+  folder, and one when it ends, with how long it ran and its status. It
+  covers `cargo metadata`, `cargo tree`, `cargo build`, `cargo test`,
+  `rustc` and every pwsh `cargo pwrs` runs.
+
+### Changed
+
+- The runtime a module ships takes no lock. A proxy object's gate and a
+  provider drive's gate are a word changed by compare-exchange: a call
+  from another thread waits as it did, spinning briefly and then parking
+  on an event the object makes on its first contention, and the rules on
+  the thread inside a call are the ones before (shared entries nest, an
+  exclusive one refuses and is refused, a drive operation reached again
+  nests). `Pwrs.Bootstrap`'s tables are maps a change copies and swaps in
+  by compare-exchange; the first of several imports of a new shell makes
+  its load context, and the first to stage into a process's folder
+  clears it, while the others wait for it. A rebuilt native library is
+  loaded and initialized once when several runspaces import at once.
+- The generated module script takes no mutex. It stages the bootstrap
+  in a folder named for the process, the stamp of the bootstrap's source
+  and the edition, and every copy it and the runtime make is written
+  under a temporary name and renamed into place, so runspaces importing
+  at the same instant run side by side. The script has no empty `catch`
+  and no `param()` block or analyzer suppression.
+- `cargo-pwrs` fetches the toolchain without a lock, into
+  `toolchain/<toolset>/v2/`. A missing package is extracted into a
+  folder of the fetching build's own, marked complete and renamed into
+  place, and of two builds fetching one package the second keeps the
+  first's folder; a hash is recorded by appending one line to
+  `v2/toolchain.lock`, whose first line for a package is its record; the
+  scripts are written under a temporary name and renamed into place.
+  Nothing outside `v2/` is written and no `fetch.guard` is opened, so
+  earlier versions sharing the machine keep their own tree, and a
+  machine that has theirs fetches the toolchain once more. A fetched
+  package is checked against the earlier versions' `toolchain.lock` as
+  well, which is only read.
+- The pwrs crate's surface table is a list that only grows, each
+  cmdlet's counters atomic, pushed by compare-exchange.
+- `pwrs::testing::install()` returns a `testing::Host` guard and gives
+  the calling test a context of its own: records, live handles, string
+  pins and stream settings belong to it, a handle names the context that
+  made it, and tests run side by side instead of in turn. `settled()`,
+  `raised()` and `views_read_only()` answer the calling test's records.
+- `pwrs-host` runs each session's scripts in a runspace of the calling
+  thread, and a `Session` stays on the thread that started it; its test
+  host builds into `current/` under the output folder.
+- The example module's region revocation and started-helper list are an
+  atomic pointer and a list pushed by compare-exchange.
+
+### Fixed
+
+- `cargo pwrs build` listed and license-checked crates a workspace
+  member's own build does not link. The crate list came from
+  `cargo metadata`, whose resolve unifies features across the workspace,
+  so an optional dependency another member turns on was counted for this
+  one: PWRS-GUI's stand-in module, whose library links no egui crate,
+  was refused for egui's font licenses and its notices named 195 crates.
+  The list now keeps only the crates `cargo tree --package` reaches for
+  the package and target with the build's features, and the stand-in's
+  notices name the 30 it links.
+- On Linux, macOS and FreeBSD, the pwsh processes `cargo-pwrs` runs for
+  its own steps (the toolchain fetch, a C# compile, the `$PSHOME` query)
+  shared pwsh's startup profile in `~/.cache/powershell` with each other
+  and with every other pwsh the user runs. pwsh processes ending at once
+  can leave that file corrupt, and a pwsh started on it then aborts in
+  `AssemblyName.ParseAsAssemblySpec`
+  ([PowerShell/PowerShell#26528](https://github.com/PowerShell/PowerShell/issues/26528)):
+  a gate run on Ubuntu lost all four fetches it made of one package
+  within five minutes, and 64 pwsh started at once against one cache
+  folder, round after round, had 13 abort in round 70. Each of those
+  pwsh now runs with `XDG_CACHE_HOME` set to a folder of its own under
+  the temporary folder, removed when it ends; Pester under
+  `cargo pwrs test` and `publish.ps1` run in the environment
+  `cargo pwrs` was given.
+
+## 0.4.0
+
+### Added
+
+- `#[psclass(columns = ["Name", ...])]` names the properties of a table
+  that is the class's default view, whatever its number of fields: the
+  format file gives the class a view `<Type>.Columns` with exactly those
+  columns, in that order, ahead of the table or list of every field it
+  gets otherwise, and `Format-List` still shows every property. With
+  `view` as well, the method's text stays the default and `Format-Table`
+  shows the named columns. An empty list, a name that is not a property
+  of the class, a name given twice and a view method named `columns` are
+  compile errors. A class naming none gets the views it got before.
+- The example module's `Hello.Job` has seven properties and names three
+  columns, and `Views.Tests.ps1` checks in both hosts that it shows as a
+  table of those three, through `Format-Table` as well, that
+  `Format-List` shows all seven, and both views by name.
+- `PsMemoryView<T>` hands the engine a `Memory<T>` (`writable`) or a
+  `ReadOnlyMemory<T>` (`read_only`) over memory the module does not
+  own, such as a mapped file, with an owner value the engine keeps until
+  it releases the view and then drops; on .NET Framework the elements
+  are copied into a `T[]` and the owner dropped before the write
+  returns. `PsMemory<T>` gains `read_only()`, and both take
+  `revocable(&PsRevocation)`: once the `PsRevocation` is revoked, a view
+  not yet handed over is refused when it is, and one already handed
+  over throws `ObjectDisposedException` from every later `GetSpan` and
+  `Pin`. `PsMemory<T>` is now `Send` and `Sync`. Host-table entry 80,
+  `memory_view_borrow`, carries the owner, the read-only flag and the
+  refusal byte; both kinds of buffer cross through it.
+- The example module's `New-RustRegionView`, `Get-RustRegion`,
+  `Get-RustRegionHolderCount` and `Revoke-RustRegionView` hand out
+  views of sixteen bytes the module keeps in an `Arc`, and
+  `Memory.Tests.ps1` checks in both hosts that a write through a view
+  reaches those bytes, the read-only type, that a view holds them until
+  it is collected or its manager disposed, and every refusal.
+- A proxy `#[psclass]` names the `#[psmethods]` methods behind .NET
+  interfaces, and the generated class implements them through those
+  methods: `count` and `item` make it an `IReadOnlyList<T>` with a
+  public `Count` and indexer, `set_item` adds `IList<T>` of a fixed size
+  and an indexer setter, `next` makes it an `IEnumerable<T>` stream,
+  `compare` gives `IComparable` and `IComparable<T>`, and `equals` with
+  `hash` give `IEquatable<T>` and the `Equals(object)` and
+  `GetHashCode()` overrides. `$obj.Count`, `$obj[i]`, `foreach`, the
+  pipeline, `-lt`, `Sort-Object`, `-eq`, hashtable keys, `Group-Object`
+  and `Select-Object -Unique` reach them in both hosts. Each method's
+  shape is checked when the module compiles.
+- A `#[psmethods]` method with a receiver may take another object of its
+  class as `&Self`. The generated method throws `ArgumentNullException`
+  for `$null` and enters both objects before the call, always in the
+  order the two were made, so two threads calling across the same pair
+  the opposite way round cannot deadlock; `Pwrs.ProxyBase` gains
+  `PwrsCallWith`, reserved as a member name with the others.
+- The example module's `Hello.Steps`, `Hello.Cells`, `Hello.Countdown`
+  and `Hello.Release` are a list, a writable list, a stream and an
+  ordered and comparable class, and `Interfaces.Tests.ps1` checks
+  them in both hosts with nineteen tests, among them two runspaces
+  ordering the same pair the opposite way round 2000 times each.
+- A `#[psmethods]` method that takes a `PsTask<T>` and returns
+  `PsResult<()>` returns a `Task<T>` (a `Task` for `PsTask<()>`) and
+  takes the caller's `CancellationToken` as its last, optional
+  parameter. The method moves the task to whatever thread does the
+  work, which settles it once with `complete`, `fail` (the error the
+  method would otherwise have thrown) or `cancel`; `is_cancelled` reads
+  a byte the token sets, with no crossing. A task dropped unsettled
+  faults with `PwrsTaskDropped`. Host-table entry 81, `task_settle`,
+  settles the `Pwrs.TaskSource<T>` the generated method makes, whose
+  continuations run asynchronously. `()` converts to `$null` through
+  `IntoPs`.
+- The example module's `Hello.Timer` has task methods, and
+  `Tasks.Tests.ps1` checks completion, cancellation while running and
+  before the call, faults, a dropped task and a task of no value in
+  both hosts with ten tests.
+- `Pipeline::events()` answers a `PsEvents` for the runspace the cmdlet
+  runs in: `Clone`, `Send` and `Sync`, so a worker thread, an attached
+  thread or a thread the module keeps after the call returns raises
+  PowerShell engine events through it. `raise(source_identifier,
+  message_data)` and `raise_with(source_identifier, sender, args,
+  message_data)` convert their values on the raising thread and raise as
+  `New-Event` does, so the event is queued, or handed to its
+  `Register-EngineEvent -Action`, before the call returns, and the
+  events one thread raises arrive in the order it raised them. Actions
+  run on the runspace's pipeline thread. Host-table entry 82,
+  `event_raise`, carries it.
+- The example module's `Send-RustEvent` raises events carrying a
+  `Hello.EventData` from a `stream_from_worker` worker, or from a thread
+  it leaves running with `-DelayMs`, and `Events.Tests.ps1` checks in
+  both hosts that `Wait-Event` and `Get-Event` read them in order with
+  their MessageData, sender and arguments, that an `-Action` runs on the
+  pipeline thread, and that a child host started with `-MTA` receives
+  one.
+- `references = ["System.Windows.Forms", ...]` under
+  `[package.metadata.pwrs]` adds assemblies to the compile of a module's
+  hand-written C#: the pwsh half takes each name from
+  `Microsoft.WindowsDesktop.App.Ref` 8.0.31, and the Windows PowerShell
+  half's shell compiles against the whole .NET Framework 4.7.2 reference
+  set (`Microsoft.NETFramework.ReferenceAssemblies.net472` 1.0.3, with
+  its facades) in place of netstandard 2.0's, so `System.Drawing`'s
+  `Bitmap`, `Font` and `Icon` reach that half as well. Such a module
+  needs .NET Framework 4.7.2 or later under Windows PowerShell; a module
+  that names none compiles as it did. Both packages are fetched the first
+  time a module names any and checked against the toolchain's lock. A
+  name found for one half only compiles into that half, and a name
+  neither carries stops the build. The build prints which half took each
+  name. Nothing is shipped: off Windows the module imports, and a call
+  into code using a desktop assembly throws, naming it.
+- The example module's `Get-RustHybridDesktop` reads Windows Forms'
+  `SystemInformation` and sets and reads back a pixel of a
+  `System.Drawing.Bitmap`, and `Hybrid.Tests.ps1` checks its answer in
+  both hosts on Windows and that it fails naming Windows Forms
+  elsewhere.
+- `pwrs::thread::enter_sta()` puts the calling thread in a
+  single-threaded COM apartment until the guard it returns drops, for a
+  thread a module starts to own a window or a COM object: on Windows
+  `CoInitializeEx` with `COINIT_APARTMENTTHREADED`, and `CoUninitialize`
+  on the same thread when the guard drops; elsewhere nothing. A thread
+  already in the multithreaded apartment is refused with
+  `PwrsApartmentChanged`. `pwrs::thread::apartment()` reads a thread's
+  apartment through `CoGetApartmentType`, and is `None` where there is
+  no COM.
+- The example module's `Get-RustApartment` reports the apartment of a
+  worker thread before, while and after it holds the guard, and
+  `Apartments.Tests.ps1` checks it in both hosts. hello's import hook
+  sets a process environment variable named for the loaded copy of the
+  library and its removal hook clears it; `Lifecycle.Tests.ps1` and the
+  hot reload gate check that exactly one is held after every import and
+  that a replaced copy's is released. Two Hosts explains why process-wide
+  state carries such a name and why a value holding a one-thread
+  resource does not release it in `Drop`.
+
+### Changed
+
+- `pwrs_build::CompileEnv` gains `path_map`, the folders a compile
+  records under fixed names in a `.pdb` and in the assembly's pointer to
+  it. A `CompileEnv` built with a struct literal needs the field;
+  `path_map: &[]` compiles as before.
+- `pwrs::runtime::class_id` is `class_id::<T>()` and finds the id by
+  Rust type. `PsClassMeta` gains `PATH`, and `ClassEntry` gains
+  `type_id` and `path`, which `export_module!` fills.
+
+### Fixed
+
+- Two `#[psclass]` types under one PowerShell name, one of them not
+  listed in `export_module!`, built and ran, and the unlisted type's
+  values were written with the listed type's field layout. `cargo pwrs
+  build` now refuses two types under one name, compared without regard
+  to case, and names both, whether `export_module!` lists both or only
+  one: each class a library can write leaves a `PWRS-CLASS/1` record in
+  it that the build reads. A written class the list leaves out is a
+  warning. Class ids are found by Rust type, so a library built another
+  way fails such a write with `PwrsClassNameTaken`.
+- Two builds fetching the toolchain at once could fail, one removing a
+  package folder the other was extracting into. A build fetches holding
+  a lock on the toolchain's `fetch.guard`, so fetches run one at a time.
+- Two copied classes, cmdlets or providers whose Rust types share a
+  name in different modules failed the shell's compile with CS0101.
+  Field blocks carry the class id, and cmdlet and provider classes carry
+  their id where a Rust name is shared, so existing class names and
+  error ids are unchanged.
+- The README's table of contents links its "Modules built with it"
+  section, which 0.3.2's linked under an anchor no heading had.
+- `GetSpan` and `Pin` on a `Memory<T>` whose manager had been disposed
+  answered a span over a null pointer with the old length; they throw
+  `ObjectDisposedException`, and the manager releases the memory exactly
+  once however many threads dispose it.
+- A `#[psmethods]` method with an argument named as one of the
+  generated method body's locals, such as `b`, `r` or `s0`, failed to
+  compile in the generated shell. The body's locals start with two
+  underscores, which no argument's name can, and `Hello.Timer`'s
+  `sum_async(a, b, task)` compiles.
+- A build without `--release` of a module that bundles another stopped
+  with "cannot bundle ...: net10.0/Pwrs.Bootstrap.dll differs between
+  the two builds": each runtime assembly carried the path of its own
+  `.pdb`. The compiles give the work folder and the module folder fixed
+  names in a `.pdb` and in the pointer to it, so the two builds' runtime
+  assemblies are the same bytes; release output is unchanged, and the
+  files under `src/csharp/` keep their own paths.
+
+## 0.3.2
+
+### Changed
+
+- `String::from_ps` reads a string longer than 256 UTF-16 units where
+  the host keeps it: host-table entry 79, `string_pin`, converts the
+  handle to a string as `string_read` does and pins it, and its units
+  are transcoded with no intermediate copy, as a `[string]` parameter's
+  are. A string of up to 256 units is still read in one crossing into a
+  buffer of that size. On a 16,988,895-character string, the read took
+  a median of 3.46 ms rather than 8.57 in PowerShell 7.6.6 and 3.49
+  rather than 8.40 in Windows PowerShell 5.1 on Windows 11, and 4.14
+  rather than 29.85 in PowerShell 7.6.6 on Ubuntu 24.04, and the whole
+  call took what a `[string]` parameter's took in each.
+
+## 0.3.1
+
+### Fixed
+
+- The `ToString()` that `#[psclass(show = "...")]` generates builds its
+  text from an `object?[]`, so a property of a string or class type,
+  which the generated class declares nullable, compiles without C#
+  warning CS8601 in either shell. A null one shows as nothing.
+- The `GetDynamicParameters()` a `#[dynamic_params]` cmdlet's shell
+  declares returns `object?`, as `IDynamicParameters` declares it, since
+  it answers null when the hook adds no parameter; it compiles without
+  C# warning CS8603 in either shell.
+- The example module's `Hello.Light` declares `show = "{Name}: {State}"`,
+  and `Views.Tests.ps1` checks its text with a name and with a null one.
+- The example module's `Bundled.Tests.ps1` expects one Calc library in
+  each platform's folder, so hello's suite passes from a module folder
+  `cargo pwrs merge` joined, which carries a folder for each platform.
+
+## 0.3.0
+
+### Added
+
+- `PsError::with_details(text)` and the `details` field: text beyond the
+  one-line message, such as a cause chain or a backtrace, reaches the
+  record's `Exception.InnerException` as its Message, on every path an
+  error leaves by. That is a cmdlet's record, written or terminating,
+  and the exception a proxy method, a static call, a field read, a
+  provider, a completer, a transform or a lifecycle hook throws, which
+  PowerShell wraps in a `MethodInvocationException` for a method. The
+  default error view still shows the message alone.
+- Host-table entries 76, `write_error_details`, and 77,
+  `exception_new`, which carry it. The table only grows, so a module
+  built for 0.2.3 loads on this runtime.
+- `PwrsException` takes an inner exception, and every call site that
+  turns a native error into an exception throws one the native side
+  built as it is.
+- `pwrs::testing::take_errors_with_details`, and the fake host's
+  `write_error_details` and `exception_new`.
+- `#[param(allow_empty_string)]` declares `[AllowEmptyString]`, so a
+  mandatory string parameter takes an empty string, such as a blank
+  line piped from `Get-Content`, which the engine refuses without it. On
+  a parameter that isn't a `String`, `PathBuf` or an `Option` of either,
+  it is a compile error. In the hello example `Measure-RustLine` takes
+  its lines that way, and the suite pipes a blank one through it and
+  shows `Get-Greeting` refusing one.
+- The example module's `Get-Greeting -Fail` and `-Terminate`, and
+  `[Hello.Counter]`'s `Advance` and `Parse`, raise errors with details,
+  which `examples/hello/tests/ErrorDetails.Tests.ps1` reads in both
+  hosts.
+- `pwrs::attach_current_thread()` and the guard it returns,
+  `AttachedThread`. A thread the module starts to drive PowerShell
+  itself, such as a runspace driver, holds the guard, and while it does
+  the thread check lets its `PsObject` and `PsType` calls run; once the
+  guard drops the thread is checked again. The guard cannot leave its
+  thread. The example module's `Test-RustOffThread -Attached` reads a
+  type name under the guard and after it, which `Parallel.Tests.ps1`
+  checks in both hosts.
+- `Progress` and `Pipeline::write_progress`: a progress record with
+  every field a `ProgressRecord` has, the parent activity, the current
+  operation and the seconds left among them, and a processing record
+  that shows no percentage. `.completed()` ends the activity.
+  `Pipeline::progress` keeps its meaning.
+- Host-table entry 78, `write_progress_record`, which carries it.
+- `Worker` and `Pipeline::stream_from_worker`: a worker thread writes
+  output, errors, warning, verbose, debug and information text, and
+  progress through one channel, and the pipeline thread writes each
+  record in the order sent. Of the progress records for one activity
+  waiting together, only the latest is written. A terminating error the
+  worker writes ends the call with that error.
+- `Pipeline::par_map_with` and `Pipeline::par_for_each_with`, which hand
+  the closure a `Worker` for the other streams and for the stop.
+- `Pipeline::workers(n)` and `Workers`: the parallel helpers with at
+  most `n` items running at once. Zero is refused with
+  `PwrsWorkerCount`.
+- `#[psclass(proxy, view = method)]`: a proxy class names a
+  `#[psmethods]` method returning `PsResult<String>`, and the module's
+  format file shows the class by that text, escape sequences included,
+  ahead of its table or list, which `Format-Table` and `Format-List`
+  still show. A `view` on another mode, or naming anything but such a
+  method, is a compile error. The example module's `Hello.Frame` and
+  `New-RustFrame` show it, and `Views.Tests.ps1` checks it in both
+  hosts.
+- `#[psclass(show = "...")]`: a copied class names the text its object
+  shows, a format over its own property names, and the generated
+  class's `ToString()` returns it, so an object nested in another prints
+  as that text rather than its type name. It runs in C# on both hosts.
+  `show` on another mode, a name that is not a property, and a stray
+  brace are compile errors. The example module's `Hello.Point`,
+  `Hello.Segment` and `New-RustSegment` show it, and `Views.Tests.ps1`
+  checks it in both hosts.
+- `pwrs::testing::take_progress`, and the fake host's
+  `write_progress_record`; both progress entries of the fake host
+  record what they write.
+- The example module's `Write-RustProgress`, `Invoke-RustWorker`,
+  `Invoke-RustParallelWork` and `Get-RustParallelStats`, which
+  `examples/hello/tests/Workers.Tests.ps1` runs in both hosts, and its
+  `parallel` feature, which builds it on Flynnel's pool so its suite
+  runs the parallel helpers there as well.
+
+### Changed
+
+- `PsError` has a sixth public field, `details`. Code that builds a
+  `PsError` with a struct literal adds `details: None` or uses
+  `PsError::new`; `PsError { message, ..e }` and a pattern ending in
+  `..` compile unchanged.
+- The notices take a crate's license files by the names `LICENSE`,
+  `COPYING`, `NOTICE`, `COPYRIGHT` and `UNLICENSE`, alone or with a
+  suffix such as `-MIT` or `.txt`. A crate whose license file has any
+  other name takes a `[package.metadata.pwrs.license-files]` entry.
+- American spelling throughout the source, the docs and the example's
+  help text, and no dates in this file's headings.
+- Edition 2024, and every crate declares `rust-version = "1.98"`, so a
+  module needs rustc 1.98 or later. `cargo pwrs new` writes an edition
+  2024 crate.
+- `FromPs for String` has the host write the string straight into its
+  buffer's spare capacity, with no zero fill first, and reads a string
+  longer than the first 256 characters once more into room for all of
+  it. A string that grows between the two reads is refused with
+  `PwrsConversionError`.
+- The module's `.psm1` opens with a `param()` block whose attribute
+  suppresses PSScriptAnalyzer's `PSAvoidUsingEmptyCatchBlock`, with a
+  justification, so the script and manifest pass the rules the
+  PowerShell Gallery runs on every package with no findings. The one
+  empty `catch`, around the import lock's `WaitOne`, is empty on
+  purpose: `WaitOne` throws `AbandonedMutexException` when it acquires
+  a mutex whose last owner exited without releasing it. The script
+  0.2.3 writes draws that rule's warning. `tools/gallery_rules_gate.ps1`
+  runs the Gallery's rules over each built example's script and
+  manifest and fails on any finding.
+- `par_map` and `par_for_each` wait for their workers 50 ms at a time,
+  so a stop is seen while no result arrives. Once the pipeline stops,
+  or a worker panics, no further item starts under either pool; 0.2.3
+  kept draining until a result arrived, and under the `parallel`
+  feature ran one more item in every leaf not yet started.
+- `par_for_each` runs on the same pool as `par_map`, Flynnel's under the
+  `parallel` feature, and the pipeline thread waits for it without
+  spinning.
+- `Order`, `StopSignal`, the thread helpers and the parallel helpers
+  live in `pwrs::worker`; `pwrs::pipeline::Order` and
+  `pwrs::pipeline::StopSignal` still name the same types.
+- The hello example's cold-import test imports from eight runspaces
+  that each have their own session state, where it used a
+  `RunspacePool`. A pool's runspaces share one `InitialSessionState`,
+  whose list of format files `Import-Module` adds to and walks without
+  a lock before the module's own script runs, so a pool importing
+  modules with format files in several runspaces at once can fail
+  inside PowerShell with "Collection was modified; enumeration
+  operation may not execute.", whatever the modules; the test failed
+  that way once on FreeBSD. Everything PWRS shares between runspaces is
+  process-wide and separate runspaces share it as well. How To Fix A
+  Failure has the pool's failure and the way around it.
+
+### Fixed
+
+- `Pipeline::invoke` and `invoke_with_input` failed on a module
+  function whose `dynamicparam` block reads its module's `$script:`
+  state, as every CDXML function does, `New-ScheduledTaskAction` among
+  them, with "Cannot retrieve the dynamic parameters for the cmdlet.
+  You cannot call a method on a null-valued expression.". The command
+  was resolved to its `CommandInfo` and added as that, which evaluates
+  the block outside its module. The command is now added by name,
+  which the engine resolves as it does a typed command; a name is not
+  script text, so nothing is parsed. A name no command answers to is
+  the `Err` with PowerShell's own `CommandNotFoundException` message,
+  "The term '...' is not recognized ...", where 0.2.3 said
+  `pwrs: no command named`. In the hello example the suite runs such a
+  function, from a module `New-Module` builds, through
+  `Get-RustComposed`, and checks the unknown name's message.
+
+## 0.2.3
+
+### Added
+
+- `proxy_enter_shared`, host-table entry 75: the shared form of
+  `proxy_enter`, which `PsProxy::with` now takes, so a `with` borrow
+  nests inside a `&self` method or a property read on the same thread
+  and is refused only inside a `&mut self` method or a `with_mut`
+  borrow. The table only grows, so a module built for 0.2.2 loads on
+  this runtime.
+- A `bundled-modules` entry can be a table: `path`, the crate directory
+  the string form names, with any of `on-import-failure`, `features`,
+  `default-features`, `license-files` and `cpu-features`.
+  `on-import-failure = "warn"` makes the module's script write a warning
+  naming the bundled module and its error when it cannot be imported,
+  and import the module without it; `"stop"`, the default and the string
+  form's behavior, fails the import. `features` and `default-features`
+  reach the bundled crate's build. `license-files` and `cpu-features`
+  cover the bundled library, beside the bundled crate's own settings, so
+  a module can supply them for a crate it bundles from another project's
+  checkout; one crate and version supplied from both places stops the
+  build. The hello example's `Calc` entry warns, and its suite imports a
+  copy whose `Calc` cannot load.
+
+### Changed
+
+- `cargo pwrs publish` checks each bundled module's library as it checks
+  the module's own: crates it links without a license text, and
+  extensions it requires beyond its target's baseline that nothing
+  declares, refuse the package, naming the bundled module and the entry
+  setting that lets it through. Earlier versions checked the bundling
+  module's library alone.
+- A `bundled-modules` entry that is neither a string nor a table, and a
+  table key or value the entry does not take, stop the build, named.
+  Earlier versions skipped an entry that was not a string.
+- The crates require their siblings at exactly their own version:
+  PoWerRuSt requires `=0.2.3` of pwrs-sys and pwrs-macros, and
+  cargo-pwrs and pwrs-host `=0.2.3` of pwrs-build. Earlier releases
+  wrote `^` requirements, so a lock refresh could pair PoWerRuSt 0.2.0
+  with pwrs-sys 0.2.2, whose larger host table it does not compile
+  against; a module that holds an earlier release pins all three.
+- `Cargo.lock`, which `cargo install cargo-pwrs --locked` builds from,
+  takes the newest compatible releases: cc 1.5.1, find-msvc-tools
+  0.1.14, smallvec 1.16.2, zerocopy and zerocopy-derive 0.8.59, and
+  cudarc 0.19.10 for the optional flynnel feature. Every direct
+  dependency already named its newest stable release.
+
+### Fixed
+
+- A proxy method called with its own receiver as a by-value argument,
+  such as `$c.CompareTo($c)` on a proxy class, failed with "in use by a
+  call already running on this thread": the call held the object's gate
+  while the argument was read back through the proxy's getters, and the
+  gate refused every re-entry. The gate now tells a shared entry (a
+  property read, a `&self` method, a `with` borrow), which nests on the
+  thread inside one, from an exclusive entry (a `&mut self` method, a
+  `with_mut` borrow), which is refused while anything is inside and
+  refuses everything while it runs; a `&mut self` method called with
+  its own receiver by value stays refused, with the same message. The
+  generated shell passes each method's receiver kind, which the
+  descriptor carries as `mutable` (read as exclusive when a descriptor
+  does not carry it), and a `&self` method runs on a shared reference.
+  In the hello example `Hello.Counter` gains `SameAs`, a `&self` method
+  taking a counter by value, its suite calls `SameAs` and `Absorb` with
+  their own receiver, and `Test-RustSeriesHold` gains `-Exclusive`, so
+  the suite reads a held series from the holding thread under each
+  kind of hold.
+- A proxy class's public constructor whose Rust half returned an error,
+  such as a failed `[Type]::new(...)`, left an object no constructor
+  had run on, and when the collector finalized it the finalizer threw
+  on the finalizer thread, which ended the process with
+  `System.ArgumentNullException` from `Pwrs.ProxyBase.ReleaseInstance`.
+  The finalizer now leaves such an object alone, since it holds no
+  value to free. In the hello example `Hello.Counter`'s constructor
+  refuses a label holding `=`, which `Parse` could not read back, and
+  the suite collects a counter whose construction failed in a child
+  host and checks the host goes on.
+
+## 0.2.2
+
+### Added
+
+- `[package.metadata.pwrs] bundled-modules`, other PWRS crates whose
+  modules ship inside this one. `cargo pwrs build` builds each with the
+  same tool for the same target and profile, `--locked`, into
+  `target/pwrs-bundled/<crate directory>/` under the bundling module's
+  target directory, refuses it unless its `Pwrs.Bootstrap.dll` and
+  `Pwrs.Runtime.dll` match the bundling module's byte for byte, and
+  copies its folder to `<Module>/<Name>/`. The generated script imports
+  each into the session before its own shell, `-Global` and
+  `-DisableNameChecking`, and leaves one the session already holds as
+  it is, which is what lets the import succeed on PowerShell 7 at all.
+  `publish` carries the folder inside the package, and `merge` copies a
+  bundled module's `runtimes/<rid>` into the destination's copy of it.
+  The hello example bundles the calc example, and `Bundled.Tests.ps1`
+  proves the folder, the byte-identical runtime, the import from the
+  bundled folder and the reuse of a module imported first, in both
+  hosts.
+- `benches/dynamic_params.ps1`, which prices a cmdlet's dynamic
+  parameters per call against compiled C# cmdlets and splits PWRS's
+  share into the bound-parameter table, the call into the library and
+  the hook's reads; and in the hello example `Get-RustStaticReading` and
+  `Get-RustBlindReading`, `Get-RustReading` with no hook and with a hook
+  that reads nothing and adds nothing, which the bench times it against,
+  and `Get-RustTableEntry`, which reads one key of a table as it was
+  passed.
+- `benches/bulk_array.ps1`, which prices a large array's binding in
+  each form it can arrive in (a bare `byte[]`, the same array wrapped
+  in a `PSObject`, an `object[]` of the values boxed) through each way
+  a parameter can take it, in both hosts, with the busy cores of every
+  other process printed beside each figure. `docs/PERF.md` carries its
+  table.
+- `?` on a `std::collections::TryReserveError` gives an error record
+  with id `PwrsOutOfMemory` and category `ResourceUnavailable`, the
+  pair `PsMemory::zeroed` already raised. A cmdlet that reserves
+  memory sized by its input with `try_reserve` now reports a refused
+  allocation as an error and the session carries on; the infallible
+  forms end the process, which no boundary can catch.
+- `pwrs::text::try_from_utf16` and `try_from_str16`, the forms of the
+  UTF-16 readers that reserve before they allocate.
+- A module compiled for x86-64 extensions its CPU lacks refuses to
+  import with the missing ones named, instead of ending the session at
+  the first such instruction. A library built with
+  `-C target-cpu=native` carries them throughout. `export_module!` now
+  emits the list the crate was compiled for as the data export
+  `pwrs_cpu_requirements`, beside `pwrs_cpuid` and `pwrs_xgetbv`,
+  whose bodies are only those instructions, and the runtime reads and
+  checks it before any other export runs. `cargo pwrs build` warns about
+  requirements beyond the target's own baseline, and `cargo pwrs
+  publish` refuses them unless `[package.metadata.pwrs] cpu-features`
+  lists them. A module now needs rustc 1.88 or later for the naked
+  functions.
+- `pwrs::cpu`: whether the CPU and the operating system offer each
+  x86-64 extension, which ones the library was compiled for, and `has`,
+  the predicate to dispatch kernels on. `PWRS_CPU_MAX` caps it at a
+  psABI level, and the import check applies the same cap, so one
+  machine can run every tier of a module.
+- A `PsObject` method called from a worker the module started (`get`,
+  `set`, `call`, `pin`, `type_name`, `type_tag`, and `PsType`'s calls)
+  returns an error with id `PwrsOffThread` in a debug build and under
+  `cargo pwrs test`, which sets `PWRS_THREAD_CHECK=1` for its hosts.
+  `PsObject` is `Send`, so the compiler lets a worker capture one, but
+  such a call attaches the worker to the .NET runtime and runs the
+  engine's member binder on a thread no runspace belongs to. A release
+  build does not check.
+- `PsProxy<T>`, a parameter holding a `#[psclass(proxy)]` object of
+  class `T`. It is declared with `T`'s CLR type, so the binder accepts
+  that class alone, from the pipeline, a variable, or through commands
+  that know nothing of it. `with` and `with_mut` lend the value in place
+  under the object's gate, so a proxy with Rust-only state, which cannot
+  be read back by value, can be taken by a cmdlet; writing a `PsProxy`
+  writes the same object. The borrow crosses through two host-table
+  entries, `proxy_enter` and `proxy_exit`.
+- `#[psclass(proxy, native_bytes = path)]` names a `fn(&Self) -> usize`.
+  The object reports its answer with `GC.AddMemoryPressure` when made,
+  again after each method call and each `with_mut`, and withdraws it
+  when the value is freed, through the optional export
+  `pwrs_proxy_bytes`.
+- `Pipeline::stream_from_thread_until`, which hands the worker a
+  `StopSignal` as well as the channel. It is set when the pipeline
+  thread stops draining, so a worker that computes without sending can
+  return instead of holding a stopped pipeline until it is done.
+- `cargo pwrs build` writes the license notices a module owes.
+  `runtimes/<rid>/THIRD-PARTY-NOTICES.txt` beside each native library
+  lists every crate the library links with the license it declares and
+  the license files its source carries, word for word, and the module
+  folder's own covers the managed runtime and the .NET Framework
+  assemblies a module with hand-written C# ships. A crate whose license
+  expression the allowed licenses do not satisfy stops the build; the
+  defaults are permissive licenses, and `[package.metadata.pwrs]
+  allowed-licenses` adds to them. `cargo pwrs publish` refuses a module
+  whose library links a crate whose source carries no license file.
+- Each published crate carries the repository's `LICENSE`, so a module
+  built on them can quote it.
+- `--target <triple>.<glibc>`, as cargo-zigbuild spells it
+  (`x86_64-unknown-linux-gnu.2.35`), builds the library through
+  `cargo zigbuild` against that glibc's symbols, so a module can load
+  under a pwsh running on an older glibc than the building machine's,
+  such as the powershell snap's.
+- Helper executables. `[package.metadata.pwrs] helpers` names some of
+  the package's `[[bin]]` targets, and `cargo pwrs build` ships each
+  beside the native library in `runtimes/<rid>/native/`, built for the
+  same target and profile, so `merge` and `publish` carry them; a name
+  that is no `[[bin]]` target stops the build. `pwrs::helper_path(name)`
+  answers where to start one: a copy staged for the process beside the
+  staged library, made on the first request for the helper's bytes, so
+  a running helper holds no file in the module folder. It crosses
+  through a new host-table entry, `helper_path`. Outside Windows the
+  copy is readable and executable by its owner whatever mode the shipped
+  file has, since a `.nupkg` records no Unix mode for its entries.
+- `#[param(set = ["Path", "LiteralPath"])]` puts a parameter in several
+  parameter sets and no others: the shell declares one `[Parameter]`
+  per set, so the binder refuses the parameter beside one of any other
+  set, and help writes a syntax line per set. The descriptor carries a
+  parameter's sets as `sets`; `cargo pwrs` still reads the single `set`
+  an older crate writes.
+- `#[param(clr = "byte[]")]` on a `PsObject` parameter declares it as
+  that CLR type, so the binder coerces to it and chooses between
+  parameters by it, while the value still crosses as a handle and is
+  read in place. A byte array piped to a compressor-shaped cmdlet then
+  arrives whole, and a piped file goes on to a `-LiteralPath` bound from
+  its `PSPath` instead of stopping at an `object` parameter.
+- `#[param(allow_empty_collection)]` declares `[AllowEmptyCollection]`,
+  so a mandatory collection parameter takes an empty array instead of
+  the binder refusing it.
+- `[package.metadata.pwrs.license-files]` supplies the license file a
+  linked crate's package lacks, keyed `"name@version"`, as a path in the
+  module's own repository. The notices quote it for that crate and
+  `publish` accepts the module; an entry for a crate or version the
+  library does not link, for a crate that ships its own license file,
+  or pointing at a missing or empty file, stops the build.
+
+### Changed
+
+- `stream_from_thread` waits on its channel 50 ms at a time and reads
+  the stop flag between waits, so a stop is seen while the worker sends
+  nothing. It used to wait for the worker's next send.
+- Every dependency requirement names its newest stable release:
+  syn 3, which moved the receiver's reference form into
+  `ReceiverKind`, so `#[psmethods]` reads it there; libloading 0.9;
+  criterion 0.8 for the benches, whose `black_box` is now
+  `std::hint::black_box`; and serde, serde_json, quote and proc-macro2
+  at their newest 1.x.
+- `cargo pwrs test` streams each host's Pester output as the suite
+  writes it. It used to print a host's output when that host exited,
+  so a test that never returned left the run showing only
+  `pwrs: Pester in pwsh`. `pwrs_build::pwsh` gains `stream_pwsh_script`
+  and `stream_winps_script`, which give the script an empty stdin, as
+  the capturing pair does.
+- `tools/hot_reload_gate.ps1` and `tools/coload_gate.ps1` take
+  `-Target`, a triple they hand to `cargo pwrs build --target`, so the
+  modules they build load under a pwsh on an older glibc than the
+  building machine's.
+- The license's copyright line, in the repository and in each crate,
+  names Mark Newton.
+- A cmdlet's dynamic-parameter hook costs less per call. The generated
+  `GetDynamicParameters` builds one table for the hook, each value out
+  of the PSObject the binder may have wrapped it in, and the runtime
+  pins that table for the call instead of copying it into a second; the
+  hook's table now compares names ignoring case, as
+  `MyInvocation.BoundParameters` does. A hook that adds nothing hands
+  the engine `$null`, which it reads as no dynamic parameters and prices
+  below an empty table. And a `PsHashtable` or `PsReadOnlyTable` read
+  from Rust (`get`, `set`, `contains`, `remove`) is answered by the
+  dictionary itself in the host, instead of by PowerShell's adapter and,
+  for `get`, reflection; a missing key on any table reads as `$null`.
+  Measured on a Windows desktop with `benches/dynamic_params.ps1`,
+  paired within rounds, `Get-RustReading` less the same cmdlet with no
+  hook: 3,414 ns to 1,900 ns per call in pwsh 7.6.6, 18,757 ns to
+  7,649 ns in Windows PowerShell 5.1; `GetDynamicParameters` called
+  directly, less a C# hook returning an empty table: 1,993 ns to
+  1,412 ns and 10,227 ns to 2,709 ns. The bound-parameter table itself
+  was 162 and 308 ns of that before. `docs/PERF.md` carries the whole
+  table with the load each run carried.
+- A dynamic-parameter hook's answer crosses as one managed string, a
+  line per parameter joined by U+0003 with seven cells joined by U+0001
+  and validate-set values by U+0002, and `$null` for none, instead of an
+  `object[]` of `string[7]` rows built through seventeen host crossings
+  per parameter; the runtime splits it, and a line without its seven
+  cells is an error naming the count where it was skipped before.
+  Measured on the same Windows desktop, `GetDynamicParameters` called
+  directly, PWRS less a C# hook adding the same parameter: 4,536 ns to
+  2,200 ns per added parameter in pwsh 7.6.6 and 8,134 ns to 3,507 ns
+  in Windows PowerShell 5.1; `Get-RustReading -Kind temperature` less
+  the same cmdlet with no hook, end to end: 4,930 ns to 3,998 ns and
+  28,397 ns to 18,021 ns. `docs/ABI.md` states the format.
+
+### Fixed
+
+- A provider's content reader handed the engine each `get_content`
+  result's base object, so the properties a `PSObject` carries on its
+  wrapper, a deserialized object's among them, read as `$null` through
+  `$drive:name` while `(Get-Item drive:name).Value` kept them. The
+  reader now hands each result over as the module returned it. The
+  memfs example reads a directory through `$mem:path` as one
+  `Pwrs.MemDir` object whose `Name` and `Entries` are note properties,
+  which its suite checks.
+- A module imported from several runspaces at once, in a process that
+  had not imported it yet, failed in some of them: each ran the
+  generated script's bootstrap copy and the loader's staging over the
+  same files, so one loaded a copy another was still writing, and on
+  Windows PowerShell every later import in that process then failed to
+  load the runtime from the staging folder. The script now runs under
+  a mutex named for the process, the loader loads under a lock of its
+  own, and a staged copy is written under a temporary name and renamed
+  into place, so a path that exists is whole. The hello suite imports
+  the module cold from eight runspaces at once in a child host of each
+  edition, twice, with every import succeeding.
+- How To Use Threads said `PsObject` methods could be called on
+  workers; it now says a worker builds plain Rust values and leaves
+  `PsObject` to the thread the cmdlet runs on.
+- The README's row for threads split at the closure's `|tx|` on GitHub,
+  which read it as a column break and dropped the rest of the row. The
+  pipes are escaped.
+- Reading a managed string, array, hashtable, `BigInteger` or
+  `SecureString` into Rust allocated the copy infallibly, as did every
+  string parameter, so a value too large for the allocator ended the
+  host process. They now reserve first and return `PwrsOutOfMemory`.
+- `PsSecureString::reveal` could free a buffer holding part of the
+  secret without zeroing it, when the string grew between the read of
+  its length and the read of its text. Every buffer it gives up is now
+  wiped first.
+- A proxy disposed on one thread during a property read or method call
+  on another had its value freed under the running call. `Dispose` now
+  waits for the object's gate, and on the thread holding it, from a
+  script the call runs, the value is freed when the call ends.
+- A property read or method call reaching a proxy from inside a call
+  already running on the same thread was handed a second reference to a
+  value in use. It is now refused with a `PwrsException`.
+- A byte array written by any cmdlet reaches the next one wrapped in a
+  PSObject, and binding it to a `byte[]` parameter converted it element
+  by element: 8.4 s in pwsh 7.6 and 24 s in Windows PowerShell 5.1 for
+  32 MiB, against milliseconds unwrapped. Every array-typed parameter
+  now carries `[Pwrs.UnwrapArray]`, a transformation the binder runs
+  first, which hands it the wrapped array itself.
+- A module's dynamic parameters did not complete. The generated
+  `GetDynamicParameters` handed the hook `MyInvocation.BoundParameters`,
+  which completion leaves empty, so during `TabExpansion2` the hook saw
+  nothing bound and offered nothing. It now also hands the hook every
+  parameter set on the cmdlet object, which completion does set.
+- A warning written with `warning!` under `-WarningAction
+  SilentlyContinue` was not written at all, so `-WarningVariable` stayed
+  empty where `Write-Warning` fills it, and an information record
+  written with `information!` under the default `$InformationPreference`
+  never reached `-InformationVariable` or a `6>` redirection. The
+  runtime now counts a warning or information record as kept wherever
+  the engine keeps one written by its own cmdlets; verbose and debug
+  records are kept only where they are shown, as before.
+- A module fresh from `cargo pwrs new` ended its first `cargo pwrs test`
+  with a surface-check finding against its own cmdlet: the scaffolded
+  suite never piped anything into `-Name`, which the cmdlet declares as
+  taking pipeline input. The suite now pipes two names in as well.
+
+## 0.2.1
+
+### Added
+
+- Hand-written C# can use spans on Windows PowerShell. The
+  `netstandard2.0` compile references the .NET Framework builds of
+  `System.Memory` 4.6.3, `System.Buffers` 4.6.1 and
+  `System.Runtime.CompilerServices.Unsafe` 6.1.2 beside
+  `System.Numerics.Vectors`, and a module with hand-written C# ships
+  all four in its `netstandard2.0` folder, which its script copies
+  beside the staged shell. Six files of SIMD code written for a .NET
+  SDK project targeting .NET Framework and .NET 8 failed on that half
+  with four `ReadOnlySpan<>` errors, and compile now. Hello's
+  `Measure-RustHybridDot` walks its arrays in `Vector<int>` steps
+  through `MemoryMarshal.Cast`. The copy costs the first import in a
+  Windows PowerShell process: on hello, 5.8 ms by minimum and 8.4 ms by
+  median over 21 fresh processes, with a warm re-import unchanged.
+
+### Changed
+
+- The PowerShell 7 half of every module is compiled against .NET 8's
+  reference pack, `Microsoft.NETCore.App.Ref` 8.0.31, and the
+  `System.Management.Automation` 7.4.0 reference, both fetched from
+  NuGet, instead of the reference set of the pwsh doing the build.
+  Every machine now emits the same references, and hand-written C# on
+  PowerShell 7 can use only what .NET 8 and PowerShell 7.4 have: code
+  calling an API only .NET 9 or 10 has stops compiling. The folder
+  keeps its name, `net10.0`. On a PowerShell 7 whose .NET is older
+  than 8, the module's script stops with a line naming the PowerShell
+  it needs.
+
+- `System.Numerics.Vectors` moves from 4.5.0 to 4.6.1, and the
+  toolchain fetches four more packages. Each package version is
+  fetched into a folder named for it (`simd-4.6.1/`) and the scripts
+  into one named for their text, so an existing toolchain fetches its
+  packages once more, and `cargo-pwrs` 0.2.0 on the same machine keeps
+  reading its own unversioned folders, which this version never
+  writes.
+
+### Fixed
+
+- A module built on one PowerShell 7 did not load on an older one,
+  because its PowerShell 7 half referenced the .NET of the pwsh that
+  built it. Measured by a consumer: a module built on pwsh 7.6.6 failed
+  on 7.5.11, 7.4.20 and FreeBSD's 7.5.5 with "Unable to find type
+  [Pwrs.Bootstrap.Loader]", which broke a published module there, and
+  one built on FreeBSD's 7.5.5 failed on 7.4.20 and referenced
+  `System.Private.CoreLib` directly, since FreeBSD's pwsh ships
+  implementation assemblies. `cargo pwrs merge` keeps the first
+  folder's managed half, so the machine that built it set the floor
+  for every platform. The pinned references above remove the cause.
+
+- Hand-written C# using `System.Numerics.Vector<T>` compiled for
+  Windows PowerShell and failed there when it ran, with a
+  `FileNotFoundException` for `System.Numerics.Vectors` 4.1.3.0: the
+  compile referenced the package's reference assembly, whose version no
+  build in the package carries, .NET Framework has no
+  `System.Numerics.Vectors` of its own, and nothing beside the staged
+  shell could answer. The compile now references the .NET Framework
+  build a module ships, at the same version.
+
+- Hand-written C# guarded the way a .NET SDK project guards it
+  compiled differently under `cargo pwrs`, because only `NET`,
+  `NET10_0` and `NETCOREAPP`, or `NETSTANDARD` and `NETSTANDARD2_0`,
+  were defined. SIMD code keeping its `System.Runtime.Intrinsics` paths
+  under `NET8_0_OR_GREATER` built without them and no warning said so:
+  compiled with those defines, the six files above referenced no
+  intrinsics type, and with the SDK's they reference 17. Both compiles
+  now define what the SDK defines for net8.0 and netstandard2.0, the
+  `OR_GREATER` symbols included, and nothing else; `NET10_0` is not
+  among them.
+
+- Two modules imported at the same moment from two runspaces of one
+  process could load one module's native library under the other's
+  shell, when their module folders hash alike. A shell runs from a
+  staged copy whose folder is named by a 31-bit hash of the module
+  folder, and it found its module folder through the loader's one
+  table from staging folder to module for the whole process, where two
+  such modules share an entry and the later import overwrites the
+  earlier one's. The module's script now hands its shell the folder it
+  was imported from before importing it, and the shell asks the loader
+  only when nothing was handed over. `Pwrs.Bootstrap`, the runtime and
+  the native ABI do not change. Found by an audit of what two modules
+  in one process share, not by a failure.
+
+- `cargo pwrs test` reported a Pester that would not load as the bare
+  `Import-Module` error, so a scaffolded project on a host whose
+  Pester is a OneDrive placeholder failed with "The cloud file
+  provider is not running" and nothing tying it to the test run. It
+  now writes one line naming the host, each Pester it tried, what the
+  import said, and that `PWRS_PESTER_PATH` overrides the choice, and
+  exits 2. How To Fix A Failure has the message.
+
+## 0.2.0
+
+The minor version moves for one change in what two modules can rely
+on. On Windows PowerShell, where the first PWRS module's runtime
+serves every module imported after it, when one of two modules was
+built by `cargo-pwrs` 0.1.8 or earlier and the other by this one, the
+one imported second cannot be imported if it declares classes or
+enums, as described under Fixed. A module declaring neither imports
+after either, and the module imported first keeps working. Rebuild
+every PWRS module one Windows PowerShell session imports with one
+`cargo-pwrs`. PowerShell 7 gives each module its own runtime and is
+not affected. The Rust API only adds, and the native ABI does not
+change.
+
+### Added
+
+- `Pipeline::invocation()` hands back the running cmdlet's
+  `MyInvocation`, the engine's `InvocationInfo`, with one dynamic
+  member access and no vtable entry. It is set before `begin`, so any
+  phase can read where the command stands: `PipelinePosition`, counting
+  from 1, and `PipelineLength`, which counts commands, so an expression
+  at the head of a pipeline is input and not counted. That is what a
+  set of cooperating cmdlets needs to tell that their neighbors are
+  their own. One behavior is worth knowing before relying on it,
+  measured on both editions: begins run left to right, but a command's
+  queued input is processed right after its own begin, so when an
+  upstream begin writes output, a command can process it before a
+  later command has begun.
+
+- A copied `#[psclass]` takes `#[psmethods]` statics, and a `new`
+  returning `PsResult<Self>` is its constructor, reached as
+  `[Ns.Type]::new(...)`. A copied object carries its fields rather
+  than a Rust value, so a value type no longer has to become a proxy,
+  and have every property read cross the boundary, just to be made
+  without a `New-` cmdlet. `new` builds the value in Rust and the
+  object is made from it field by field. A method taking `&self` on a
+  copied class is refused by `cargo pwrs build` with the reason.
+
+  Declaring a `new` also removes the public parameterless constructor
+  C# otherwise supplies, which fills CLR zeros: `[T]::new()` on such a
+  type made an object the class never meant to exist, which bound as
+  a valid value and failed far from where it was made. A class that
+  declares no `new` keeps that constructor, as it always had. Rust has
+  no overloading, so one `new` with `Option` arguments answers every
+  arity, and one starting from `Self::default()` gives a parameterless
+  constructor that starts from `Default`. A constructor has no
+  pipeline, so it refuses rather than warns.
+
+### Fixed
+
+- Two PWRS modules in one Windows PowerShell 5.1 session built each
+  other's objects. A class id is its class's position in its own
+  module's `export_module!` list, so every module numbers its classes
+  from 0, and `factory_new` looked the id up in one static table per
+  copy of `Pwrs.Runtime`. PowerShell 7 gives each module its own load
+  context and so its own copy, but Windows PowerShell has one load
+  context per process, where the first module's runtime serves every
+  module after it: the module imported second replaced the first one's
+  factories. The first module's copied objects and enum values then
+  came back as the second module's types, read with the second
+  module's field layouts, and a proxy of the first module's value was
+  bound to the second module's library, which read it, called it and
+  freed it as a type it is not. Measured with two modules built outside
+  this repository: in one order an object of the first module came
+  back as a type of the second, and in the other a call threw an
+  `OverflowException`.
+
+  Each module now owns its factory table. On Windows PowerShell each
+  module's native library is handed its own copy of the host table,
+  whose `factory_new` answers from that module's factories, for the
+  first load and every reload; on PowerShell 7 the table stays one per
+  copy of the runtime, which was already one per module. The table
+  takes no lock: its only writer is the module's shell, from its type
+  initializer, which finishes before anything can reach the module.
+  The native ABI and the Rust crates do not change, so a module gets
+  the fix by rebuilding with this `cargo-pwrs`.
+  `Pwrs.NativeModule.FactoriesPerModule` answers `true` on a runtime
+  with the fix and is absent before it, for a module that must decide
+  whether two PWRS modules can share a Windows PowerShell session.
+
+  `tools/coload_gate.ps1` builds one fixture twice under two names and
+  imports both into one session in each order, checking a copied
+  object, a proxy call and `Dispose`, and an enum from each. It fails
+  on the unfixed runtime under 5.1 and passes under both editions with
+  the fix. The hot reload gate beside it now also checks that each
+  reload's objects come from that reload's own shell.
+
+  On Windows PowerShell, when one of two modules was built by
+  `cargo-pwrs` 0.1.8 or earlier and the other by this one, the one
+  imported second fails to import if it declares classes or enums,
+  with `The type initializer for
+  'Pwrs.Modules.<Name>.PwrsModule' threw an exception`, over a
+  `MissingMethodException` the engine does not print, where before it
+  shared the first module's factories silently. A module declaring
+  neither imports after either, and the first module keeps working.
+  Measured in every order of a 0.1.8 and a 0.2.0 module, one declaring
+  classes and an enum and the other neither, on Windows PowerShell
+  5.1.26100.9444 and pwsh 7.6.6, where every order imports. Rebuild
+  both with the same `cargo-pwrs`; How To Fix A Failure has the detail.
+
+- The surface check's file was named by process alone, so two PWRS
+  modules loaded in one host process wrote the same file and each
+  replaced the other's table: the report saw only whichever module
+  released a cmdlet last. Each native image now writes
+  `<pid>-<image>.tsv`, and `cargo pwrs test` sums them by cmdlet name
+  as before. Test time only; found by the audit of what two modules in
+  one session share.
+
+- `cargo test --workspace` aborted on a Linux host whose pwsh is the
+  snap: `pwrs-host`, the workspace's in-process test host, started the
+  snap's .NET without the ICU it runs on, and .NET ended the process
+  with "Couldn't find a valid ICU package installed on the system".
+  The snap's pwsh finds the ICU the snap bundles through an RPATH into
+  the snap, and its launcher names the version in
+  `CLR_ICU_VERSION_OVERRIDE`; a process outside the snap has neither.
+  The host now loads the snap's ICU by full path before the runtime
+  starts and sets the override unless it is set. Measured on Ubuntu
+  24.04 with the powershell snap's pwsh 7.6.5, whose ICU is 70.1
+  beside the system's 74.2.
+
+- `PsResult<Self>` in a `#[psmethods]` signature did not compile,
+  though it is the spelling the documentation gives for a constructor:
+  the return and argument types were written inside the generated
+  `impl ... for MethodsCollector<T>`, where `Self` names the collector
+  and not the class. `Self` is now resolved to the class wherever a
+  type is written, `other: Self` included.
+
+## 0.1.8
+
+### Added
+
+- `PsReadOnlyTable` hands PowerShell a table script reads through
+  both `$t.key` and `$t['key']` and cannot write through either.
+  `PsReadOnlyTable::over` takes an object the caller already holds,
+  so the keys are copied once and the values are shared.
+
+  The engine exposes a key as a property only for the non-generic
+  `IDictionary` carried on a type's public surface, which is why
+  `Hashtable` and `OrderedDictionary` answer `$t.key` while
+  `Dictionary` and `ReadOnlyDictionary` answer `$null`. Losing one
+  access form silently is worse than the sharing it would guard
+  against, so the type carries the interface publicly and refuses
+  every mutating member instead. Both write forms reach the indexer,
+  and the refusal raises rather than being ignored.
+
+  It holds the source rather than copying it, so enumeration keeps
+  the source's order and making one costs nothing per key. That makes
+  it a view and not a snapshot: a change made through the source
+  shows through. A nested table comes back wrapped as well, from the
+  indexer, from `Values` and from enumeration, so the refusal reaches
+  all the way down; each such read builds a wrapper, so two reads of
+  one key match by content and not by reference.
+
+- `benches/dynamic_reads.ps1` times one property read taken from Rust
+  against the same read taken from PowerShell, over the same objects
+  in one process, and `Measure-RustPropertyReads` in the hello example
+  is the cmdlet it drives. Measured figures are in `docs/PERF.md`: the
+  crossing beats a name PowerShell resolves at run time, by about 3.1x
+  on a PSCustomObject and 1.4x on a CLR object, and loses to a name
+  compiled into the member access, which PowerShell reaches through a
+  cached call site.
+
+- `#[transform(cmdlet = "Get-Thing", parameter = "Size")]` on a
+  `fn(&PsObject) -> PsResult<PsObject>` runs before the binder coerces
+  the argument to the parameter's declared type and before
+  validation, which is where nothing else can run: a `long` parameter
+  accepts `2MB`, and a refusal is a binding failure naming the
+  parameter rather than an error the cmdlet wrote. Listed under
+  `transforms` in `export_module!`, it generates an
+  `ArgumentTransformationAttribute` on the parameter and reaches Rust
+  through `pwrs_transform_invoke`, bound optionally so a library
+  built before it existed still loads. No instance exists yet, so a
+  transform takes no `Pipeline` and cannot write to a stream; a value
+  it does not recognize is handed back for the binder to coerce or
+  reject.
+
+- `#[psenum(clr = "System.ConsoleColor")]` mirrors a CLR enum that
+  already exists rather than declaring one. Nothing is generated, it
+  takes no class id, and it is not listed under `enums:`. The
+  parameter is declared as that CLR type, so the binder converts its
+  member names, completes them, and rejects the rest before the body
+  runs, and a value written back is that type and not a number. A
+  variant list narrower than the CLR enum's members is allowed: a
+  member the Rust enum does not name binds and then fails in `FromPs`.
+  Vtable entry 71, `enum_new`, builds the value through
+  `Enum.ToObject` with the name resolved the way a type literal is.
+  `name` and `clr` together are a compile error.
+
+- `cargo pwrs test` reports what the suite left unexercised of what
+  the module declares: a cmdlet no test invoked, a cmdlet that ran
+  without ever asking though it declares `SupportsShouldProcess`, and
+  a parameter declaring `ValueFromPipeline` that nothing was ever
+  piped into. The engine keeps both promises whether or not the body
+  holds up its end, so neither breaks loudly: `-WhatIf` on a cmdlet
+  that never asks does the thing it was supposed to describe.
+
+  Neither is decidable from the declaration, so the run is the
+  evidence. `pwrs::surface` records what each phase saw while
+  `PWRS_SURFACE_DIR` is set, each host writes `<pid>.tsv` there, and
+  the tool reads both against the descriptor. Unset, which is every
+  production call, a phase pays one relaxed load and a branch. A
+  finding never fails the command: it is either a missing test or a
+  promise the body does not keep, and only the author knows which.
+
+- `PsErrorRecord` reads a `System.Management.Automation.ErrorRecord`
+  by its parts: `category` as the typed `ErrorCategory`, `error_id`,
+  `message` and `target`, which is `$null` when the record carries
+  none. A record taken as a parameter, handed down the pipeline,
+  collected by `-ErrorVariable`, caught in script, or written by a
+  command run through `invoke` reads the same way, so a cmdlet can
+  sort or retry on what failed rather than on the text of it. It is
+  `FromPs` only: a cmdlet raises an error by returning `Err(PsError)`
+  and the engine builds the record. `ErrorCategory::from_code(u32)`
+  maps the engine's number back to the enum, and a number outside it
+  is an `InvalidData` error rather than a silent `NotSpecified`.
+
+- `Pipeline::host_ui` hands back the cmdlet's `$Host.UI` as `HostUi`,
+  with `read_line`, `read_line_as_secure_string`, `write_line` and
+  `prompt_for_choice(caption, message, &[(label, help)], default)`
+  typed rather than reached by dynamic incantation. Every call is a
+  dynamic member access on the pipeline thread; no vtable entry was
+  added. A host that cannot prompt, such as one run with
+  `-NonInteractive`, refuses with the engine's own error, and that is
+  the `Err`. The engine's method binder takes an array of
+  `ChoiceDescription`s as the collection `PromptForChoice` declares,
+  as it does for a script. The console host answers `read_line` and
+  `prompt_for_choice` from redirected standard input but not
+  `read_line_as_secure_string`, which reads the console device.
+
+- `Pipeline::invoke` runs a cmdlet, function or alias the session can
+  see, with parameters bound by name from a slice of pairs, and
+  returns what it wrote; `invoke_with_input` pipes a value in first,
+  unrolling a collection. The name is resolved to its `CommandInfo`
+  and run through a nested `PowerShell` in the current runspace, so
+  no script text is built or parsed. The command's non-terminating
+  errors are written to the calling cmdlet's error stream and its
+  output is returned, so the caller's `-ErrorAction` decides what a
+  failure inside means; a terminating error is the `Err`. Vtable
+  entry 70, pipeline thread.
+
+- A `#[psmethods]` fn with no receiver is a static method of the
+  generated proxy class, called on the type as `[Ns.Type]::Name()`,
+  and the static named `new` returning `PsResult<Self>` is the
+  class's constructor, reached as `[Ns.Type]::new(...)`. A static
+  that returns the class returns a new proxy object. The shell
+  reaches both through `PwrsCallStatic`, a `pwrs_proxy_call` with a
+  null instance that serializes nothing and checks no generation,
+  since there is no object to guard; the constructor's call answers
+  the new value's pointer for the public constructor to adopt. The
+  descriptor carries `static` and `constructor` per method. A type
+  therefore needs no `New-` cmdlet to come into being.
+
+- `#[on_import]` and `#[on_remove]` mark a `fn() -> PsResult<()>` the
+  engine runs when the module is imported and when it is removed,
+  named under `on_import` and `on_remove` in `export_module!`. The
+  generated shell implements `IModuleAssemblyInitializer` and
+  `IModuleAssemblyCleanup` for the hooks declared and no others, so a
+  module without them is not called. A removal unloads nothing, so
+  the import hook runs on every import and the removal hook is where
+  an import's resources are released; on a reload the old library's
+  removal hook runs before the new library's import hook. The export
+  is `pwrs_module_lifecycle`, bound optionally, so a library built
+  before it existed loads as before.
+
+- Scalars keep their CLR width. `5i32.into_ps()` reaches the shell as
+  a `System.Int32` rather than a `System.Int64`, and the same for
+  `i8`, `i16`, `u8`, `u16`, `u32` and `f32`. The engine types every
+  operator's answer by its operands' widths, so a value that left
+  script as an `Int32` and returned as an `Int64` changed what the
+  caller's next operator did with it. Vtable entries 59 to 65.
+
+  A width costs one handle. `i64`, `f64` and `bool` are what the
+  direct write entries build and still write without one; the other
+  widths now take a handle per written value rather than widening.
+
+- `PsObject::type_tag()` answers the tag of an object's own type in
+  one crossing, against three and a string compare for `type_name()`,
+  which is `GetType` then `FullName` then a string read. A caller
+  dispatching on a type it does not know at compile time matches a
+  `u32` and falls back to the name only for `PS_TYPE_OBJECT`. It
+  unwraps a `PSObject` first, so a wrapped `Int32` answers
+  `PS_TYPE_I32`. Vtable entry 58. Measured at 12 to 13 ns against 937
+  to 1046 ns for `type_name()` and 345 to 1203 ns for
+  `GetType().FullName` in script; `docs/PERF.md` has the table.
+
+- `PsDecimal` and `PsDecimalBits` carry a `System.Decimal`, and tag 17
+  makes a `Decimal[]` allocatable and pinnable. The two types are the
+  same four words in the two orders that exist: `PsDecimal` is
+  `Decimal.GetBits` order and `PsDecimalBits` is memory order, which
+  is what a pinned element is. Scale is carried rather than
+  normalized, since `1.10` and `1.1` are equal and not identical.
+
+  Memory order is internal to the runtime. It was measured as
+  `flags, hi, lo, mid` on x64 Windows under .NET 10 and .NET
+  Framework 4.8, by two independent methods, and no reading exists
+  for arm64, Linux or macOS. The first `pin::<PsDecimalBits>()` in a
+  process therefore proves the order against `Decimal.GetBits` and
+  caches the verdict; a host that disagrees fails with
+  `PwrsDecimalLayout` instead of returning reinterpreted words.
+  Vtable entries 66 and 67.
+
+- `PsDateTimeOffset` carries a `System.DateTimeOffset`: ticks and the
+  UTC offset in whole minutes. `PsDateTime`'s kind says only which
+  clock a value belongs to, so an offset is what keeps an instant
+  meaningful away from the host that produced it. Vtable entries 68
+  and 69.
+
+### Documentation
+
+- How To Fix A Failure, keyed by the literal text a reader sees, each
+  string taken from the source that raises it or measured on both
+  hosts: the import that refuses with status 4, the descriptor ABI
+  refusal, a native library missing for the platform, a missing
+  export, pwsh not found, the toolchain directory, a rebuild that
+  seems not to take, an error or a panic from a cmdlet, a prompt in a
+  host that cannot ask, and `PWRS_MODULE` unset.
+
+- That the crate and `cargo-pwrs` have to be the same version, in the
+  quick start where the dependency is first written and leading the
+  page above. It is the likeliest way to a module that will not
+  import, and nothing said it.
+
+- `pwrs-sys`, `pwrs-macros`, `pwrs-build` and `cargo-pwrs` each carry
+  a README, so their pages say what the crate is and which of them a
+  reader actually wants; each also carries keywords and categories.
+  `PoWerRuSt` keeps the repository README.
+
+- The locked-decisions list runs to forty-seven, having stopped at
+  the conversion surface while eight more were settled.
+
+- `Cmdlet` is the trait you implement and `CmdletMeta` and
+  `CmdletBind` are what the macros generate, in the pipeline
+  reference. All three are exported and only one is yours to write.
+
+- Where the two hosts disagree, in the conversions reference. A
+  string cast to `decimal` normalizes the scale on PowerShell 7 and
+  keeps it on Windows PowerShell 5.1, so `[decimal]'1.10'` is scale 1
+  on one and 2 on the other, while `[decimal]::Parse('1.10')` and the
+  `1.10d` literal are 2 on both. And `-eq`, `-lt` and `-like` compare
+  with the invariant culture, which is ICU on 7 and NLS on 5.1: those
+  disagree on punctuation and ligatures and treat control characters
+  as nothing, so text compared in Rust with ordinal semantics can
+  reach a different answer than the same text compared in script, and
+  the difference moves between hosts. The collation finding is a
+  consumer's, attributed and not reproduced here.
+
+### Fixed
+
+- `PsObject::pin::<T>()` checked only that the array's elements were
+  the same width as `T`, so an `Int64[]` pinned as `f64` and handed
+  back the bits read as the wrong type, raising nothing. It now checks
+  the element type as well and refuses with `PwrsPinElementType`,
+  naming both tags. `Vec<T>` reads were never affected: that path
+  compared the tag before pinning, and it keeps its single check
+  through an internal entry rather than asking twice.
+
+  The bound on `pin` gains `IntoPs`, which carries the type tag. Every
+  primitive that could be pinned already satisfies it.
+
+- Host vtable entry 57, `readonly_table_new`, appended with the size
+  header covering it. No existing entry changes meaning. The type is
+  constructed through it rather than by name because the engine's
+  resolver does not see a type in the module's own load context, and
+  a name would resolve on the desktop edition and not on Core.
+
+## 0.1.7
+
+### Added
+
+- `PWRS_TOOLSET` names the `Microsoft.Net.Compilers.Toolset` version to
+  fetch, instead of the pinned one. The compiler runs inside the pwsh
+  process, so it needs a runtime that host already has; a host whose
+  newest pwsh predates .NET 10 sets this to 5.3.0, the newest toolset
+  built for net9.0. Each version gets its own tree under
+  `toolchain/`, so switching neither refetches nor mixes two compilers
+  under one lock. Unset behaves exactly as before.
+
+### Fixed
+
+- A compiler whose runtime the host does not have was reported as
+  `csc.dll has no entry point`, which is what the loader says when a
+  framework is missing and reads as a damaged download. The message
+  now names the framework the compiler wants, the one the host has,
+  and `PWRS_TOOLSET`.
+
+### Documentation
+
+- macOS arm64 and FreeBSD x64 are recorded in `docs/PLATFORMS.md`,
+  measured by a consumer on their own hosts and attributed as such.
+  macOS needs nothing. FreeBSD needs `PWRS_TOOLSET=5.3.0` to build,
+  and one variable set for Pester, whose `GetPesterOs` reads
+  `$IsLinux` through `Get-Variable` and so is satisfied by a global.
+- The Core half is no longer described as .NET 10. `net10.0` is where
+  the `.psm1` looks, not what the compiler targets: that compile is
+  `/nostdlib+` against the reference set the building pwsh ships and
+  emits no `TargetFrameworkAttribute`, so the assembly references that
+  host. The README's "No .NET 8 or 9" was refuted by a module built on
+  pwsh 7.5.5 and imported on .NET 9.
+
+## 0.1.6
+
+### Fixed
+
+- `cargo pwrs new` wrote a fixed `PoWerRuSt` version into the manifest
+  it scaffolds, and the README told the reader to depend on the same
+  fixed version. Both had been left at 0.1.4 through the 0.1.5
+  release. The scaffold now takes the version from `cargo-pwrs`
+  itself, which the workspace publishes alongside the library, and a
+  test fails the build when the README names any other version. The
+  version requirement is a caret range, so a crate scaffolded by 0.1.5
+  resolved to 0.1.5 regardless.
+- `tools/hot_reload_gate.ps1` matched source lines with patterns
+  anchored on `$`, which in multiline mode matches before the newline
+  and not before a carriage return, so the gate failed on a checkout
+  with CRLF endings. The patterns end in a lookahead now, and
+  `.gitattributes` gives every platform the same bytes, which the
+  shell assembly's name also depends on.
+
+## 0.1.5
+
+### Added
+
+- A rebuilt module takes its cmdlets over in a live session, in
+  PowerShell 7 on Windows and Linux and in Windows PowerShell 5.1.
+  `Import-Module -Force` after `cargo pwrs build` runs the code that
+  was just built.
+- `Pipeline::par_map` and `Pipeline::par_for_each` run owned `Send`
+  work on a pool and write from the pipeline thread. `Order::Input`
+  keeps input order, `Order::AsReady` writes each result as its worker
+  finishes. The pool is std threads; the `parallel` feature swaps in
+  Flynnel. `Order` is in the prelude.
+- `tools/hot_reload_gate.ps1`, which builds one module three times in
+  one host process and checks that a changed surface takes the cmdlets
+  over and a changed body does not disturb the types. It passes in
+  pwsh 7.6 and Windows PowerShell 5.1 on Windows, and in pwsh 7.6 on
+  Linux.
+
+Nothing is unloaded by a reload, and what that costs and when not to
+rely on it are in the wiki's
+[How To Reload A Module](https://github.com/Variably-Constant/PWRS/blob/main/wiki/content/docs/how-to/How-To-Reload-A-Module.md).
+
+### Changed
+
+- The shell assembly is named `<Module>.Shell.<stamp>.dll`, where the
+  stamp is a hash of the managed source it was compiled from. A module
+  folder's layout changes accordingly, including the help file name.
+- Every load, managed and native, is taken from a copy under the
+  process's own temporary folder. `cargo pwrs build` now succeeds while
+  a session holds the module, and nothing is written inside an
+  installed module folder.
+
+### Fixed
+
+- A worker that panicked under `par_map` dropped the items it held and
+  the call returned success with a short stream. It now fails with a
+  terminating `PwrsWorkerPanic`, which is what the documentation had
+  always said.
+
+## 0.1.4
+
+- The generated module manifest carries the properties a build can
+  supply, each read from Cargo metadata and each covered by a test that
+  has PowerShell parse the manifest and read the value back.
+
+0.1.3 was never published; the version number was taken by another
+piece of work and skipped.
+
+## 0.1.2
+
+- Windows CI. A pwsh 7 process passes its `PSModulePath` to a Windows
+  PowerShell 5.1 child, whose standard library is then unusable and
+  whose errors name none of that. `cargo pwrs test` now gives the 5.1
+  child a `PSModulePath` with the PowerShell 7 entries removed.
+- The `netstandard2.0` compile takes a `System.Numerics.Vectors`
+  reference, without which the vector paths raise CS0246.
+
+## 0.1.1
+
+- The crates.io README. Relative links in a README resolve against the
+  crate's own directory rather than the repository root, so the links
+  in 0.1.0 were broken; they are absolute now. crates.io freezes a
+  README per version, which is why this needed a release.
+
+## 0.1.0 [YANKED]
+
+First publish. Yanked: it shipped a README from before the crates were
+on crates.io, which a published version cannot be corrected in place.

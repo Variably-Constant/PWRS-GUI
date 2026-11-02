@@ -1,0 +1,656 @@
+/* PWRS-GUI's widget runtime: every widget laid out and painted as the egui
+   renderer lays it out and paints it, from the tokens both renderers share
+   (tokens.css), with none of the engine's own controls showing. */
+
+*, *::before, *::after { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--panel); color: var(--text); font-family: var(--font-ui); font-size: var(--body); line-height: var(--line-body, normal); }
+body { overflow: hidden; }
+::selection { background: var(--selection); }
+button, input, textarea { font: inherit; color: inherit; margin: 0; }
+/* Text in the UI face is spaced by the tracking that brings the engine's to
+   egui's (--ui-tracking, tokens.css), in em of each element's own size;
+   text in the monospace face has the engine's. */
+* { letter-spacing: var(--ui-tracking, normal); }
+.mono, .mono *, .markdown code, .markdown kbd { letter-spacing: normal; }
+
+/* The window: its menu bars along the top, its widgets in the body, inside
+   the window's margin or, with a button bar, a dialog's, then the button
+   bar and the status bars along the bottom. The body takes the height the
+   bars leave and scrolls only when the window is made smaller than its
+   widgets. The one widget in the body, when it fills down, takes the
+   body's height starting from its own: from a flex basis of 0, Chromium
+   shows a scroll bar in a window its widgets fit exactly. */
+#root { display: flex; flex-direction: column; height: 100%; min-width: 0; }
+#root > .body { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; padding: var(--panel-margin); overflow: auto; }
+#root.dialog > .body { padding: var(--dialog-margin); }
+#root > .body > :not(.fill) { flex: none; }
+#root > .body > .fill { flex: 1 1 auto; min-height: 0; }
+
+/* A column stacks its widgets item-y apart, each placed across by its
+   align: at the left, in the middle, at the right, or stretched across. A
+   row sets them item-x apart, centered on a line at least a control tall,
+   placed as a group by its align, or with stretch sharing the room. A
+   widget that takes the room across, or contains one that does, is .wide. */
+.col { display: flex; flex-direction: column; align-items: flex-start; gap: var(--item-y); min-width: 0; }
+.row { display: flex; flex-direction: row; align-items: center; gap: var(--item-x); min-height: var(--interact-h); min-width: 0; }
+.col > .wide { align-self: stretch; }
+.row > .wide { flex: 1 1 0; }
+.col.align-center { align-items: center; }
+.col.align-end { align-items: flex-end; }
+.col.align-stretch { align-items: stretch; }
+.row.align-center { justify-content: center; }
+.row.align-end { justify-content: flex-end; }
+.row.align-stretch > * { flex: 1 1 0; min-width: 0; }
+.align-stretch > .field { width: auto; }
+.align-stretch > input.drag { width: auto !important; text-align: left; }
+.align-stretch > .editable { display: flex; }
+.align-stretch > .editable > .field { flex: 1 1 auto; width: auto; }
+.align-stretch > .peek-field > .field { width: auto; }
+.align-stretch > .date > .combo { flex: 1 1 auto; }
+/* A stretched grid's columns but its last are as wide as their widest
+   widget, as egui's are, a field counting its own width there. */
+.grid.align-stretch > .field:not(.last), .grid.align-stretch > .editable:not(.last) > .field, .grid.align-stretch > .peek-field:not(.last) > .field { min-width: var(--edit-w); }
+.grid.align-stretch > input.drag:not(.last) { min-width: var(--own-w); }
+
+/* Widgets that fill down share the height their column leaves, three rows
+   of controls each at least, so a long list scrolls in its place; the
+   others take their own height. Each starts from those three rows, which
+   are more than any widget's border and padding, so every one grows by the
+   same share and ends the same height, as egui gives each the same height:
+   a flex basis of 0 would start a framed list from its border and padding.
+   In a row, a widget that fills down takes the row's height. */
+.col > :not(.fill) { flex-shrink: 0; }
+.col > .fill { flex: 1 1 calc(3 * var(--interact-h)); min-height: calc(3 * var(--interact-h)); }
+.row > .fill:not(.spacer) { align-self: stretch; min-height: 0; }
+.grid > .fill { align-self: stretch; min-height: 0; }
+
+.label { white-space: pre-wrap; overflow-wrap: anywhere; }
+.heading { font-size: var(--heading); line-height: var(--line-heading, normal); }
+/* A dialog's main line: larger, in the strong text's color. */
+.instruction { font-size: var(--instruction); line-height: var(--line-instruction, normal); color: var(--strong); }
+.mono { font-family: var(--font-mono); font-size: var(--mono); line-height: var(--line-mono, normal); }
+.strong { color: var(--strong); }
+.weak { color: var(--weak); }
+.error { color: var(--error); }
+.off { opacity: var(--disabled-alpha); }
+
+/* A control's frame: its state's fill, painted out past the control by its
+   state's expansion, the stroke on the inside of that edge, and the text in
+   its state's color. The state is inactive, hovered, active while pressed
+   or focused, or open while the control's popup shows. A selectable one
+   has no frame while inactive and unselected, and a selected one, and the
+   window's default button while it is enabled, take the selection's fill
+   and text; a disabled default button is drawn as any disabled button. */
+.frame {
+  --fill: var(--inactive-weak-bg); --edge: var(--inactive-stroke); --edge-w: var(--inactive-stroke-width);
+  --grow: var(--inactive-expansion); --round: var(--inactive-radius); --ink: var(--inactive-fg); --ink-w: var(--inactive-fg-width);
+  color: var(--ink);
+  background: var(--fill);
+  border-radius: max(0px, calc(var(--round) - var(--grow)));
+  box-shadow: 0 0 0 var(--grow) var(--fill);
+  outline: var(--edge-w) solid var(--edge);
+  outline-offset: calc(var(--grow) - var(--edge-w));
+}
+.frame.selectable { --fill: transparent; --edge-w: 0px; --grow: 0px; }
+.frame.picked, .frame.default:not(:disabled, .off) { --fill: var(--selection); --ink: var(--selection-stroke); }
+/* Where egui's hit test gives the pointer to a widget it is not over, the
+   pointer takes that widget's cursor (runtime.js, fringeCursor). */
+:root[data-cursor], :root[data-cursor] * { cursor: var(--fringe-cursor) !important; }
+
+/* A widget is hovered and held as egui's hit test and interaction have it
+   (runtime.js, engage), which the hovered and held classes show. */
+.frame:is(.hovered, .hot):not(:disabled, .off, .open) {
+  --fill: var(--hovered-weak-bg); --edge: var(--hovered-stroke); --edge-w: var(--hovered-stroke-width);
+  --grow: var(--hovered-expansion); --round: var(--hovered-radius); --ink: var(--hovered-fg); --ink-w: var(--hovered-fg-width);
+}
+.frame:is(.held, :focus-visible, .pressed):not(:disabled, .off, .open) {
+  --fill: var(--active-weak-bg); --edge: var(--active-stroke); --edge-w: var(--active-stroke-width);
+  --grow: var(--active-expansion); --round: var(--active-radius); --ink: var(--active-fg); --ink-w: var(--active-fg-width);
+}
+.frame:is(.picked, .default):is(.hovered, .hot, .held, :focus-visible, .pressed):not(:disabled, .off, .open) { --fill: var(--selection); --ink: var(--selection-stroke); }
+.frame.open {
+  --fill: var(--open-weak-bg); --edge: var(--open-stroke); --edge-w: var(--open-stroke-width);
+  --grow: var(--open-expansion); --round: var(--open-radius); --ink: var(--open-fg); --ink-w: var(--open-fg-width);
+}
+.frame:disabled { opacity: var(--disabled-alpha); }
+
+/* A menu's buttons, as egui's menu style draws them: no stroke, no fill
+   while inactive, and less padding. */
+.frame.plain { --fill: transparent; --edge-w: 0px; padding: 0 2px; }
+.frame.plain:is(.hovered, .held, :focus-visible, .pressed, .open):not(:disabled, .off) { --edge-w: 0px; }
+
+/* A control in a text field's look: the field's fill in every state, its
+   edge in the line color while neither hovered nor focused, the hovered
+   stroke under the pointer, the selection's stroke while pressed, focused
+   or open, and its text in the field's color. A number field, a drop-down
+   and a date chooser take it, as WinUI's NumberBox, ComboBox and
+   CalendarDatePicker share TextBox's look. */
+.frame.well { --fill: var(--extreme); --edge: var(--noninteractive-stroke); --edge-w: var(--noninteractive-stroke-width); --ink: var(--inactive-fg); --ink-w: var(--inactive-fg-width); }
+.frame.well:is(.hovered, .hot):not(:disabled, .off, .open) { --fill: var(--extreme); --ink: var(--inactive-fg); --ink-w: var(--inactive-fg-width); }
+.frame.well:is(.held, :focus-visible, .pressed, .open):not(:disabled, .off) { --fill: var(--extreme); --edge: var(--selection-stroke); --edge-w: var(--selection-stroke-width); --ink: var(--inactive-fg); --ink-w: var(--inactive-fg-width); }
+
+.btn {
+  appearance: none; border: 0; cursor: default; flex: none; white-space: pre; text-align: center;
+  font-size: var(--button); line-height: var(--line-button, normal);
+  padding: var(--button-py) var(--button-px); min-height: var(--interact-h);
+}
+.link { appearance: none; border: 0; padding: 0; background: none; color: var(--link); cursor: pointer; text-align: left; white-space: pre-wrap; }
+.link:is(.hovered, :focus-visible) { text-decoration: underline; outline: none; }
+
+/* A check box or an option button: the box a control's height across, the
+   text an icon's spacing after it. A check box's corners are rounded three
+   tenths of the box at most, so it is not taken for an option button. */
+.check { display: inline-flex; align-items: center; gap: var(--icon-gap); min-height: var(--interact-h); min-width: var(--interact-h); position: relative; cursor: default; user-select: none; }
+.check > input {
+  --fill: var(--inactive-bg); --edge: var(--inactive-stroke); --edge-w: var(--inactive-stroke-width); --grow: 0px;
+  --round: var(--inactive-radius); --ink: var(--inactive-fg); --ink-w: var(--inactive-fg-width);
+  appearance: none; flex: none; width: var(--icon); height: var(--icon);
+  background: var(--fill); border-radius: min(var(--round), var(--icon-round));
+  outline: var(--edge-w) solid var(--edge); outline-offset: calc(-1 * var(--edge-w));
+}
+.check.hovered:not(.off) > input { --fill: var(--hovered-bg); --edge: var(--hovered-stroke); --edge-w: var(--hovered-stroke-width); --round: var(--hovered-radius); --ink: var(--hovered-fg); --ink-w: var(--hovered-fg-width); }
+.check.held:not(.off) > input, .check:not(.off) > input:focus-visible { --fill: var(--active-bg); --edge: var(--active-stroke); --edge-w: var(--active-stroke-width); --round: var(--active-radius); --ink: var(--active-fg); --ink-w: var(--active-fg-width); }
+.check.hovered:not(.off) { color: var(--hovered-fg); }
+.check > .mark { position: absolute; left: calc((var(--icon) - var(--icon-inner)) / 2); top: calc(50% - var(--icon-inner) / 2); width: var(--icon-inner); height: var(--icon-inner); overflow: visible; pointer-events: none; display: none; }
+.check > input:checked ~ .mark { display: block; }
+.check > .mark polyline { fill: none; stroke: var(--inactive-fg); stroke-width: var(--inactive-fg-width); }
+.check.hovered:not(.off) > .mark polyline { stroke: var(--hovered-fg); stroke-width: var(--hovered-fg-width); }
+.check.held:not(.off) > input ~ .mark polyline, .check:not(.off) > input:focus-visible ~ .mark polyline { stroke: var(--active-fg); stroke-width: var(--active-fg-width); }
+.check > input[type=radio] { border-radius: 50%; outline-offset: calc(var(--grow) - var(--edge-w) / 2); box-shadow: 0 0 0 var(--grow) var(--fill); }
+.check.hovered:not(.off) > input[type=radio] { --grow: var(--hovered-expansion); }
+.check.held:not(.off) > input[type=radio], .check:not(.off) > input[type=radio]:focus-visible { --grow: var(--active-expansion); }
+.check > input[type=radio]:checked { background: radial-gradient(circle, var(--ink) calc(var(--icon-inner) / 3 - 0.5px), transparent calc(var(--icon-inner) / 3 + 0.5px)), var(--fill); }
+.radio { gap: var(--item-y); }
+
+/* A text field: the extreme background, edged in the line color while it is
+   neither hovered nor focused, the hovered stroke under the pointer, and
+   the selection's stroke while focused. */
+.field {
+  --edge: var(--noninteractive-stroke); --edge-w: var(--noninteractive-stroke-width); --grow: var(--inactive-expansion); --round: var(--inactive-radius);
+  appearance: none; border: 0; display: block; flex: none;
+  width: var(--edit-w); max-width: 100%; height: calc(var(--line-body, 17px) + 2 * var(--edit-py));
+  padding: var(--edit-py) var(--edit-px); line-height: var(--line-body, normal);
+  color: var(--inactive-fg); caret-color: var(--cursor); background: var(--extreme);
+  border-radius: max(0px, calc(var(--round) - var(--grow)));
+  box-shadow: 0 0 0 var(--grow) var(--extreme);
+  outline: var(--edge-w) solid var(--edge); outline-offset: calc(var(--grow) - var(--edge-w));
+}
+.field::placeholder { color: var(--weak); opacity: 1; }
+.field.hovered:not(:disabled) { --edge: var(--hovered-stroke); --edge-w: var(--hovered-stroke-width); --grow: var(--hovered-expansion); --round: var(--hovered-radius); }
+.field:focus { --edge: var(--selection-stroke); --edge-w: var(--selection-stroke-width); --grow: var(--active-expansion); --round: var(--active-radius); }
+.field:disabled { opacity: var(--disabled-alpha); }
+textarea.field { resize: none; overflow: hidden; height: calc(var(--edit-rows) * var(--line-body, 17px) + 2 * var(--edit-py)); white-space: pre-wrap; }
+/* A password field's peek button stands in its right end (tokens::PEEK);
+   the engine's own reveal button never shows. */
+::-ms-reveal { display: none; }
+.peek-field { position: relative; display: flex; flex: none; max-width: 100%; }
+.peek-field > .field { flex: 1 1 auto; min-width: 0; }
+.align-stretch > .peek-field { width: auto; align-self: stretch; }
+.peek-field.offered > .field { padding-right: calc(var(--edit-px) + var(--peek-button)); }
+.peek {
+  display: none; position: absolute; top: 0; bottom: 0; right: 0; width: var(--peek-button);
+  color: var(--weak); background-color: currentColor;
+  -webkit-mask: var(--peek-eye) no-repeat center / var(--peek-eye-w) var(--peek-eye-h);
+  mask: var(--peek-eye) no-repeat center / var(--peek-eye-w) var(--peek-eye-h);
+}
+.peek-field.offered > .peek { display: block; }
+.peek-field.shown > .peek { color: var(--selection-stroke); }
+
+/* A number as egui's drag value shows it: a button a control wide at least,
+   dragged across to change, and a field while it is being typed in. */
+.drag { min-width: var(--interact-w); cursor: ew-resize; user-select: none; caret-color: transparent; }
+.drag.lowest { cursor: e-resize; }
+.drag.highest { cursor: w-resize; }
+.frame.drag:focus:not(.off) { cursor: text; user-select: text; caret-color: var(--cursor); --ink: var(--inactive-fg); --fill: var(--extreme); --edge: var(--selection-stroke); --edge-w: var(--selection-stroke-width); --grow: var(--active-expansion); --round: var(--active-radius); }
+input.drag { text-align: center; }
+
+/* A slider: its rail, its handle, and its number beside it. */
+.slider { flex: none; }
+.slider input[type=range] { appearance: none; -webkit-appearance: none; display: block; width: var(--slider-w); height: var(--interact-h); background: transparent; outline: none; }
+.slider input[type=range]::-webkit-slider-runnable-track { height: var(--rail-h); border-radius: var(--inactive-radius); background: var(--inactive-bg); }
+.slider input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  --size: calc(2 * var(--interact-h) / 2.5);
+  width: var(--size); height: var(--size); margin-top: calc((var(--rail-h) - var(--size)) / 2);
+  border-radius: 50%; background: var(--inactive-bg); border: var(--inactive-fg-width) solid var(--inactive-fg);
+}
+.slider input[type=range].hovered:not(:disabled)::-webkit-slider-thumb { --size: calc(2 * var(--interact-h) / 2.5 + 2 * var(--hovered-expansion)); background: var(--hovered-bg); border: var(--hovered-fg-width) solid var(--hovered-fg); }
+.slider input[type=range]:is(.held, :focus-visible):not(:disabled)::-webkit-slider-thumb { --size: calc(2 * var(--interact-h) / 2.5 + 2 * var(--active-expansion)); background: var(--active-bg); border: var(--active-fg-width) solid var(--active-fg); }
+
+/* A drop-down: the text chosen and a triangle pointing down, a combo box's
+   width at least; the editable one is a field with a narrow drop-down. */
+.combo { display: inline-flex; align-items: center; gap: var(--icon-gap); justify-content: space-between; min-width: var(--combo-w); text-align: left; }
+.combo .chosen { flex: 1 1 auto; white-space: pre; }
+.combo .arrow { flex: none; width: var(--icon); height: var(--icon); position: relative; }
+.combo .arrow::after { content: ''; position: absolute; left: calc(var(--icon) * 0.15); top: calc(var(--icon) * 0.275); border-style: solid; border-color: var(--ink) transparent transparent transparent; border-width: calc(var(--icon) * 0.45) calc(var(--icon) * 0.35) 0 calc(var(--icon) * 0.35); }
+.combo.narrow { min-width: 0; padding-left: var(--button-px); padding-right: var(--button-px); }
+.editable { display: inline-flex; align-items: center; gap: var(--item-x); }
+
+/* A popup: a drop-down's choices, a date chooser's calendar, a color
+   chooser's picker, framed as egui frames a menu. */
+.popup {
+  position: fixed; z-index: 20; display: flex; flex-direction: column; align-items: stretch; gap: var(--item-y);
+  padding: var(--menu-margin); background: var(--window); color: var(--text);
+  border: var(--window-stroke-width) solid var(--window-stroke); border-radius: var(--menu-radius); box-shadow: var(--popup-shadow);
+}
+.popup.choices { max-height: var(--combo-h); overflow-y: auto; }
+.popup.choices .frame { text-align: left; }
+.calendar { display: grid; grid-template-columns: repeat(7, minmax(var(--interact-w), max-content)); grid-auto-rows: minmax(var(--interact-h), auto); gap: var(--item-y) var(--item-x); align-items: center; justify-items: start; }
+.picker { --picker-w: 275px; }
+.picker .swatch-wide { width: var(--picker-w); height: var(--interact-h); }
+.picker canvas { display: block; touch-action: none; }
+.picker canvas.hovered { outline: var(--hovered-stroke-width) solid var(--hovered-stroke); outline-offset: calc(-1 * var(--hovered-stroke-width)); }
+.picker .sv { width: var(--picker-w); height: var(--picker-w); }
+.picker .hue { width: var(--picker-w); height: var(--interact-h); }
+.swatch { width: var(--interact-w); height: var(--interact-h); flex: none; padding: 0; background: var(--chosen); box-shadow: 0 0 0 var(--grow) var(--chosen); outline: 1px solid var(--edge-fill); outline-offset: calc(var(--grow) - 1px); border-radius: min(var(--round), 2px); }
+.swatch { --edge-fill: var(--inactive-bg); --grow: var(--inactive-expansion); --round: var(--inactive-radius); }
+.swatch.hovered:not(:disabled, .open) { --edge-fill: var(--hovered-bg); --grow: var(--hovered-expansion); --round: var(--hovered-radius); }
+.swatch:is(.held, :focus-visible):not(:disabled, .open) { --edge-fill: var(--active-bg); --grow: var(--active-expansion); --round: var(--active-radius); }
+.swatch.open { --edge-fill: var(--open-bg); --grow: var(--open-expansion); --round: var(--open-radius); }
+.swatch:disabled { opacity: var(--disabled-alpha); }
+
+/* A separator: a line through the middle of six points, across a column
+   or down a row. */
+.separator { flex: none; position: relative; border: 0; margin: 0; }
+.col > .separator, .tabs > .separator, .popup > .separator, .menu > .separator { height: 6px; align-self: stretch; }
+.row > .separator, .menubar > .separator, .statusbar > .separator { width: 6px; align-self: stretch; }
+.separator::after { content: ''; position: absolute; background: var(--noninteractive-stroke); }
+.col > .separator::after, .tabs > .separator::after, .popup > .separator::after, .menu > .separator::after { left: 0; right: 0; top: calc(50% - var(--noninteractive-stroke-width) / 2); height: var(--noninteractive-stroke-width); }
+.row > .separator::after, .menubar > .separator::after, .statusbar > .separator::after { top: 0; bottom: 0; left: calc(50% - var(--noninteractive-stroke-width) / 2); width: var(--noninteractive-stroke-width); }
+
+/* Space added between widgets, which takes the place of the spacing after
+   the widget before it. A spacer that fills takes the room the widgets
+   around it leave, down a column or across a row. */
+.spacer { flex: none; }
+.col > .spacer { height: var(--size); }
+.row > .spacer { width: var(--size); }
+.col > .spacer:not(:last-child) { margin-bottom: calc(-1 * var(--item-y)); }
+.row > .spacer:not(:last-child) { margin-right: calc(-1 * var(--item-x)); }
+.row > .spacer.fill { flex: 1 1 0; min-width: var(--size); }
+.col > .spacer.fill { min-height: max(calc(3 * var(--interact-h)), var(--size)); }
+
+/* A group or a tab that fills down gives its widgets its height, starting
+   from their own, as the window's body does. */
+.group { border: var(--noninteractive-stroke-width) solid var(--noninteractive-stroke); border-radius: var(--noninteractive-radius); padding: var(--group-margin); min-width: 0; }
+.group.fill { display: flex; flex-direction: column; }
+.group.fill > .col { flex: 1 1 auto; min-height: 0; }
+.tabs { display: flex; flex-direction: column; align-items: flex-start; gap: var(--item-y); min-width: 0; }
+.tabs > .fill { flex: 1 1 auto; min-height: 0; align-self: stretch; }
+/* A tab's title, as Fluent's TabList draws one: a button without a frame,
+   its text in the weak text color, the hovered one under the pointer and
+   the strong one when chosen. Under the chosen title's text a line
+   --tab-mark thick in the selection's stroke, and under a hovered or
+   pressed title one in the hovered stroke, each lying on the separator's
+   line, which stands in the middle of its six points after the gap below
+   the titles. The keyboard's ring goes about a focused title. */
+.tabbar { display: flex; align-items: center; gap: var(--item-x); min-height: var(--interact-h); }
+.tabbar > .tab { position: relative; background: none; color: var(--weak); outline: none; border-radius: var(--inactive-radius); }
+.tabbar > .tab:is(.hovered, .held) { color: var(--hovered-fg); }
+.tabbar > .tab.picked { color: var(--strong); }
+.tabbar > .tab::after {
+  content: ''; position: absolute; z-index: 1; left: var(--button-px); right: var(--button-px); height: var(--tab-mark);
+  bottom: calc(-1 * (var(--item-y) + 3px + var(--noninteractive-stroke-width) / 2)); border-radius: calc(var(--tab-mark) / 2);
+}
+.tabbar > .tab:is(.hovered, .held):not(.picked)::after { background: var(--hovered-stroke); }
+.tabbar > .tab.picked::after { background: var(--selection-stroke); }
+.tabbar > .tab:focus-visible { box-shadow: inset 0 0 0 var(--selection-stroke-width) var(--selection-stroke); }
+
+.grid { display: grid; gap: var(--item-y) var(--item-x); grid-auto-rows: minmax(var(--interact-h), auto); align-items: center; justify-items: start; }
+.grid.align-center { justify-items: center; }
+.grid.align-end { justify-items: end; }
+.grid.align-stretch { justify-items: stretch; }
+
+/* Scrolled areas: a list, a tree, a log, a scroll area, a table and a
+   split's pane, with egui's thin bar in the room it takes beside them: a
+   thin strip of the field color with the handle in a control's fill at its
+   outer edge, filling that room while the pointer is on it. */
+.list, .tree, .log, .scroll-area { overflow-y: auto; overflow-x: hidden; outline: none; }
+::-webkit-scrollbar { width: var(--scroll-room); height: var(--scroll-room); }
+::-webkit-scrollbar-corner { background: transparent; }
+::-webkit-scrollbar-track, ::-webkit-scrollbar-thumb { background-clip: content-box; border: 0 solid transparent; }
+::-webkit-scrollbar-track { background-color: var(--extreme); }
+::-webkit-scrollbar-thumb { background-color: var(--inactive-bg); border-radius: var(--inactive-radius); min-height: var(--scroll-min); min-width: var(--scroll-min); }
+::-webkit-scrollbar-track:vertical, ::-webkit-scrollbar-thumb:vertical { border-left-width: calc(var(--scroll-room) - var(--scroll-thin)); }
+::-webkit-scrollbar-track:horizontal, ::-webkit-scrollbar-thumb:horizontal { border-top-width: calc(var(--scroll-room) - var(--scroll-thin)); }
+::-webkit-scrollbar-track:hover { border-width: 0; background-color: color-mix(in srgb, var(--extreme) 60%, transparent); }
+::-webkit-scrollbar-thumb:hover { border-width: 0; background-color: color-mix(in srgb, var(--hovered-bg) 60%, transparent); }
+::-webkit-scrollbar-thumb:active { border-width: 0; background-color: color-mix(in srgb, var(--active-bg) 60%, transparent); }
+
+/* A list, framed as egui frames one: the field color inside the line
+   color, its rows touching and each as wide as the frame, an item too long
+   for it cut short. */
+.list {
+  display: flex; flex-direction: column; align-items: stretch; gap: 0; padding: 2px;
+  background: var(--extreme); border: var(--noninteractive-stroke-width) solid var(--noninteractive-stroke); border-radius: var(--noninteractive-radius);
+}
+.list > .btn { text-align: left; overflow: hidden; text-overflow: ellipsis; }
+.log { display: flex; flex-direction: column; gap: var(--item-y); }
+.log .line { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+.tree { display: flex; flex-direction: column; gap: var(--item-y); }
+.tree .treeitem { display: flex; align-items: center; gap: 0; height: var(--interact-h); flex: none; border-radius: var(--inactive-radius); cursor: default; user-select: none; white-space: pre; color: var(--inactive-fg); }
+.tree .treeitem.hovered { background: var(--hovered-weak-bg); color: var(--hovered-fg); border-radius: var(--hovered-radius); }
+.tree .treeitem.picked { background: var(--selection); color: var(--selection-stroke); }
+.tree:focus .treeitem.focused { box-shadow: inset 0 0 0 var(--selection-stroke-width) var(--selection-stroke); }
+/* A node's text too long for its tree ends in an ellipsis, as a list's item does. */
+.tree .treeitem > .name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.list:focus > .focused { box-shadow: inset 0 0 0 var(--selection-stroke-width) var(--selection-stroke); }
+/* An item's arrow, as Fluent's and macOS's trees draw it: a chevron in the
+   weak text color, or the row's text color on a selected row, pointing
+   right while the item is closed and down while it is open, in the middle
+   of an icon's box that with the icon's gap after it is as wide as a
+   level's indent, so an item's arrow stands under its parent's text. The
+   chevron is two sides of a square turned an eighth of a turn and moved
+   back a quarter of its span, which puts its own middle at the box's. A
+   spinner stands a gap after the text. */
+.tree .arrow { flex: none; width: calc(var(--icon) + var(--icon-gap)); height: var(--interact-h); position: relative; }
+.tree .arrow::after {
+  content: ''; position: absolute; box-sizing: border-box;
+  width: calc(var(--chevron-span) / 1.41421356); height: calc(var(--chevron-span) / 1.41421356);
+  left: calc(var(--icon) / 2 - var(--chevron-span) / 2.82842712); top: calc(var(--interact-h) / 2 - var(--chevron-span) / 2.82842712);
+  border: 0 solid var(--weak); border-right-width: var(--chevron-w); border-bottom-width: var(--chevron-w);
+}
+.tree .arrow.closed::after { transform: translateX(calc(var(--chevron-span) / -4)) rotate(-45deg); }
+.tree .arrow.open::after { transform: translateY(calc(var(--chevron-span) / -4)) rotate(45deg); }
+.tree .treeitem.picked .arrow::after { border-color: currentColor; }
+.tree .arrow:not(.open, .closed)::after { display: none; }
+.tree .treeitem > .spinner { margin-left: var(--item-x); }
+
+/* A table, as egui_extras draws one: its filter row when it has one, over
+   a header of headings in the strong text color, each a button framed only
+   under the pointer, with a line in the noninteractive stroke under the
+   header where the rows' bands begin, and the rows. The first column's
+   content starts at the table's edge, the columns stand item-x apart, and
+   the last has item-x after its content; the rows stand item-y apart in
+   bands that meet, each band reaching half a gap past its row's cells,
+   striped from the first row, in the hovered fill under the pointer and
+   the selection's when picked. A column is as wide as its widest cell or
+   its heading with the wider sort arrow (.room), an interactive widget's
+   width at least, or as wide as a person dragged it, and the last takes
+   the room left when its cells stand at the left, or else an empty column
+   after it does (.filler). A line stands in
+   the middle of the gap after each column but the last, from the header's
+   top to the rows' bottom, in the hovered stroke within its grab and the
+   active stroke while dragged. */
+.table { position: relative; display: flex; flex-direction: column; gap: var(--item-y); min-width: 0; }
+.table .tools { display: flex; align-items: center; gap: var(--item-x); min-height: var(--interact-h); flex: none; }
+.table .scroll { overflow: auto; margin-left: calc(-0.5 * var(--item-x)); }
+.table.fill > .scroll { flex: 1 1 0; min-height: 0; }
+.table table { border-collapse: separate; border-spacing: 0; width: 100%; }
+.table th {
+  position: sticky; top: 0; z-index: 1; background: var(--panel); text-align: left; font-weight: normal; white-space: nowrap;
+  padding: 0 calc(var(--item-x) / 2) calc(var(--item-y) / 2); height: calc(var(--interact-h) + var(--item-y) / 2);
+  box-shadow: inset 0 calc(-1 * var(--noninteractive-stroke-width)) 0 var(--noninteractive-stroke);
+}
+.table th > .heading { color: var(--strong); }
+.table th > .room { display: block; height: 0; min-height: 0; min-width: var(--interact-w); padding-top: 0; padding-bottom: 0; overflow: hidden; visibility: hidden; }
+.table td { padding: calc(var(--item-y) / 2) calc(var(--item-x) / 2); height: calc(var(--interact-h) + var(--item-y)); white-space: pre; user-select: none; }
+.table tbody tr:last-child td { padding-bottom: 0; height: calc(var(--interact-h) + var(--item-y) / 2); }
+.table :is(th, td):not(:last-child) { width: 1px; }
+.table :is(th, td):is(:last-child, .end) { padding-right: var(--item-x); }
+/* The empty column that takes the spare room after a last column of
+   numbers or of centered values: as wide as that room, nothing measured. */
+.table :is(th, td).filler { padding-left: 0; padding-right: 0; }
+.table tbody tr:nth-child(odd) td { background: var(--faint); }
+.table tbody tr.hovered:not(.picked) td { background: var(--hovered-bg); }
+.table tbody tr.picked td { background: var(--selection); color: var(--selection-stroke); }
+/* The ring about the row a focused table's keyboard is on, drawn on its
+   cells, since not every engine draws a shadow on a table row. */
+.table .scroll:focus { outline: none; }
+.table .scroll:focus tbody tr.focused td { --ring: var(--selection-stroke-width); box-shadow: inset 0 var(--ring) 0 var(--selection-stroke), inset 0 calc(-1 * var(--ring)) 0 var(--selection-stroke); }
+.table .scroll:focus tbody tr.focused td:first-child { box-shadow: inset var(--ring) 0 0 var(--selection-stroke), inset 0 var(--ring) 0 var(--selection-stroke), inset 0 calc(-1 * var(--ring)) 0 var(--selection-stroke); }
+.table .scroll:focus tbody tr.focused td:last-child { box-shadow: inset calc(-1 * var(--ring)) 0 0 var(--selection-stroke), inset 0 var(--ring) 0 var(--selection-stroke), inset 0 calc(-1 * var(--ring)) 0 var(--selection-stroke); }
+.table .scroll:focus tbody tr.focused td:only-child { box-shadow: inset 0 0 0 var(--ring) var(--selection-stroke); }
+.table .edges { position: absolute; inset: 0; z-index: 2; pointer-events: none; }
+.table .edge { position: absolute; width: calc(2 * var(--grab)); margin-left: calc(-1 * var(--grab)); pointer-events: auto; cursor: col-resize; touch-action: none; }
+.table .edge::after { content: ''; position: absolute; top: 0; bottom: 0; --line: var(--noninteractive-stroke); --line-w: var(--noninteractive-stroke-width); left: calc(var(--grab) - var(--line-w) / 2); width: var(--line-w); background: var(--line); }
+.table .edge.hovered::after { --line: var(--hovered-stroke); --line-w: var(--hovered-stroke-width); }
+.table .edge.dragged::after { --line: var(--active-stroke); --line-w: var(--active-stroke-width); }
+
+/* A split: its first pane the share of its length its position gives
+   (--share, which the runtime sets) and its second the rest, past the
+   divider's 6 points, each given that length outright. Chromium lays a
+   pane out first at its flex basis, and one laid out with no room shows a
+   scroll bar its widgets do not need. A pane scrolls as the window's body
+   does, and its one widget, when it fills down, takes the pane's height
+   starting from its own, as the body's does. */
+.split { --divider: 6px; display: flex; min-width: 0; min-height: 0; }
+.split.horizontal { flex-direction: row; }
+.split.vertical { flex-direction: column; }
+.split .pane { overflow: auto; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.split > .pane:first-child { flex: 0 0 calc((100% - var(--divider)) * var(--share)); }
+.split > .pane:last-child { flex: 0 0 calc((100% - var(--divider)) * (1 - var(--share))); }
+.split .pane > .fill { flex: 1 1 auto; min-height: 0; }
+.split .divider { flex: 0 0 var(--divider); position: relative; touch-action: none; }
+.split .divider::after { content: ''; position: absolute; background: var(--noninteractive-stroke); }
+.split.horizontal .divider { cursor: col-resize; }
+.split.horizontal .divider::after { left: calc(50% - var(--noninteractive-stroke-width) / 2); top: 0; bottom: 0; width: var(--noninteractive-stroke-width); }
+.split.vertical .divider { cursor: row-resize; }
+.split.vertical .divider::after { top: calc(50% - var(--noninteractive-stroke-width) / 2); left: 0; right: 0; height: var(--noninteractive-stroke-width); }
+
+img.image { display: block; }
+
+/* A progress bar as Windows and macOS draw one: a line with its text at
+   the left, cut short where it would reach the figure, and how much is
+   done at the right, over a thin bar, the selection's fill on a control's
+   rail; as wide as its room and 96 points at least, as egui's bar is. */
+.progress { flex: none; display: flex; flex-direction: column; gap: var(--item-y); min-width: 96px; }
+.progress .line { display: flex; gap: var(--item-x); font-size: var(--body); line-height: var(--line-body, normal); color: var(--text); }
+.progress .said { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: pre; }
+.progress .done { flex: none; margin-left: auto; white-space: pre; }
+.progress .rail { position: relative; height: var(--progress-h); border-radius: calc(var(--progress-h) / 2); background: var(--inactive-bg); overflow: hidden; }
+.progress .bar { position: absolute; left: 0; top: 0; bottom: 0; border-radius: inherit; background: var(--selection); }
+
+/* A spinner: an arc of the strong text color turning once a second, its
+   length coming and going. */
+.spinner { display: block; flex: none; width: var(--interact-h); height: var(--interact-h); }
+.spinner circle { fill: none; stroke: var(--strong); stroke-width: 3; stroke-dasharray: 0 44; transform-origin: 9px 9px; animation: spin 1s linear infinite, arc 1.5708s ease-in-out infinite alternate; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes arc { to { stroke-dasharray: 29.32 44; } }
+
+.file { display: inline-flex; align-items: center; gap: var(--item-x); min-height: var(--interact-h); }
+.file .paths { white-space: pre; }
+
+/* A window's bars: its menu bars over a line, its status bars under one,
+   and its button bar, the buttons at its right a dialog's button size at
+   least and its gap apart, inside a dialog's margin, on the strip Windows
+   draws under a dialog's buttons with a line over it. */
+.menubars { flex: none; background: var(--panel); border-bottom: var(--noninteractive-stroke-width) solid var(--noninteractive-stroke); }
+.menubar { display: flex; align-items: center; gap: var(--item-x); min-height: var(--interact-h); padding: var(--bar-py) var(--bar-px); }
+.statusbars { flex: none; background: var(--panel); border-top: var(--noninteractive-stroke-width) solid var(--noninteractive-stroke); }
+.statusbar { display: flex; align-items: center; gap: var(--item-x); min-height: var(--interact-h); padding: var(--bar-py) var(--bar-px); }
+.buttonbar { flex: none; display: flex; align-items: center; justify-content: flex-end; gap: var(--dialog-gap); padding: var(--dialog-margin); background: var(--panel); }
+.buttonbar.strip { background: var(--strip); border-top: var(--noninteractive-stroke-width) solid var(--noninteractive-stroke); }
+.buttonbar > .btn { min-width: var(--dialog-button-w); min-height: var(--dialog-button-h); }
+.menu {
+  position: fixed; z-index: 10; display: flex; flex-direction: column; align-items: stretch; gap: var(--item-y);
+  padding: var(--menu-margin); background: var(--window); color: var(--text);
+  border: var(--window-stroke-width) solid var(--window-stroke); border-radius: var(--menu-radius); box-shadow: var(--popup-shadow);
+}
+.menu .entry { display: flex; justify-content: space-between; align-items: center; gap: var(--icon-gap); text-align: left; }
+.menu .shortcut { color: var(--weak); }
+
+/* A document lays its blocks out as the egui renderer does, in rows of body
+   text's height: one empty row between two blocks and one above every
+   heading, the first one too, its own box containing every gap. */
+.markdown { display: flow-root; min-width: 0; overflow-wrap: anywhere; line-height: var(--line-body); }
+.markdown > *, .markdown blockquote > *, .markdown .alert > * { margin: 0; }
+.markdown > * + *, .markdown blockquote > * + *, .markdown .alert > * + * { margin-top: var(--line-body); }
+/* A heading takes the size egui_commonmark gives its level, in the strong
+   text color for the first four levels, never bold. */
+.markdown h1, .markdown h2, .markdown h3, .markdown h4, .markdown h5, .markdown h6 { margin-top: var(--line-body); font-weight: normal; }
+.markdown h1 { font-size: var(--heading); line-height: var(--line-heading); }
+.markdown h2 { font-size: var(--heading-2); line-height: var(--line-heading-2); }
+.markdown h3 { font-size: var(--heading-3); line-height: var(--line-heading-3); }
+.markdown h4 { font-size: var(--heading-4); line-height: var(--line-heading-4); }
+.markdown h5 { font-size: var(--heading-5); line-height: var(--line-heading-5); }
+.markdown h6 { font-size: var(--heading-6); line-height: var(--line-heading-6); }
+.markdown h1, .markdown h2, .markdown h3, .markdown h4 { color: var(--strong); }
+.markdown a { color: var(--link); }
+.markdown code, .markdown kbd { font-family: var(--font-mono); font-size: var(--mono); background: var(--code); border-radius: 3px; padding: 0 3px; }
+/* A code block is a text field of its rows the room's width, with egui's
+   text field margins and its frame drawn outside it. */
+.markdown pre.code { padding: var(--edit-py) var(--edit-px); line-height: var(--line-mono); background: var(--extreme); border-radius: var(--noninteractive-radius); box-shadow: 0 0 0 var(--noninteractive-stroke-width) var(--noninteractive-stroke); overflow-x: auto; }
+.markdown pre.code code { background: none; padding: 0; }
+/* A quote, and an alert: an empty row above and below its blocks, 10 points
+   in from a 3-point line that stops 5 points short of each end. */
+.markdown blockquote, .markdown .alert { position: relative; padding: var(--line-body) 0 var(--line-body) 10px; }
+.markdown blockquote { color: var(--weak); }
+.markdown blockquote::before, .markdown .alert::before { content: ''; position: absolute; left: -1.5px; top: 5px; bottom: 5px; width: 3px; background: var(--weak); }
+/* A list's items are rows as tall as an interactive widget, each after its
+   point, four spaces of body text wide and 4 points from the item; a nested
+   list sits four spaces further in, its points rings. */
+.markdown ul, .markdown ol { padding: 0; list-style: none; }
+.markdown li { line-height: var(--interact-h); }
+.markdown li > p { display: inline; }
+.markdown li ul, .markdown li ol { padding-left: calc(4 * var(--space)); }
+.markdown li::before { content: ''; display: inline-block; vertical-align: top; width: calc(4 * var(--space)); height: var(--line-body); margin: calc((var(--interact-h) - var(--line-body)) / 2) 4px 0 0; }
+.markdown ul > li::before { background: radial-gradient(circle, var(--strong) calc(var(--line-body) / 6), transparent calc(var(--line-body) / 6 + 0.75px)); }
+.markdown li ul > li::before { background: radial-gradient(circle, transparent calc(var(--line-body) / 6 - 0.6px), var(--strong) calc(var(--line-body) / 6 - 0.6px) calc(var(--line-body) / 6), transparent calc(var(--line-body) / 6 + 0.5px)); }
+.markdown ol > li::before { content: attr(data-number) '.'; text-align: right; line-height: var(--line-body); color: var(--strong); }
+/* A rule is a row of body text's height the room's width, egui's separator
+   line 3 points above its foot. */
+.markdown hr { height: var(--line-body); border: none; background: linear-gradient(var(--noninteractive-stroke), var(--noninteractive-stroke)) left bottom 3px / 100% var(--noninteractive-stroke-width) no-repeat; }
+/* A table is egui's striped grid in a group's frame: its rows as tall as an
+   interactive widget at least and 3 points apart, each cell at the left and
+   in the middle of its row, every second row of its body in the faint
+   color; its columns are set by the runtime. */
+.markdown table { display: grid; width: max-content; max-width: 100%; row-gap: var(--item-y); grid-auto-rows: minmax(var(--interact-h), auto); align-items: center; border: var(--noninteractive-stroke-width) solid var(--noninteractive-stroke); border-radius: var(--noninteractive-radius); padding: var(--group-margin); }
+.markdown thead, .markdown tbody, .markdown tr { display: contents; }
+.markdown th, .markdown td { padding: 0; font-weight: normal; text-align: left; }
+.markdown tbody tr:nth-child(odd) > td { background: var(--faint); }
+/* A picture sits on the bottom of its row, as egui lays a document's rows
+   out, so no descender's room opens under it. */
+.markdown img { max-width: 100%; vertical-align: bottom; }
+/* An https picture shows as the spinner after it, 24 points square, the
+   size egui gives a picture still loading, until the picture has loaded or
+   its alt text stands in its place, and whenever its window is measured. */
+.markdown .picture-loading { display: inline-block; width: 24px; height: 24px; vertical-align: bottom; }
+.markdown img.web:not(.loaded), html.measuring .markdown img.web, html.measuring .markdown .web-alt { display: none; }
+.markdown img.web.loaded + .picture-loading, .markdown .web-alt + .picture-loading { display: none; }
+html.measuring .markdown img.web + .picture-loading, html.measuring .markdown .web-alt + .picture-loading { display: inline-block; }
+/* A footnote's mark is small text in the strong color at the top of its
+   row; a note's number, in the same, ends a box four spaces wide. */
+.markdown .footnote-reference { font-size: var(--small); line-height: var(--line-small); vertical-align: top; color: var(--strong); }
+.markdown .footnote-definition > p { display: inline; }
+.markdown .footnote-label { display: inline-block; vertical-align: top; width: calc(4 * var(--space)); text-align: right; font-size: var(--small); line-height: var(--line-small); color: var(--strong); }
+/* An alert's line and title take its color. */
+.markdown .alert-note::before { background: rgb(10, 80, 210); }
+.markdown .alert-note .alert-title { color: rgb(10, 80, 210); }
+.markdown .alert-tip::before { background: rgb(0, 130, 20); }
+.markdown .alert-tip .alert-title { color: rgb(0, 130, 20); }
+.markdown .alert-important::before { background: rgb(150, 30, 140); }
+.markdown .alert-important .alert-title { color: rgb(150, 30, 140); }
+.markdown .alert-warning::before { background: rgb(200, 120, 0); }
+.markdown .alert-warning .alert-title { color: rgb(200, 120, 0); }
+.markdown .alert-caution::before { background: rgb(220, 0, 0); }
+.markdown .alert-caution .alert-title { color: rgb(220, 0, 0); }
+/* Code's colors, egui_extras's for each theme: the dark ones while the
+   system prefers dark and the page's root names no light theme, and while
+   it names the dark one. */
+:root {
+  --tok-comment: rgb(160, 160, 160); --tok-function: rgb(170, 110, 0); --tok-keyword: rgb(235, 0, 0);
+  --tok-literal: rgb(153, 134, 255); --tok-string: rgb(37, 203, 105); --tok-plain: rgb(96, 96, 96);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --tok-comment: rgb(120, 120, 120); --tok-function: rgb(220, 190, 110); --tok-keyword: rgb(255, 100, 100);
+    --tok-literal: rgb(87, 165, 171); --tok-string: rgb(109, 147, 226); --tok-plain: rgb(220, 220, 220);
+  }
+}
+:root[data-theme="dark"] {
+  --tok-comment: rgb(120, 120, 120); --tok-function: rgb(220, 190, 110); --tok-keyword: rgb(255, 100, 100);
+  --tok-literal: rgb(87, 165, 171); --tok-string: rgb(109, 147, 226); --tok-plain: rgb(220, 220, 220);
+}
+.tok-comment { color: var(--tok-comment); }
+.tok-function { color: var(--tok-function); }
+.tok-keyword { color: var(--tok-keyword); }
+.tok-literal { color: var(--tok-literal); }
+.tok-string { color: var(--tok-string); }
+.tok-punctuation, .code-plain { color: var(--tok-plain); }
+.chart { width: 100%; min-height: 120px; overflow: hidden; }
+.chart .u-over { touch-action: none; }
+.chart .u-select { background: rgba(128, 128, 128, 0.2); }
+.chart .u-legend { color: var(--text); }
+/* The values under a chart's pointer, beside it, in a popup's colors, a
+   line for each, as egui_plot writes them. */
+.chart .chart-tip {
+  position: absolute; z-index: 3; pointer-events: none; white-space: pre; padding: 2px 6px;
+  background: var(--window); color: var(--text); border: var(--window-stroke-width) solid var(--window-stroke);
+  border-radius: var(--menu-radius); box-shadow: var(--popup-shadow);
+}
+
+/* A GPU surface: its canvas filling its box, opaque black until its first
+   frame, as egui's surface is until the session gives it draws. A Canvas
+   is clear where it draws nothing, as egui's is; a box zoom's box is drawn
+   over its items, within it. A surface or canvas the keyboard gave the
+   focus shows egui's ring, the selection stroke inside its edge; a drag
+   across one selects no text, as none does in egui. */
+.surface { position: relative; flex: none; min-width: 0; overflow: hidden; outline: none; -webkit-user-select: none; user-select: none; }
+.surface canvas { position: absolute; left: 0; top: 0; width: 100%; height: 100%; display: block; background: var(--panel); touch-action: none; }
+.surface.canvas canvas { background: transparent; }
+.surface .zoombox { position: absolute; box-sizing: border-box; border-style: dotted; pointer-events: none; }
+.surface:focus-visible::after { content: ''; position: absolute; inset: 0; box-shadow: inset 0 0 0 var(--selection-stroke-width) var(--selection-stroke); pointer-events: none; }
+
+/* A media player: its picture fitted inside its box, keeping its
+   proportions, the rest of the box black, and its controls across the
+   box's foot, as egui's player draws them from the same tokens. A player
+   of sound alone shows its controls alone, or with no controls its line of
+   text, and its element none. In full screen the player is alone, and its
+   controls hide while the pointer rests. */
+.media { position: relative; flex: none; min-width: 0; overflow: hidden; background: #000; outline: none; }
+.media > video { position: absolute; left: 0; top: 0; width: 100%; height: 100%; object-fit: contain; display: block; }
+.media.audio { background: none; }
+.media.audio > audio { display: none; }
+.media.audio.controlled { height: var(--media-bar-h); }
+.media:fullscreen { width: 100vw; height: 100vh; }
+.media:fullscreen.idle { cursor: none; }
+.media:fullscreen.idle > .media-bar { display: none; }
+.media-bar { position: absolute; left: 0; right: 0; bottom: 0; height: var(--media-bar-h); display: flex; align-items: center; gap: var(--media-gap); padding: 0 var(--media-gap); box-sizing: border-box; background: var(--media-shade); color: var(--media-ink); font-size: calc(var(--small) + 2px); }
+.media-button { flex: none; width: var(--media-button); height: var(--media-button); border-radius: calc(var(--media-button) / 4); position: relative; }
+.media-button:hover { background: rgba(255, 255, 255, 0.15); }
+.media-button::after { content: ''; position: absolute; inset: var(--media-inset); background: var(--media-ink); -webkit-mask-size: 100% 100%; mask-size: 100% 100%; }
+.media-button.play::after { -webkit-mask-image: var(--media-play); mask-image: var(--media-play); }
+.media-button.pause::after { -webkit-mask-image: var(--media-pause); mask-image: var(--media-pause); }
+.media-button.sound::after { -webkit-mask-image: var(--media-sound); mask-image: var(--media-sound); }
+.media-button.muted::after { -webkit-mask-image: var(--media-muted); mask-image: var(--media-muted); }
+.media-button.full::after { -webkit-mask-image: var(--media-full); mask-image: var(--media-full); }
+.media-button.windowed::after { -webkit-mask-image: var(--media-windowed); mask-image: var(--media-windowed); }
+.media-time { flex: none; white-space: nowrap; }
+.media-slider { position: relative; height: var(--media-button); touch-action: none; }
+.media-slider.seek { flex: 1 1 auto; min-width: var(--media-knob); }
+.media-slider.volume { flex: none; width: var(--media-volume-w); }
+.media-slider > .track, .media-slider > .fill { position: absolute; left: 0; top: calc(50% - var(--media-track) / 2); height: var(--media-track); border-radius: calc(var(--media-track) / 2); }
+.media-slider > .track { right: 0; background: var(--media-ink); opacity: 0.35; }
+.media-slider > .fill { background: var(--media-ink); }
+.media-slider > .knob { position: absolute; top: calc(50% - var(--media-knob) / 2); width: var(--media-knob); height: var(--media-knob); margin-left: calc(var(--media-knob) / -2); border-radius: 50%; background: var(--media-ink); }
+/* The subtitles showing: one box of their lines, centered across the
+   player, its foot lifted above the player's foot or above its controls
+   while they show, each line unwrapped as egui lays it. */
+.media > .media-cue { position: absolute; left: 50%; bottom: var(--media-cue-lift); transform: translateX(-50%); padding: var(--media-cue-pad-y) var(--media-cue-pad-x); border-radius: var(--media-cue-round); background: var(--media-cue-shade); color: var(--media-cue-ink); font-size: var(--media-cue-size); white-space: pre; text-align: center; pointer-events: none; }
+.media.controlled > .media-cue { bottom: calc(var(--media-bar-h) + var(--media-cue-lift)); }
+.media:fullscreen.idle > .media-cue { bottom: var(--media-cue-lift); }
+
+/* While a window fitting its content is measured, before it is shown: the
+   window as wide as its widgets, at most the width it may take, and as
+   tall as they are; each widget at its own size, those that fill down too,
+   a list and a table with the room their scroll bar takes beside them, a
+   chart, surface, canvas or media player's picture given no size at egui's
+   default area size, and
+   a stretched field at its own width, but in a stretched grid's last
+   column, where it counts a control's least width, so the window's other
+   widgets set the width that column fills. */
+html.measuring, html.measuring body { height: auto; overflow: visible; }
+html.measuring #root { display: inline-flex; width: max-content; max-width: var(--fit-most-w, none); height: auto; }
+html.measuring #root > .body { flex: none; overflow: visible; }
+html.measuring .fill, html.measuring .table > .scroll, html.measuring .group.fill > .col { flex: none !important; min-height: 0 !important; }
+html.measuring .row > .wide, html.measuring .row.align-stretch > * { flex: none; }
+html.measuring .split .pane { flex: none !important; }
+html.measuring .list { padding-right: calc(2px + var(--scroll-room)); }
+html.measuring .table > .scroll { padding-right: var(--scroll-room); }
+html.measuring .surface, html.measuring .media:not(.audio) { width: var(--area-w); height: var(--area-h); }
+html.measuring .chart { width: var(--area-w); }
+html.measuring .chart:not([data-height]) { height: var(--area-h); }
+html.measuring .align-stretch > .field, html.measuring .align-stretch > .editable > .field, html.measuring .align-stretch > .peek-field > .field { width: var(--edit-w); }
+html.measuring .align-stretch > input.drag { width: var(--own-w) !important; }
+html.measuring .grid.align-stretch > .field.last, html.measuring .grid.align-stretch > .editable.last > .field, html.measuring .grid.align-stretch > .peek-field.last > .field { width: var(--interact-w); }

@@ -1,0 +1,16 @@
+# Every build of the module is the build the PowerShell Gallery gets: the
+# library targets its architecture's baseline CPU, so it imports on any
+# machine of that architecture, and on Windows it links the C runtime in
+# statically, so it loads without the Visual C++ Redistributable. A
+# target's `rustflags` replace `build.rustflags` from any other config, a
+# host's `target-cpu=native` among them; every matching table below is
+# joined. A `RUSTFLAGS` or `CARGO_ENCODED_RUSTFLAGS` variable replaces all
+# of them, so builds leave both unset.
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=x86-64"]
+
+[target.'cfg(all(target_os = "windows", target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-cpu=apple-a14"]

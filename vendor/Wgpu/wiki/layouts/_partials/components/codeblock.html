@@ -1,0 +1,120 @@
+{{- /*
+Hextra's components/codeblock partial, with three changes.
+
+The language is the fence's info string up to its first comma.
+
+A powershell block holding a session, a line that starts with "PS> ", is
+highlighted line by line. A command, from its "PS> " line through the ">> "
+lines that continue it, is highlighted as PowerShell after its prompts, and
+every other line is shown as output. Every documented command is run by
+tools/Invoke-Documentation.ps1, so a token the lexer marks as an error inside
+one is the lexer's limit, not the command's, and is shown as plain text.
+
+The shader code in a powershell block is highlighted in its own language. The
+slots tools/Export-ShaderSlots.ps1 lists for the block in
+data/shader_slots.json are swapped for placeholders before the block is
+highlighted, and each placeholder is then replaced by its code as Chroma
+highlights it in the slot's language, WGSL or GLSL. Each slot is one line,
+highlighted with its line end, which Chroma's WGSL lexer needs to end a //
+comment, and the line end is then taken off. A powershell block the file has
+no entry for stops the build.
+*/ -}}
+{{ $filename := .filename | default "" -}}
+{{ $base_url := .base_url | default "" -}}
+{{ $lang := .lang | default "" }}
+{{ $content := .content }}
+{{ $options := .options | default (dict) }}
+
+{{- if $filename -}}
+  <div class="hextra-code-filename not-prose" dir="auto">
+    {{- if $base_url -}}
+
+      {{- $base_url = strings.TrimSuffix "/" $base_url -}}
+      {{- $filename = strings.TrimPrefix "/" $filename -}}
+      {{- $file_url := urls.JoinPath $base_url $filename -}}
+
+      <a class="hx:no-underline hx:inline-flex hx:items-center hx:gap-1" href="{{ $file_url }}" target="_blank" rel="noopener noreferrer">
+          <span>{{- $filename -}}</span>
+          {{- partial "utils/icon" (dict "name" "external-link" "attributes" "height=1em") -}}
+      </a>
+    {{- else -}}
+      {{- $filename -}}
+    {{- end -}}
+  </div>
+{{- end -}}
+
+{{- $lang = index (split $lang ",") 0 -}}
+{{- $content = replace $content "\r" "" -}}
+{{- $slot_html := slice -}}
+{{- if eq $lang "powershell" -}}
+  {{- $key := md5 (strings.TrimRight "\n" $content) -}}
+  {{- $table := hugo.Data.shader_slots | default dict -}}
+  {{- if not (isset $table $key) -}}
+    {{- errorf "data/shader_slots.json has no entry for the powershell block that starts %q: run tools/Export-ShaderSlots.ps1" (index (split $content "\n") 0) -}}
+  {{- end -}}
+  {{- $masked := "" -}}
+  {{- $at := 0 -}}
+  {{- range $i, $slot := index $table $key -}}
+    {{- $start := int (index $slot 0) -}}
+    {{- $end := int (index $slot 1) -}}
+    {{- $masked = printf "%s%sWGPUSLOT%dX" $masked (substr $content $at (sub $start $at)) $i -}}
+    {{- $code := substr $content $start (sub $end $start) -}}
+    {{- $html := replaceRE `^<code[^>]*>|</code>$` "" (string (highlight (printf "%s\n" $code) (index $slot 2) (dict "hl_inline" true))) -}}
+    {{- $html = replaceRE `<span class="w">\n</span>$` "" $html -}}
+    {{- $html = replaceRE `\n((?:</span>)*)$` "$1" $html -}}
+    {{- $slot_html = $slot_html | append $html -}}
+    {{- $at = $end -}}
+  {{- end -}}
+  {{- $content = printf "%s%s" $masked (substr $content $at) -}}
+{{- end -}}
+{{- $lines := split $content "\n" -}}
+{{- if and (gt (len $lines) 0) (eq (index $lines (sub (len $lines) 1)) "") -}}
+  {{- $lines = first (sub (len $lines) 1) $lines -}}
+{{- end -}}
+{{- $session := false -}}
+{{- if eq $lang "powershell" -}}
+  {{- range $lines -}}
+    {{- if hasPrefix . "PS> " -}}{{- $session = true -}}{{- end -}}
+  {{- end -}}
+{{- end -}}
+
+{{- if $session -}}
+  {{- $out := slice -}}
+  {{- $command := "" -}}
+  {{- $open := false -}}
+  {{- $n := len $lines -}}
+  {{- range $i, $line := $lines -}}
+    {{- $next := "" -}}
+    {{- if lt (add $i 1) $n -}}{{- $next = index $lines (add $i 1) -}}{{- end -}}
+    {{- if hasPrefix $line "PS> " -}}
+      {{- $command = strings.TrimPrefix "PS> " $line -}}
+      {{- $open = true -}}
+    {{- else if and $open (hasPrefix $line ">> ") -}}
+      {{- $command = printf "%s\n%s" $command (strings.TrimPrefix ">> " $line) -}}
+    {{- else -}}
+      {{- $open = false -}}
+      {{- $html := "" -}}
+      {{- if $line -}}{{- $html = printf `<span class="go">%s</span>` (htmlEscape $line) -}}{{- end -}}
+      {{- $out = $out | append (printf "<span class=\"line\"><span class=\"cl\">%s\n</span></span>" $html) -}}
+    {{- end -}}
+    {{- if and $open (not (hasPrefix $next ">> ")) -}}
+      {{- $tokens := "" -}}
+      {{- if $command -}}
+        {{- $tokens = replaceRE `^<code[^>]*>|</code>$` "" (string (highlight $command "powershell" (dict "hl_inline" true))) -}}
+        {{- $tokens = replaceRE `<span class="err">([^<]*)</span>` "$1" $tokens -}}
+        {{- $tokens = replace $tokens "\n" "\n<span class=\"gp\">&gt;&gt; </span>" -}}
+      {{- end -}}
+      {{- $out = $out | append (printf "<span class=\"line\"><span class=\"cl\"><span class=\"gp\">PS&gt; </span>%s\n</span></span>" $tokens) -}}
+      {{- $open = false -}}
+    {{- end -}}
+  {{- end -}}
+  {{- $html := delimit $out "" -}}
+  {{- range $i, $h := $slot_html -}}{{- $html = replace $html (printf "WGPUSLOT%dX" $i) $h -}}{{- end -}}
+  <div><div class="highlight"><pre tabindex="0" class="chroma"><code class="language-{{ $lang }}" data-lang="{{ $lang }}">{{ $html | safeHTML }}</code></pre></div></div>
+{{- else if transform.CanHighlight $lang -}}
+  {{- $html := string (highlight $content $lang $options) -}}
+  {{- range $i, $h := $slot_html -}}{{- $html = replace $html (printf "WGPUSLOT%dX" $i) $h -}}{{- end -}}
+  <div>{{- $html | safeHTML -}}</div>
+{{- else -}}
+  <div><pre><code>{{ $content }}</code></pre></div>
+{{- end -}}

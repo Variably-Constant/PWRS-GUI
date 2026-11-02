@@ -1,0 +1,171 @@
+# Build the Python wheels, on demand and on a tag.
+#
+# Two kinds of wheel come out of this, for the reason the crate's
+# `abi3` feature exists. One wheel serves every interpreter from 3.11
+# upward, because it targets the stable ABI. A free-threaded
+# interpreter has no stable ABI to target until 3.15, so each of those
+# takes a wheel of its own, built without that feature.
+#
+# Nothing here publishes. The wheels are left as artifacts for a person
+# to look at and upload.
+
+name: python wheels
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    # Release tags here are bare, 0.5.0 rather than v0.5.0.
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: read
+
+jobs:
+  stable-abi:
+    name: stable ABI on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # A published wheel targets a baseline, never the machine that
+        # built it: a host whose cargo config says target-cpu=native
+        # produces a wheel that dies with an illegal instruction on
+        # import anywhere else, and the crate dispatches its wide
+        # kernels at run time anyway, so a baseline costs nothing. The
+        # baseline has to name a processor the target actually has.
+        # macos-latest is aarch64, where x86-64 is not a processor at
+        # all and the compiler says so and ignores the flag. apple-a14
+        # is the oldest Apple Silicon core, so a wheel built for it runs
+        # on every Mac that has one; `rustc --print target-cpus
+        # --target aarch64-apple-darwin` lists it and does not list
+        # apple-m1, which is an LLVM alias for the same thing.
+        include:
+          - os: ubuntu-latest
+            rustflags: "-C target-cpu=x86-64"
+          - os: windows-latest
+            rustflags: "-C target-cpu=x86-64"
+          - os: macos-latest
+            rustflags: "-C target-cpu=apple-a14"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # The floor the stable ABI is taken against. A wheel built
+          # here runs on every later interpreter too.
+          python-version: "3.11"
+
+      - name: Build
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: crates/subetha-py
+          command: build
+          args: --release --out dist
+
+      - name: Check the wheel imports and its tests pass
+        shell: bash
+        working-directory: crates/subetha-py
+        run: |
+          python -m pip install --upgrade pip pytest
+          # The distribution is subetha-ipc; subetha is what it imports
+          # as. Asking pip for the import name matches no wheel in dist.
+          python -m pip install --no-index --find-links dist subetha-ipc
+          python -c "import subetha; print(subetha.transports, subetha.free_threaded)"
+          python -m pytest tests -q
+
+      # Whether help() has anything to say is a property of the built
+      # module rather than of the source: a doc comment in a place PyO3
+      # does not carry never reaches __doc__. Asked here, of the wheel.
+      - name: Check every method has something for help()
+        shell: bash
+        working-directory: crates/subetha-py
+        run: python tools/check_docs.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-abi3-${{ matrix.os }}
+          path: crates/subetha-py/dist
+
+  free-threaded:
+    name: free-threaded ${{ matrix.python }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Baseline per target, for the reason spelled out on the
+        # stable-ABI job above.
+        include:
+          - os: ubuntu-latest
+            rustflags: "-C target-cpu=x86-64"
+            python: "3.14t"
+          - os: windows-latest
+            rustflags: "-C target-cpu=x86-64"
+            python: "3.14t"
+          - os: macos-latest
+            rustflags: "-C target-cpu=apple-a14"
+            python: "3.14t"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Confirm this interpreter really has no lock
+        shell: bash
+        run: |
+          python -c "import sysconfig, sys; \
+            assert sysconfig.get_config_var('Py_GIL_DISABLED'), \
+            'this job is meaningless on a build that has the lock'; \
+            print(sys.version)"
+
+      - name: Build without the stable ABI
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: crates/subetha-py
+          command: build
+          args: --release --out dist --no-default-features
+
+      - name: Check the lock stays off and the threading tests pass
+        shell: bash
+        working-directory: crates/subetha-py
+        run: |
+          python -m pip install --upgrade pip pytest
+          python -m pip install --no-index --find-links dist subetha-ipc
+          # The module declares it does not need the lock. If that
+          # declaration were missing or wrong the interpreter would
+          # switch the lock back on here, which is what this catches.
+          python -c "import sys, subetha; \
+            assert subetha.free_threaded, 'built against the wrong interpreter'; \
+            assert not sys._is_gil_enabled(), 'importing switched the lock back on'"
+          python -m pytest tests -q
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.python }}-${{ matrix.os }}
+          path: crates/subetha-py/dist
+
+  source:
+    name: source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: crates/subetha-py
+          command: sdist
+          args: --out dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: crates/subetha-py/dist

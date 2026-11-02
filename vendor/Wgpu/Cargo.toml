@@ -1,0 +1,323 @@
+[package]
+name = "wgpu-pwsh"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+# The module manifest takes Author from the first of `authors` and
+# ProjectUri from `repository`, and its Description and Tags from
+# [package.metadata.pwrs] below; crates.io shows `description` and
+# `keywords`.
+authors = ["Mark Newton"]
+description = "GPU compute, offscreen rendering and shader tools for PowerShell, with wgpu compiled in."
+license = "MIT"
+keywords = ["gpu", "wgpu", "shader", "wgsl", "powershell"]
+repository = "https://github.com/Variably-Constant/Wgpu"
+readme = "README.crates.md"
+# What the crates.io package carries: the sources a build compiles, the
+# examples, the version checks, the license texts, the changelog and the
+# README crates.io shows. The wiki, the Pester suites and the tools stay
+# in the repository.
+include = [
+    "/build.rs",
+    "/src",
+    "/native",
+    "/vendor/basis_universal",
+    "/vendor/block_compression",
+    "/examples",
+    "/tests/version_references.rs",
+    "/licenses",
+    "/LICENSE",
+    "/README.crates.md",
+    "/CHANGELOG.md",
+]
+
+# Everything else a module manifest carries, each under the manifest
+# key's own name in kebab case. A key left unset is written nowhere.
+[package.metadata.pwrs]
+# The PowerShell Gallery's description and tags: the paragraph and all 14
+# tags, where crates.io takes the line and the five keywords above.
+description = """GPU compute, rendering and shader tools for PowerShell through wgpu 30, \
+compiled into the module with Direct3D 12, Vulkan, OpenGL and Metal. Get-WgpuAdapter \
+lists every adapter with its features and limits, and Open-WgpuDevice opens one with all of \
+them but wgpu's experimental features. Buffers and textures stay on the GPU between \
+calls: New-WgpuBuffer takes an array of any numeric type, and Invoke-WgpuCompute runs a \
+WGSL, GLSL or SPIR-V compute shader over arrays or buffers, binding them by position, by \
+name or by group and binding as the shader declares them. Invoke-WgpuMap runs an \
+expression over arrays and Measure-WgpuArray reduces them on the GPU. Textures load from \
+and save to PNG, JPEG and other image files, and Invoke-WgpuRender draws offscreen into \
+them. Test-WgpuShader, Get-WgpuShaderInfo and ConvertTo-WgpuShader validate, inspect and \
+translate WGSL, GLSL and SPIR-V shaders into WGSL, SPIR-V, GLSL, HLSL and MSL with no GPU \
+at all. Every \
+cmdlet also has a Gpu name (Invoke-GpuCompute), and every object has methods for \
+scripts that hold it. Bound directly to Rust with PoWerRuSt (pwrs), Rust bindings for \
+writing PowerShell binary modules in the spirit of PyO3: the cmdlets are the library, not \
+a wrapper over a command line. Windows x64 and Arm64, Linux x64 and Arm64 (glibc 2.35 and \
+newer), macOS arm64 and x64, and FreeBSD x64 in one module, on PowerShell 7.4 or later \
+and, on Windows, Windows PowerShell 5.1. Source and issues at \
+https://github.com/Variably-Constant/Wgpu; the binding framework at \
+https://github.com/Variably-Constant/PWRS and https://crates.io/crates/PoWerRuSt."""
+tags = ["powershell", "wgpu", "gpu", "compute", "shader", "wgsl", "vulkan", "directx", "metal", "opengl", "Windows", "Linux", "MacOS", "FreeBSD"]
+company = "Variably Constant"
+copyright = "(c) 2026 Mark Newton"
+license-uri = "https://github.com/Variably-Constant/Wgpu/blob/main/LICENSE"
+release-notes = "The first release. What is in it: https://github.com/Variably-Constant/Wgpu/blob/main/CHANGELOG.md"
+icon-uri = "https://raw.githubusercontent.com/Variably-Constant/PWRS/main/assets/PWRS.png"
+# avif-parse, which reads the container of an .avif file, is under MPL-2.0,
+# whose terms require a binary that carries it to say where its source is;
+# the module's own license-files entry adds that statement.
+allowed-licenses = ["MPL-2.0"]
+
+# License files for linked crates whose packages ship none, which the
+# notices quote under each crate: the license files of each crate's
+# repository at the commit its .cargo_vcs_info.json records, every one of
+# them in one file for a crate under several licenses.
+# alloc-stdlib: github.com/dropbox/rust-alloc-no-stdlib ae42d22 (LICENSE).
+# bcdec_rs: github.com/ScanMountGoat/image_dds 5e1ef82 (LICENSE).
+# profiling: github.com/aclysma/profiling 8271551 (LICENSE-MIT, LICENSE-APACHE).
+# pulp-wasm-simd-flag: github.com/sarah-quinones/pulp 5eb07fd (LICENSE).
+# spirv: github.com/gfx-rs/rspirv 8afc3d0 (LICENSE).
+# zune-inflate: github.com/etemesi254/zune-image 69502ce (LICENSE.md, LICENSE-ZLIB).
+[package.metadata.pwrs.license-files]
+"alloc-stdlib@0.2.4" = "licenses/alloc-stdlib-0.2.4/LICENSE"
+"bcdec_rs@0.2.1" = "licenses/bcdec_rs-0.2.1/LICENSE"
+"profiling@1.0.18" = "licenses/profiling-1.0.18/LICENSE"
+"pulp-wasm-simd-flag@0.1.1" = "licenses/pulp-wasm-simd-flag-0.1.1/LICENSE"
+"spirv@0.4.0+sdk-1.4.341.0" = "licenses/spirv-0.4.0+sdk-1.4.341.0/LICENSE"
+"zune-inflate@0.2.54" = "licenses/zune-inflate-0.2.54/LICENSE"
+# The licenses of data three of hayro's crates embed, quoted after each
+# crate's own: hayro-cmap's Adobe character maps (BSD-3-Clause),
+# hayro-interpret's standard fonts from PDFium (BSD-3-Clause) and its CMYK
+# profile (CC0-1.0), and hayro-jpeg2000's profiles (CC0-1.0); each file is
+# its package's assets/ copy, as at github.com/LaurenzV/hayro a2354ae
+# (hayro-cmap) and ea9c81d (the other two).
+"hayro-cmap@0.1.0" = { add = ["licenses/hayro-cmap-0.1.0/LICENSE.txt", "licenses/hayro-cmap-0.1.0/README.md"] }
+"hayro-interpret@0.8.0" = { add = [
+    "licenses/hayro-interpret-0.8.0/LICENSE_FOXIT",
+    "licenses/hayro-interpret-0.8.0/CGATS_LICENSE.txt",
+    "licenses/hayro-interpret-0.8.0/README.md",
+] }
+"hayro-jpeg2000@0.4.1" = { add = ["licenses/hayro-jpeg2000-0.4.1/LICENSE.txt", "licenses/hayro-jpeg2000-0.4.1/README.md"] }
+# The notices of code this crate's own build compiles: Basis Universal,
+# with the zstd, tinyexr, qoi, tinydds and Android ASTC decoder it
+# carries; block_compression's shaders; and the tone-mapping curves
+# src/color.rs ports from three.js. Last, where the source of avif-parse
+# is, which the library carries under MPL-2.0.
+self = { add = [
+    "vendor/basis_universal/LICENSE",
+    "vendor/basis_universal/NOTICE",
+    "vendor/basis_universal/LICENSES/BSD-3-clause.txt",
+    "vendor/basis_universal/LICENSES/MIT.txt",
+    "licenses/basis_universal-2.50/third-party-copyrights.txt",
+    "vendor/block_compression/LICENSE",
+    "licenses/three.js/LICENSE",
+    "licenses/avif-parse-2.1.0/SOURCE.txt",
+] }
+
+# DXC, which mach-dxcompiler-rs downloads and links on 64-bit Windows: the
+# release 2026.10.26+141dd7f.1 of github.com/DouglasDwyer/mach-dxcompiler,
+# built from hexops' fork of Microsoft's DirectXShaderCompiler at 4190bb0.
+# LICENSE, LICENSE-APACHE and LICENSE-MIT are mach-dxcompiler's at that
+# release; the DirectXShaderCompiler files are that fork's LICENSE.TXT and
+# ThirdPartyNotices.txt at 4190bb0.
+[package.metadata.pwrs.license-files.'cfg(all(windows, not(target_arch = "aarch64"), target_env = "msvc"))']
+"mach-dxcompiler-rs@0.1.7+2026.10.26-141dd7f.1" = { add = [
+    "licenses/dxcompiler-2026.10.26-141dd7f/LICENSE",
+    "licenses/dxcompiler-2026.10.26-141dd7f/LICENSE-APACHE",
+    "licenses/dxcompiler-2026.10.26-141dd7f/LICENSE-MIT",
+    "licenses/dxcompiler-2026.10.26-141dd7f/DirectXShaderCompiler-LICENSE.TXT",
+    "licenses/dxcompiler-2026.10.26-141dd7f/DirectXShaderCompiler-ThirdPartyNotices.txt",
+] }
+
+# The crates wgpu-hal's Metal backend links on macOS ship no license file,
+# and the LICENSE.md of their repository, github.com/madsmtm/objc2, names
+# their licenses without the text. licenses/objc2/LICENSE quotes that
+# LICENSE.md and SPDX's text of MIT (spdx/license-list-data 31ba1a5), the
+# license four of them are under and the other four offer beside Zlib and
+# Apache-2.0. LICENSE.md is the same at each crate's commit: block2 0.6.2
+# b4167b5, objc2 0.6.5 d7d2fa2, objc2-encode 4.1.0 8d214f5, and the 0.3.2
+# crates 7b1abfd.
+[package.metadata.pwrs.license-files.'cfg(target_os = "macos")']
+"block2@0.6.2" = "licenses/objc2/LICENSE"
+"objc2@0.6.5" = "licenses/objc2/LICENSE"
+"objc2-core-foundation@0.3.2" = "licenses/objc2/LICENSE"
+"objc2-core-graphics@0.3.2" = "licenses/objc2/LICENSE"
+"objc2-encode@4.1.0" = "licenses/objc2/LICENSE"
+"objc2-foundation@0.3.2" = "licenses/objc2/LICENSE"
+"objc2-metal@0.3.2" = "licenses/objc2/LICENSE"
+"objc2-quartz-core@0.3.2" = "licenses/objc2/LICENSE"
+
+# DXC on Arm64 Windows, where mach-dxcompiler-rs builds none: cargo-pwrs
+# downloads Microsoft's release archive, checks its SHA-256, and ships its
+# dxcompiler.dll beside the library with the archive's license texts in
+# that runtime's notices. Direct3D 12 compiles shaders with the copy
+# pwrs::native_file_path stages for the process.
+[package.metadata.pwrs.native-files.'cfg(all(windows, target_arch = "aarch64"))']
+"dxcompiler.dll" = { url = "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/dxc_2026_09_29.zip", sha256 = "ad31b1fc8443175d204f77a611fdb3ef2ec42759bdc2f1167368de24a4a7e7f1", path = "bin/arm64/dxcompiler.dll", licenses = ["LICENCE-MIT.txt", "LICENSE-LLVM.txt", "LICENSE-MS.txt"] }
+
+# The module's native library, and a Rust library another crate links.
+[lib]
+crate-type = ["cdylib", "rlib"]
+# The doc comments hold PowerShell, not Rust examples.
+doctest = false
+
+# `module` builds the PowerShell module: its cmdlets, classes, enums and
+# export_module!. `static-dxc` links DXC, the DirectX shader compiler,
+# into the library on x86_64 Windows with MSVC; without it, wgpu's
+# Direct3D 12 backend loads a dxcompiler.dll from the PATH or else
+# compiles with FXC, which has no shader model 6 features and cannot
+# compile the BC6H and BC7 encoders. The module on Arm64 Windows
+# loads the dxcompiler.dll it ships instead. `avif` reads .avif files,
+# through avif-decode and rav1d; without it, an .avif file is refused.
+# `jxl` reads JPEG XL files through jxl-oxide, `svg` draws SVG files
+# through resvg, and `pdf` draws a PDF's first page through hayro; without
+# one, its files are refused. A crate that links the library depends on it
+# with default-features = false, carrying none of the module's exports and
+# none of avif-decode, rav1d, jxl-oxide, resvg and hayro, and names
+# static-dxc to keep DXC.
+[features]
+default = ["module", "static-dxc", "avif", "jxl", "svg", "pdf"]
+module = []
+static-dxc = ["wgpu/static-dxc"]
+avif = ["dep:avif-decode"]
+jxl = ["dep:jxl-oxide"]
+svg = ["dep:resvg"]
+pdf = ["dep:hayro"]
+# Merges a Photoshop document's layers where it stores no real composite.
+psd-merge = []
+
+[dependencies]
+# PoWerRuSt from crates.io, imported as pwrs. Build with the cargo-pwrs
+# of the same version.
+pwrs = { package = "PoWerRuSt", version = "0.8.0" }
+# Every backend and shader front end wgpu has natively, and static-dxc
+# through this crate's feature of that name. Each backend compiles only
+# where its platform has it: dx12 on Windows, metal, angle and
+# vulkan-portability on Apple targets, static-dxc on x86_64 Windows with
+# MSVC. trace writes an API trace a device can be opened with; counters
+# and exhaust feed the object counts and the format list. naga-ir hands
+# wgpu the module naga read from SPIR-V, in the clip space the module reads
+# it in, so a device compiles the shader the module checked.
+# Left out: webgpu, webgl, web and fragile-send-sync-non-atomic-wasm
+# (wasm only), drm (presentation to a display; the module draws
+# offscreen), custom (Rust-only entry points), and strict_asserts
+# (internal assertions).
+wgpu = { version = "30.0.1", default-features = false, features = [
+    "std",
+    "parking_lot",
+    "dx12",
+    "vulkan",
+    "gles",
+    "metal",
+    "angle",
+    "vulkan-portability",
+    "noop",
+    "wgsl",
+    "glsl",
+    "spirv",
+    "naga-ir",
+    "counters",
+    "exhaust",
+    "trace",
+] }
+# The shader front and back ends the shader cmdlets use without a device.
+naga = { version = "30.0.1", features = [
+    "wgsl-in",
+    "glsl-in",
+    "spv-in",
+    "wgsl-out",
+    "spv-out",
+    "glsl-out",
+    "hlsl-out",
+    "msl-out",
+    "dot-out",
+] }
+# Enumerates every texture format wgpu has, through wgpu's exhaust feature.
+exhaust = "0.2.7"
+pollster = "1.0.1"
+bytemuck = { version = "1.25.2", features = ["extern_crate_alloc"] }
+half = { version = "2.7.1", features = ["bytemuck"] }
+image = "0.25.10"
+# .exr files written with ZIP compression, in half floats where the texels
+# are 16-bit floats: exr is the codec image reads and writes .exr files
+# through, and image's encoder takes no compression or channel type.
+exr = "1.74.2"
+# .avif files read through rav1d, dav1d's port to Rust: image decodes AVIF
+# only through dav1d's C library, found installed. rav1d's x86-64 assembly
+# is built with nasm, which an x86-64 build needs on its PATH. Linked with
+# the avif feature.
+avif-decode = { version = "3.0.0", default-features = false, optional = true }
+# JPEG XL files read through jxl-oxide, in Rust; its rayon is the one image
+# already brings. Linked with the jxl feature.
+jxl-oxide = { version = "0.12.6", optional = true }
+# SVG files drawn through resvg, with text in the system's fonts, .svgz
+# files and the raster images an SVG embeds. Linked with the svg feature.
+resvg = { version = "0.49.0", optional = true }
+# PDF pages drawn through hayro, in Rust, with PDF's standard fonts and
+# character maps embedded for files that do not carry theirs. Linked with
+# the pdf feature.
+hayro = { version = "0.8.0", optional = true }
+# An image's embedded ICC color profile, RGB, gray or CMYK, converted to
+# sRGB on import with the rendering intent asked for.
+moxcms = "0.9.1"
+# A CMYK JPEG's samples as stored, for its profile to convert, where the
+# image crate decodes CMYK into RGB by formula: the versions image decodes
+# JPEG with.
+zune-jpeg = "0.5.15"
+zune-core = "0.5.3"
+# A TIFF's orientation and ICC profile tags, which the image crate does not
+# read, and its CMYK samples as stored: the version image decodes TIFF with.
+tiff = "0.11.3"
+# A PNG's text chunks, where ImageMagick writes a file's EXIF as "Raw
+# profile type exif", which the image crate does not read: the version
+# image decodes PNG with.
+png = "0.18.1"
+# Texture files read and written whole: DDS through ddsfile, KTX2 through
+# ktx2 (and Basis Universal, vendored, for its supercompressed formats).
+ddsfile = "0.6.0"
+ktx2 = "0.5.0"
+# zlib supercompression in KTX2. zstd is the copy vendor/basis_universal
+# compiles, called through its C functions, so no second copy is linked.
+flate2 = "1.1.10"
+# Block-compressed texels decoded on the CPU for a device without the
+# format's feature: BC by bcdec_rs, BC6H to half floats, and ETC2 by
+# texture2ddecoder. EAC and ASTC have decoders of the module's own.
+texture2ddecoder = "0.1.2"
+bcdec_rs = "0.2.1"
+# BC1-BC7 and BC6H encoded by compute shaders on the GPU: the module runs
+# block_compression's shaders, from vendor/block_compression with the
+# changes its CHANGES.md describes, through pipelines of its own, and takes
+# only the BC6H and BC7 settings from the crate, which without its default
+# features compiles no wgpu code and turns none of wgpu's features on.
+block_compression = { version = "0.11.0", default-features = false, features = ["bc6h", "bc7"] }
+# Lock-free cells for what device callbacks write from any thread and the
+# default device every runspace reads.
+arc-swap = "1.9.3"
+
+# Basis Universal's encoder, transcoder and zstd from vendor/basis_universal.
+[build-dependencies]
+cc = "1.10.0"
+
+# The pixel types avif-decode gives, built by the tests of the AVIF
+# conversion.
+[dev-dependencies]
+imgref = "1.12.3"
+rgb = "0.8.53"
+
+# wgpu-core 30.0.1 with wgpu's fixes for the queue-empty assertion in
+# Device::maintain, which a wait that times out while another thread polls
+# the same device can trip, and for NV12 and P010 textures it left
+# uncleared, which it clears by copies into each plane; and with NV12 and
+# P010 textures of more than one mip level or a dimension other than 2D
+# refused, as Direct3D 12 and Vulkan refuse them.
+# vendor/wgpu-core/CHANGES.md says what changed.
+# A crate that depends on this one takes the patch only by naming it too.
+[patch.crates-io]
+wgpu-core = { path = "vendor/wgpu-core" }
+
+# Whole-program LTO and one codegen unit so pwrs inlines into the
+# cmdlet bodies. panic = "unwind" lets pwrs catch a panic at the
+# boundary and report it as an error instead of ending the host.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "unwind"

@@ -1,0 +1,5 @@
+avif-parse 2.1.0 is covered by the Mozilla Public License, version 2.0,
+whose text this file quotes under avif-parse 2.1.0. This module's library
+contains it unmodified, in Executable Form. Its Source Code Form is available from crates.io, at
+https://crates.io/crates/avif-parse/2.1.0, and from its repository, at
+https://github.com/kornelski/avif-parse.
