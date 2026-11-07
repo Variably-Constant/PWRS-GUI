@@ -1,0 +1,4936 @@
+//! Sens-O-Matic transport carrying the sliding-window RLC erasure code.
+//! Sens-O-Matic is the reliable FEC-UDP protocol; the erasure code is its
+//! swappable detail (like a cipher suite). This module is the variant that
+//! carries the sliding-window Random Linear Code ([`crate::rlc_fec`]): it ships
+//! items as source symbols with interleaved RLC repair symbols, recovering an
+//! isolated loss without a retransmit round trip. A NAK-driven ARQ floor
+//! guarantees eventual delivery for losses the coding window cannot cover. The
+//! public types are `SensOMaticRlcSender` / `SensOMaticRlcReceiver`.
+//!
+//! This is the adaptive, low-latency-primary code; the protocol's other code is
+//! block Cauchy Reed-Solomon ([`crate::udp_bridge`], the `SensOMaticRs*` types).
+//! Both deliver every item in order; the difference is the erasure code: block
+//! RS waits for the rest of a block to recover (often firing a wasted retransmit
+//! first), while the sliding-window RLC recovers from the next repair. The two
+//! share the GF(2^8) field and the committed SIMD multiply ladder.
+//!
+//! Wire formats (first byte is the packet type):
+//!
+//! ```text
+//! DATA     [10] [conn_id u64-le] [source_id u32-le] [send_us u32-le]
+//!               [symbol bytes]                              (17-byte header)
+//! `REPAIR` [11] [conn_id u64-le] [repair_key u32-le]
+//!               [first_source_id u32-le] [window_size u16-le] [dt u8]
+//!               [repair payload]                            (20-byte header)
+//! NAK      [12] [missing source_id u32-le]*        (receiver -> sender)
+//! ACK      [13] [delivered_through u32-le] [sack u64-le]   (13 bytes)
+//! FEEDBACK [14] [loss_q8 u8] [burst_q8 u8] [cong_q8 u8]
+//!               [rate_q16 u16-le] [cap_q16 u16-le]          (8 bytes)
+//! ```
+//!
+//! The connection id follows the type byte on both data-carrying frames so
+//! a session is routed by id rather than by 4-tuple, which is what lets it
+//! survive a peer address change (`frame_conn_id`). The reverse-path
+//! frames carry none: they are matched to a session by the socket they
+//! arrive on.
+//!
+//! The two feedback frames are read by length, so a shorter one from an
+//! older peer is a frame with its tail absent rather than a malformed one.
+//! An `ACK` is acted on from 5 bytes and its selective-acknowledgment
+//! bitmap only from 13; a `FEEDBACK` is acted on from 4 bytes, its rate
+//! only from 6 and its packet-pair capacity only from 8. The sender here
+//! always writes the full length of each.
+//!
+//! A symbol is a fixed `symbol_len` buffer holding a `u16` length prefix, the
+//! item bytes, then zero padding, so the receiver strips padding exactly.
+//!
+//! The `send_us` field is the sender's microseconds-since-start stamp, which the
+//! receiver differences against its own arrival clock to recover a relative
+//! one-way trip time for the [`crate::loss_class_sensor`] Spike arm (a constant
+//! clock offset cancels in the min/max range). It rides the DATA header, not the
+//! coded symbol, so repair linear combinations are unaffected.
+//!
+//! The FEEDBACK frame is the adaptive-control feedback path: the receiver fits
+//! the loss rate, the Gilbert-Elliott mean burst length, and the congestion
+//! share of recent loss, quantizes each into a byte, and ships them back; the
+//! sender turns them into a [`crate::fusion::SensorSnapshot`] and runs the
+//! [`crate::rlc_control::RlcController`] to retune the window, the repair
+//! cadence (code rate), and the coefficient density - the sensing-driven half of
+//! the adaptive RLC primary.
+
+use crate::burst_model_sensor::BurstModel;
+use crate::fusion::SensorSnapshot;
+use crate::loss_class_sensor::LossClassSensor;
+use crate::rlc_control::RlcController;
+use crate::rlc_fec::{RepairSymbol, RlcDecoder, RlcEncoder};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::io;
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::time::{Duration, Instant};
+
+const PKT_RLC_DATA: u8 = 10;
+const PKT_RLC_REPAIR: u8 = 11;
+const PKT_RLC_NAK: u8 = 12;
+const PKT_RLC_ACK: u8 = 13;
+const PKT_RLC_FEEDBACK: u8 = 14;
+/// Path-validation pair: the receiver sends a `PATH_CHALLENGE`
+/// (`[type][8 conn-id][8 nonce]`) to a candidate new peer address; the sender
+/// echoes the nonce in a `PATH_RESPONSE` of the same shape, proving it can
+/// receive at the new address. Cleartext-framed (it carries no payload to
+/// protect) but the nonce is unpredictable, so an off-path attacker cannot
+/// forge a response for a challenge it never saw.
+/// Path-validation control frames. Outside the contiguous data range, so a
+/// shared-socket demux routes them by type rather than by range.
+pub(crate) const PKT_RLC_PATH_CHALLENGE: u8 = 18;
+pub(crate) const PKT_RLC_PATH_RESPONSE: u8 = 19;
+
+/// PATH_CHALLENGE / PATH_RESPONSE body: type byte + connection id (u64) + an
+/// 8-byte nonce.
+pub(crate) const PATH_FRAME_LEN: usize = 1 + 8 + 8;
+
+/// Anti-amplification factor (RFC 9000 §8): until a new peer address validates,
+/// the receiver sends at most this multiple of the bytes it received from that
+/// address, so a spoofed source address cannot turn the receiver into a
+/// reflector toward a victim.
+const AMPLIFICATION_FACTOR: u64 = 3;
+
+/// How long the receiver waits for a `PATH_RESPONSE` before declaring the new
+/// address unreachable and reverting to the previous one (a spoofed move never
+/// answers; a genuine migration answers within a round trip).
+const CHALLENGE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Minimum interval between resends of one admission challenge. Bounds the
+/// challenges a candidate receives per arm/expire cycle to
+/// `CHALLENGE_TIMEOUT / ADMISSION_RESEND_INTERVAL`, so a responder that
+/// services its socket on a coarse cadence drains tens of frames, not a
+/// poll-rate flood, before its answer.
+const ADMISSION_RESEND_INTERVAL: Duration = Duration::from_millis(50);
+
+/// One admission candidate: the address to validate, the nonce it must echo,
+/// when the challenge was armed (expiry clock) and when it was last resent
+/// (resend pacing clock).
+struct PendingAdmission {
+    addr: SocketAddr,
+    nonce: u64,
+    armed_at: Instant,
+    last_sent: Option<Instant>,
+}
+
+/// Consecutive latched-reset receives one drain absorbs before giving up. Each
+/// reset reports a previous send to a dead peer, so the drain reads past them
+/// to reach datagrams from peers that are still alive.
+const MAX_DRAIN_RESETS: usize = 64;
+
+/// Bytes the sender reads each reverse-path control frame into. A longer
+/// frame reaches it cut short.
+const CTRL_BUF: usize = 256;
+
+/// Bytes the sealed envelope (`[17][pn u64-le][inner datagram + tag]`) adds
+/// around an inner datagram: the type byte, the packet number and the 16-byte
+/// AEAD tag.
+const SEALED_OVERHEAD: usize = 1 + 8 + 16;
+#[cfg(feature = "tls")]
+const _: () = assert!(SEALED_OVERHEAD == 1 + 8 + crate::rlc_crypto::TAG_LEN);
+
+/// The most source ids one `NAK` carries and still reaches a sender whole,
+/// sealed or not.
+const NAK_MAX_IDS: usize = (CTRL_BUF - SEALED_OVERHEAD - 1) / 4;
+
+/// How many ids below the lowest id seen a start probe names at first: the
+/// sixteen an ordinary NAK round carries. It doubles each time the whole range
+/// came back, up to what one `NAK` holds beside id 0 and the canary.
+const START_PROBE_DEPTH: u32 = 16;
+const START_PROBE_MAX_DEPTH: u32 = NAK_MAX_IDS as u32 - 2;
+
+/// Consecutive empty canary rounds before a window starts above id 0.
+const START_PROBE_ROUNDS: u32 = 2;
+
+/// TLS handshake flight (cleartext, before keys exist) + its ack, and the AEAD
+/// envelope `[17][pn u64-le][sealed inner datagram + tag]` for the data phase.
+#[cfg(feature = "tls")]
+const PKT_RLC_CRYPTO: u8 = 15;
+#[cfg(feature = "tls")]
+const PKT_RLC_CRYPTO_ACK: u8 = 16;
+#[cfg(feature = "tls")]
+const PKT_RLC_SECURE: u8 = 17;
+
+/// DATA header: type byte + connection id (u64) + source id (u32) + send-
+/// timestamp (u32). The connection id decouples the session from the 4-tuple, so
+/// a client that rebinds (NAT / interface change) keeps its session: the
+/// receiver routes by the id, not the address.
+const DATA_HDR: usize = 1 + 8 + 4 + 4;
+
+/// Packet-pair (dispersion) capacity-probe tuning.
+/// `PAIR_RING_CAP` - how many recent above-floor consecutive-id gaps to keep.
+/// `PAIR_GAP_FLOOR_US` - reject gaps tighter than this as NAPI/GRO batch noise:
+///   a 12us gap for a ~1.5kB packet implies ~985 Mbit, physically impossible on
+///   the target paths, so anything tighter is a same-softirq-poll artifact.
+/// `PAIR_PERCENTILE_NUM/DEN` - the low percentile of the floored gaps to read
+///   the bottleneck dispersion from (25th: just above the batch noise, at the
+///   tight-pair cluster, robust to a few sub-dispersion jitter readings).
+const PAIR_RING_CAP: usize = 512;
+const PAIR_GAP_FLOOR_US: f64 = 12.0;
+const PAIR_PERCENTILE_NUM: usize = 25;
+const PAIR_PERCENTILE_DEN: usize = 100;
+/// Safe band for the NAK-adapted cruise fraction. The cliff sits at ~0.79x the
+/// raw capacity, so `PAIR_FRACTION_HI` stays just under it (push there only when
+/// the FEC reports the path is clean); `PAIR_FRACTION_LO` is the widest margin
+/// the controller backs off to under heavy loss. Anchored to the loss-
+/// independent capacity, a fraction in this band is always a sub-cliff pace.
+const PAIR_FRACTION_LO: f64 = 0.62;
+const PAIR_FRACTION_HI: f64 = 0.78;
+
+/// Sliding-window length for the loss rate the controller provisions FEC against
+/// (recent source-id outcomes). ~0.4s of symbols on a 30 Mbit link - reactive to
+/// a real change in loss, robust to a single recovered-symbol delivery burst.
+const LOSS_WINDOW: usize = 1024;
+/// Denominator floor for the windowed loss rate: until the window holds this many
+/// samples, a few startup losses divide by this (not by the tiny actual count),
+/// so a cold-start cluster cannot read as catastrophic loss and slam FEC to max.
+const LOSS_WINDOW_MIN_FILL: usize = 256;
+
+/// Derive a per-connection id from the invariant TSC, the wall clock, the pid
+/// and the local port, so two processes starting in the same instant draw
+/// different ids.
+///
+/// The wall clock alone is not enough: its granularity is coarse enough that
+/// 1000 draws in a loop yield 484 distinct values on a Windows host, and two
+/// peers that also share a port then collide. A production server facing
+/// untrusted peers would draw this from a CSPRNG.
+fn derive_conn_id(local_port: u16) -> u64 {
+    let kind = if crate::ordering::has_invariant_tsc() {
+        crate::ordering::StampKind::Tsc
+    } else {
+        crate::ordering::StampKind::Monotonic
+    };
+    let tsc = crate::ordering::stamp_now(kind);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut x = tsc
+        ^ nanos.rotate_left(32)
+        ^ ((std::process::id() as u64) << 16)
+        ^ ((local_port as u64) << 48);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+/// Socket buffer sizing so a send burst does not overflow the kernel UDP queue
+/// and manufacture loss on a fast link.
+const SOCK_BUF: usize = 4 * 1024 * 1024;
+
+/// Sockets whose kernel refused the [`SOCK_BUF`] enlargement of a send or
+/// receive buffer, summed over the process. A refusal leaves the socket at
+/// the kernel's default size, where a send burst can overflow the queue and
+/// read as link loss; a FreeBSD default `kern.ipc.maxsockbuf` refuses 4 MiB.
+static SOCKET_BUFFER_REFUSALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many socket buffer enlargements the kernel has refused in this
+/// process. A count above zero on a host that then reports loss on a quiet
+/// link is the buffer, not the network.
+pub fn socket_buffer_refusals() -> u64 {
+    SOCKET_BUFFER_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Enlarge a socket's send / receive buffers to [`SOCK_BUF`]. A refusal is
+/// counted in [`socket_buffer_refusals`] and the socket keeps the kernel
+/// default: the transport still runs, with less headroom for bursts.
+pub(crate) fn set_buffers(sock: &UdpSocket) {
+    set_buffers_to(sock, SOCK_BUF);
+}
+
+/// [`set_buffers`] at a caller's size, for the transports that ask for
+/// more than [`SOCK_BUF`]; refusals count in the same tally.
+pub(crate) fn set_buffers_to(sock: &UdpSocket, bytes: usize) {
+    let s = socket2::SockRef::from(sock);
+    if s.set_recv_buffer_size(bytes).is_err() {
+        SOCKET_BUFFER_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if s.set_send_buffer_size(bytes).is_err() {
+        SOCKET_BUFFER_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    // A peer that closes its socket makes this one's next recv fail
+    // with WSAECONNRESET on Windows, costing a recv attempt for every
+    // ICMP the departure draws.
+    crate::dgram::quiet_icmp_connreset(sock);
+}
+
+/// Send one datagram, treating `WouldBlock`/EAGAIN - a full send buffer or
+/// qdisc, i.e. transient back-pressure - as "retry shortly" rather than a fatal
+/// error, the way a production UDP stack (quinn) does. When the kernel send
+/// buffer is smaller than the in-flight window (a default-configured host caps
+/// `SO_SNDBUF` at `wmem_max`, often ~208 KB), a burst overruns the buffer and
+/// EAGAIN is the correct back-pressure signal, not a failure. Bounded so a
+/// genuinely wedged path still surfaces an error.
+fn send_with_retry(
+    sock: &crate::dgram::DgramSock,
+    wire: &[u8],
+    peer: SocketAddr,
+) -> io::Result<()> {
+    let start = Instant::now();
+    let mut backoff = Duration::from_micros(20);
+    loop {
+        match sock.send_to(wire, peer) {
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if start.elapsed() > Duration::from_secs(30) {
+                    return Err(e);
+                }
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(Duration::from_millis(1));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// GSO-batch variant of [`send_with_retry`]: ships `batch` as one `sendmsg`,
+/// retrying on transient `WouldBlock`/EAGAIN back-pressure.
+fn send_gso_with_retry(
+    sock: &crate::dgram::DgramSock,
+    batch: &[u8],
+    seg: u16,
+    peer: SocketAddr,
+) -> io::Result<()> {
+    let start = Instant::now();
+    let mut backoff = Duration::from_micros(20);
+    loop {
+        match sock.send_gso(batch, seg, peer) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if start.elapsed() > Duration::from_secs(30) {
+                    return Err(e);
+                }
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(Duration::from_millis(1));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+// Kernel RX timestamps, source-address decoding, and the `recvmsg`-based
+// receive that carries the `SO_TIMESTAMPNS` arrival time now live in the
+// `dgram` backend (so they apply to both the plain-UDP and io_uring paths)
+// and are reached through `DgramSock::recv_with_kts`.
+
+/// AEAD-seal `inner` into a `PKT_RLC_SECURE` wire datagram - a type byte, the
+/// 64-bit packet number, then the ciphertext-with-tag. The whole inner datagram
+/// (type byte and all) is encrypted, so the FEC stays over cleartext and the
+/// wire reveals only the packet number.
+#[cfg(feature = "tls")]
+fn secure_wrap(crypto: &crate::rlc_crypto::CryptoState, inner: &[u8]) -> io::Result<Vec<u8>> {
+    let mut payload = inner.to_vec();
+    let pn = crypto
+        .seal(&mut payload)
+        .map_err(io::Error::other)?;
+    let mut wire = Vec::with_capacity(9 + payload.len());
+    wire.push(PKT_RLC_SECURE);
+    wire.extend_from_slice(&pn.to_le_bytes());
+    wire.extend_from_slice(&payload);
+    Ok(wire)
+}
+
+/// Open a `PKT_RLC_SECURE` datagram into its cleartext inner datagram, or `None`
+/// if it is not a sealed frame or fails to authenticate.
+#[cfg(feature = "tls")]
+fn secure_unwrap(crypto: &crate::rlc_crypto::CryptoState, pkt: &[u8]) -> Option<Vec<u8>> {
+    if pkt.len() < 9 || pkt[0] != PKT_RLC_SECURE {
+        return None;
+    }
+    let pn = u64::from_le_bytes(pkt[1..9].try_into().ok()?);
+    let mut payload = pkt[9..].to_vec();
+    let n = crypto.open(pn, &mut payload).ok()?;
+    payload.truncate(n);
+    Some(payload)
+}
+
+/// The reliability layer under one peer's TLS handshake: sequenced cleartext
+/// `PKT_RLC_CRYPTO` flights, retransmitted until acked, fed to the TLS state
+/// in order. The blocking single-peer [`drive_handshake`] steps one of these
+/// over its own recv loop; the multi-peer listen path holds one per dialing
+/// peer and steps each from the demux thread, so the wire reliability lives
+/// in one place. The `CryptoState` is borrowed per call rather than owned:
+/// the caller's state stays armed whatever happens to the handshake, and a
+/// state that is present but incomplete refuses to seal, where one consumed
+/// on an error path would leave the transport sending cleartext.
+#[cfg(feature = "tls")]
+pub(crate) struct HandshakeMachine {
+    next_send_seq: u32,
+    next_recv_seq: u32,
+    /// Unacked outbound flights, each `(seq, bytes)`; retransmitted until acked.
+    outbox: Vec<(u32, Vec<u8>)>,
+    start: Instant,
+    last_send: Option<Instant>,
+}
+
+#[cfg(feature = "tls")]
+impl HandshakeMachine {
+    /// A machine over `crypto`. A client queues its opening flight at once; a
+    /// server has nothing to send until the peer's ClientHello arrives.
+    pub(crate) fn new(crypto: &mut crate::rlc_crypto::CryptoState, is_client: bool) -> Self {
+        let mut m = Self {
+            next_send_seq: 0,
+            next_recv_seq: 0,
+            outbox: Vec::new(),
+            start: Instant::now(),
+            last_send: None,
+        };
+        if is_client {
+            m.queue_outgoing(crypto);
+        }
+        m
+    }
+
+    fn queue_outgoing(&mut self, crypto: &mut crate::rlc_crypto::CryptoState) {
+        for f in crypto.take_outgoing() {
+            self.outbox.push((self.next_send_seq, f));
+            self.next_send_seq += 1;
+        }
+        self.last_send = None; // send the new flights at once
+    }
+
+    /// Feed one inbound crypto datagram (first byte 15 or 16) and return the
+    /// frames to send in response: an ack, and nothing for an ack. A frame
+    /// ahead of the expected sequence is ignored (the peer retransmits it);
+    /// a flight the TLS state rejects is the handshake failing.
+    pub(crate) fn on_datagram(
+        &mut self,
+        crypto: &mut crate::rlc_crypto::CryptoState,
+        pkt: &[u8],
+    ) -> Result<Vec<Vec<u8>>, String> {
+        let mut replies = Vec::new();
+        if pkt.len() < 5 {
+            return Ok(replies);
+        }
+        let seq = u32::from_le_bytes([pkt[1], pkt[2], pkt[3], pkt[4]]);
+        match pkt[0] {
+            PKT_RLC_CRYPTO if seq <= self.next_recv_seq => {
+                let mut ack = Vec::with_capacity(5);
+                ack.push(PKT_RLC_CRYPTO_ACK);
+                ack.extend_from_slice(&seq.to_le_bytes());
+                replies.push(ack);
+                if seq == self.next_recv_seq {
+                    crypto.read_handshake(&pkt[5..])?;
+                    self.next_recv_seq += 1;
+                    self.queue_outgoing(crypto);
+                }
+            }
+            PKT_RLC_CRYPTO_ACK => self.outbox.retain(|(s, _)| *s != seq),
+            _ => {}
+        }
+        Ok(replies)
+    }
+
+    /// The unacked flights to (re)transmit, or empty when the 100ms timer is
+    /// not due. Due immediately on construction and after each new flight.
+    pub(crate) fn due_flights(&mut self) -> Vec<Vec<u8>> {
+        let due = self.last_send.map(|t| t.elapsed() > Duration::from_millis(100)).unwrap_or(true);
+        if !due || self.outbox.is_empty() {
+            return Vec::new();
+        }
+        self.last_send = Some(Instant::now());
+        self.outbox
+            .iter()
+            .map(|(seq, f)| {
+                let mut pkt = Vec::with_capacity(5 + f.len());
+                pkt.push(PKT_RLC_CRYPTO);
+                pkt.extend_from_slice(&seq.to_le_bytes());
+                pkt.extend_from_slice(f);
+                pkt
+            })
+            .collect()
+    }
+
+    /// `crypto` has the 1-RTT keys and every flight this side sent is acked.
+    pub(crate) fn is_complete(&self, crypto: &crate::rlc_crypto::CryptoState) -> bool {
+        crypto.is_complete() && self.outbox.is_empty()
+    }
+
+    /// Past the 10s handshake deadline, so an abandoned peer is not held.
+    pub(crate) fn timed_out(&self) -> bool {
+        self.start.elapsed() > Duration::from_secs(10)
+    }
+
+    /// The ack for a peer's flight after this side has completed, or `None`
+    /// for anything else. This side completes once its keys derive and its
+    /// own flights are acked, which on a server is before the peer's final
+    /// flight arrives - so that flight lands here, at the expected sequence,
+    /// and is acked without being read, exactly as [`drive_handshake`]'s
+    /// grace loop acks it. It touches no TLS state, so it serves a machine
+    /// whose crypto has moved on to the data phase.
+    pub(crate) fn ack_replay(&self, pkt: &[u8]) -> Option<Vec<u8>> {
+        if pkt.len() < 5 || pkt[0] != PKT_RLC_CRYPTO {
+            return None;
+        }
+        let seq = u32::from_le_bytes([pkt[1], pkt[2], pkt[3], pkt[4]]);
+        if seq > self.next_recv_seq {
+            return None;
+        }
+        let mut ack = Vec::with_capacity(5);
+        ack.push(PKT_RLC_CRYPTO_ACK);
+        ack.extend_from_slice(&seq.to_le_bytes());
+        Some(ack)
+    }
+
+    /// Flights this machine has consumed. A completed server has consumed at
+    /// least the ClientHello, so a crypto flight arriving at sequence 0
+    /// afterward is a fresh handshake from the same address, not a replay.
+    pub(crate) fn recv_seq(&self) -> u32 {
+        self.next_recv_seq
+    }
+}
+
+/// Drive the TLS handshake to completion over `sock`, carrying each level's
+/// `write_hs` flight in a reliable (retransmitted, acked, in-order) cleartext
+/// `PKT_RLC_CRYPTO` exchange. The client sends first; the server (peer `None`
+/// initially) learns its peer from the first flight. Returns the peer once the
+/// 1-RTT keys are derived on this side.
+#[cfg(feature = "tls")]
+pub(crate) fn drive_handshake(
+    sock: &crate::dgram::DgramSock,
+    mut peer: Option<SocketAddr>,
+    crypto: &mut crate::rlc_crypto::CryptoState,
+    is_client: bool,
+) -> io::Result<SocketAddr> {
+    let mut m = HandshakeMachine::new(crypto, is_client);
+    let mut buf = vec![0u8; 8192];
+    while !m.is_complete(crypto) {
+        if m.timed_out() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "tls handshake timeout"));
+        }
+        // (Re)transmit the unacked flights on the machine's timer.
+        if let Some(p) = peer {
+            for pkt in m.due_flights() {
+                sock.send_to(&pkt, p)?;
+            }
+        }
+        match sock.recv_from(&mut buf) {
+            Ok((n, from)) if n >= 5 => {
+                peer.get_or_insert(from);
+                let replies = m
+                    .on_datagram(crypto, &buf[..n])
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                for r in replies {
+                    sock.send_to(&r, from)?;
+                }
+            }
+            Ok(_) => {}
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(ref e) if e.kind() == io::ErrorKind::TimedOut => {}
+            Err(ref e) if e.kind() == io::ErrorKind::ConnectionReset => {}
+            Err(e) => return Err(e),
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // Keep acking for a short grace so a peer retransmitting its final
+    // flight (because our ack was lost) still converges - but exit the
+    // instant the peer sends a non-handshake frame, since that proves it
+    // got our ack and moved to data (and avoids a long window where its
+    // early data frames would be dropped here).
+    let grace = Instant::now();
+    while grace.elapsed() < Duration::from_millis(200) {
+        match sock.recv_from(&mut buf) {
+            Ok((n, from)) if n >= 5 && buf[0] == PKT_RLC_CRYPTO => {
+                let seq = u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]);
+                let mut ack = Vec::with_capacity(5);
+                ack.push(PKT_RLC_CRYPTO_ACK);
+                ack.extend_from_slice(&seq.to_le_bytes());
+                sock.send_to(&ack, from)?;
+            }
+            Ok((n, _)) if n >= 1 && buf[0] != PKT_RLC_CRYPTO_ACK => break,
+            Ok(_) => {}
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::TimedOut => {}
+            Err(ref e) if e.kind() == io::ErrorKind::ConnectionReset => {}
+            Err(e) => return Err(e),
+        }
+    }
+    peer.ok_or_else(|| io::Error::other("no peer"))
+}
+
+/// The connection id a PATH_RESPONSE carries (the `u64` after the type byte),
+/// or `None` for any other frame or a truncated one. A migration answer names
+/// the window it validates, so it is routed to that window and no other.
+fn path_response_conn_id(inner: &[u8]) -> Option<u64> {
+    if inner.len() < PATH_FRAME_LEN || inner[0] != PKT_RLC_PATH_RESPONSE {
+        return None;
+    }
+    let mut id = [0u8; 8];
+    id.copy_from_slice(&inner[1..9]);
+    Some(u64::from_le_bytes(id))
+}
+
+/// The connection id of a `DATA` / `REPAIR` inner frame (the `u64` after the type
+/// byte), or `None` for any other frame. Used to route a session by id rather
+/// than 4-tuple, so it survives a peer address change.
+fn frame_conn_id(inner: &[u8]) -> Option<u64> {
+    if inner.len() >= 9 && (inner[0] == PKT_RLC_DATA || inner[0] == PKT_RLC_REPAIR) {
+        Some(u64::from_le_bytes(inner[1..9].try_into().ok()?))
+    } else {
+        None
+    }
+}
+
+/// Bytes a symbol reserves for the `u16` item-length prefix.
+const LEN_PREFIX: usize = 2;
+
+/// Pack `item` into a fixed `symbol_len` symbol: a `u16` length prefix, the
+/// item bytes, then zero padding. `item` must fit `symbol_len - 2`.
+fn pack_symbol(item: &[u8], symbol_len: usize) -> Vec<u8> {
+    debug_assert!(item.len() + LEN_PREFIX <= symbol_len);
+    let mut sym = vec![0u8; symbol_len];
+    sym[0..2].copy_from_slice(&(item.len() as u16).to_le_bytes());
+    sym[2..2 + item.len()].copy_from_slice(item);
+    sym
+}
+
+/// Recover the item bytes from a symbol (strip the length prefix and padding).
+fn unpack_symbol(sym: &[u8]) -> Vec<u8> {
+    if sym.len() < LEN_PREFIX {
+        return Vec::new();
+    }
+    let len = u16::from_le_bytes([sym[0], sym[1]]) as usize;
+    let end = (LEN_PREFIX + len).min(sym.len());
+    sym[LEN_PREFIX..end].to_vec()
+}
+
+/// Sender side of the RLC transport.
+pub struct SensOMaticRlcSender {
+    sock: crate::dgram::DgramSock,
+    peer: SocketAddr,
+    enc: RlcEncoder,
+    symbol_len: usize,
+    /// BBR congestion control: paces the send rate to the measured bottleneck
+    /// bandwidth and bounds in-flight to the BDP, keeping the bottleneck queue
+    /// shallow (low latency under bufferbloat). Fed the per-symbol rate-sample
+    /// snapshots in `bbr_samples` on send, and the delivered set on each ACK.
+    bbr: crate::bbr::Bbr,
+    bbr_samples: HashMap<u32, crate::bbr::PacketSample>,
+    /// Source symbols held for ARQ retransmission, keyed by source id.
+    sent: BTreeMap<u32, Vec<u8>>,
+    /// Last transmit instant per source id, so a retransmit can be suppressed.
+    /// The
+    /// receiver re-NAKs a still-missing id every ~1ms, but a retransmit takes a
+    /// round trip to be confirmed - so an un-suppressed sender resends the same
+    /// symbol ~RTT/1ms (~30x) before the ACK clears it, a self-amplifying flood
+    /// that drives congestion collapse under loss. A symbol is only (re)sent if
+    /// it has not been sent within ~1.2 RTT.
+    last_tx: HashMap<u32, Instant>,
+    /// Highest contiguous source id the receiver has delivered.
+    acked_through: u32,
+    /// The source id of the most recently packed item, `u32::MAX`
+    /// before the first.
+    last_sid: u32,
+    /// Cumulative `DATA` and `REPAIR` datagrams handed to the socket layer
+    /// without error.
+    wire_datagrams: u64,
+    /// Cumulative NAK frames processed by the pump.
+    naks_seen: u64,
+    /// Source symbols sent again, whatever asked for it: a NAK, the RTO on
+    /// a stalled cumulative ACK, or the end-of-stream tail.
+    retransmits: u64,
+    /// Cumulative ACK frames processed by the pump.
+    acks_seen: u64,
+    /// Cumulative PATH_CHALLENGE frames the pump echoed.
+    challenges_seen: u64,
+    /// Frames the pump's default arm dropped, and the last such type
+    /// byte.
+    other_seen: u64,
+    last_other_byte: u8,
+    /// Max source symbols in flight (sent but not yet delivered) before the
+    /// sender paces, so a burst cannot overrun the receiver or the kernel
+    /// socket buffer and manufacture loss. Used as the static cap, and as the
+    /// bootstrap window before BBR has a bandwidth estimate when `bbr_cwnd`.
+    flow_window: u32,
+    /// When set, the in-flight bound is BBR's dynamic congestion window
+    /// (`cwnd_gain * BtlBw * RTprop`) instead of the static `flow_window`, so
+    /// the window self-sizes to the path's BDP and ProbeBW grows it to find
+    /// more bandwidth (escaping the static-window fixed point). Paired with
+    /// pacing (below) so the cwnd-bounded sends spread over the RTT instead of
+    /// bursting and manufacturing loss.
+    bbr_cwnd: bool,
+    /// Static rate pacing: spread the in-flight window evenly over the RTT
+    /// (one symbol every `min_rtt / window`) instead of ack-clocked bursting.
+    /// This lets a larger `flow_window` fill the path BDP without bursting the
+    /// shallow bottleneck buffer (the unpaced cliff) - the way a paced sender
+    /// keeps instantaneous queue depth low while in-flight rises to the BDP.
+    /// Distinct from `bbr_cwnd` (which paces at BBR's measured rate); when both
+    /// are set, BBR wins.
+    paced: bool,
+    /// Fixed-rate pacing target in bytes per second (0 = off). When set, the sender
+    /// paces the wire at exactly this rate regardless of window/RTT - the
+    /// The offensive FEC-push lever: drive the wire toward the path's raw capacity
+    /// (past a loss-based controller's conservative operating point), and let
+    /// the FEC recover whatever the bottleneck drops near the ceiling. Takes
+    /// priority over `bbr_cwnd` and `paced`; pair with a large `flow_window` so
+    /// the window does not gate before the rate does.
+    pace_bps: f64,
+    /// Adaptive FEC-push: auto-tune `pace_bps` as a closed loop instead of a
+    /// fixed target. Probes the rate up while the path absorbs what is paced
+    /// (delivered rate keeps up, the FEC recovering the induced loss), and backs
+    /// off to the delivered rate the moment the path cannot keep up - so it
+    /// fills the headroom a loss-based controller leaves and survives a path
+    /// drop (which sinks the static pacer). The offensive use of FEC: probe
+    /// harder than BBR because the coding absorbs the probe loss.
+    adaptive_push: bool,
+    /// Last time the adaptive loop adjusted `pace_bps`.
+    last_push_adapt: Instant,
+    /// Adaptive `pace_bps` clamps (bytes/sec): floor so a transient stall cannot
+    /// collapse the rate to zero, ceiling so a probe cannot run away unbounded.
+    push_min_bps: f64,
+    push_max_bps: f64,
+    /// Latest forward-loss fraction the receiver measured and fed back over the
+    /// control plane (FEEDBACK frame). The adaptive push drives the rate from
+    /// this real measurement against the FEC's recovery capacity, not from an
+    /// inferred ack-frontier rate (which lags and backs off prematurely).
+    fb_loss: f64,
+    /// Latest delivered (goodput) rate in bytes per second the receiver measured and
+    /// fed back. The ground-truth path signal: it plateaus at the path capacity
+    /// (the bufferless cliff shows as a rate plateau, not a usable loss
+    /// gradient), so the adaptive push paces just above it to fill the path
+    /// without the runaway overshoot the binary loss signal caused.
+    fb_rate_bps: f64,
+    /// Latest congestion fraction the receiver's Biaz/Spike loss classifier fed
+    /// back (the RFC 9265 signal): the share of loss attributable to congestion
+    /// (delay-correlated) rather than random/path loss. The offensive push fills
+    /// through random loss (the FEC recovers it) but yields to congestion loss
+    /// (the FEC must not hide it), so this gates rate growth vs back-off.
+    fb_cong: f64,
+    /// Best delivered (goodput) rate seen, in bytes per second - the find-then-cruise
+    /// estimate of the path capacity. The push probes the pace up to locate the
+    /// cliff (where goodput stops rising / collapses), then cruises below it;
+    /// a goodput collapse vs this best is the overshoot signal that triggers a
+    /// hard cut. Decays slowly so a transient high does not pin the cruise rate.
+    max_delivered_bps: f64,
+    /// Packet-pair capacity estimate, in bytes per second, the receiver measured from the
+    /// tightest consecutive-id arrival gap and fed back. Independent of loss
+    /// (the bottleneck imposes the gap regardless of drops), so the adaptive
+    /// push cruises just under it - no rate probing into the sharp cliff, which
+    /// is what every loss-confounded signal collapsed on. 0 until measured.
+    fb_capacity_bps: f64,
+    /// Source-symbol counter for the packet-pair probe: every `PAIR_PROBE_EVERY`
+    /// symbols the sender ships the next one back-to-back (skips its pacing gap)
+    /// so the receiver sees a tight pair and can read the bottleneck dispersion.
+    pair_probe_ctr: u32,
+    /// Cruise target as a fraction of the measured raw capacity. The bufferless
+    /// cliff sits at ~0.79x the raw rate, so this stays below it; default 0.70
+    /// (proven-safe pace under the cliff), overridable via `SUBETHA_PAIR_FRACTION`
+    /// for path tuning. Clamped to [0.30, 0.78] so it can never target the cliff.
+    push_fraction: f64,
+    /// Post-cut cooldown (adaptive steps): after a goodput collapse the push
+    /// cruises (holds the cut rate, no probe) for this many steps before gently
+    /// probing again, so it does not sawtooth straight back into the sharp cliff
+    /// - on a knife-edge path, re-probing every RTT just re-collapses.
+    push_cooldown: u32,
+    /// NAK'd source ids received since the last adaptive step - a NAK is a
+    /// direct FEC-miss signal (the coding could not recover a loss), so this
+    /// drives the coordinated loss-aware control: NAKs => parity too thin =>
+    /// raise parity and back off the pace together.
+    naks_recv_window: u32,
+    /// Source symbols sent since the last adaptive step (the NAK-rate
+    /// denominator).
+    sent_window: u32,
+    /// Earliest instant the next symbol may be sent, when pacing at BBR's
+    /// target rate (`pacing_gain * BtlBw`). `None` disables pacing (static mode).
+    next_send: Option<Instant>,
+    /// UDP GSO (`UDP_SEGMENT`) batching of the steady-state DATA path: when on,
+    /// consecutive equal-size sealed DATA datagrams accumulate in `gso_buf` and
+    /// ship in one `sendmsg` (the kernel slices them), collapsing the per-symbol
+    /// syscall + stack-traversal cost. The batch flushes on a repair boundary
+    /// (repairs are a different size), when it reaches `gso_max` segments, before
+    /// a flow-window wait, and at drain - so FEC timing is unchanged (a repair
+    /// still ships immediately after its source window).
+    gso: bool,
+    /// Accumulated sealed DATA datagrams (each exactly `gso_seg` bytes).
+    gso_buf: Vec<u8>,
+    /// Segments currently buffered in `gso_buf`.
+    gso_n: usize,
+    /// The uniform sealed-DATA datagram size, learned on the first enqueue.
+    gso_seg: usize,
+    /// Max segments per GSO batch: `min(64, 65535 / gso_seg)` so the super-buffer
+    /// fits one IP datagram and stays within UDP's 64-segment ceiling.
+    gso_max: usize,
+    /// Monotonic start, for the per-DATA send-timestamp the receiver turns into
+    /// a relative one-way trip time.
+    start: Instant,
+    /// The sensing-driven controller: each FEEDBACK frame retunes the encoder's
+    /// window / cadence / density through it.
+    controller: RlcController,
+    /// When set, the controller is held at its initial parameters (the static
+    /// baseline for an adaptive-vs-static A/B); FEEDBACK is still pumped for
+    /// telemetry but never changes the coding.
+    static_params: bool,
+    /// Diagnostic: when `SUBETHA_FEC_DEBUG` is set, log each coding-parameter
+    /// decision the sensing controller makes (loss/burst/cong in -> window/step/
+    /// density/coding_on out) so the under-loss behavior can be read directly.
+    fec_debug: bool,
+    /// Times the live coding parameters actually changed (telemetry).
+    adapt_count: u64,
+    /// FEEDBACK frames received (telemetry).
+    feedback_recv: u64,
+    /// One in-flight RTprop probe: the source id and the instant it was sent.
+    /// When an ACK advances past the probe id, `now - probe_time` is an RTT
+    /// sample (delivery round trip), min-filtered into `min_rtt_us`.
+    probe: Option<(u32, Instant)>,
+    /// Minimum observed delivery round trip (microseconds), the RTprop estimate
+    /// the controller uses to weight FEC against ARQ: when the round trip is
+    /// expensive a NAK costs more, so heavier FEC (a smaller step) is worth it.
+    min_rtt_us: u64,
+    /// Last time the cumulative ACK advanced, and the last RTO-driven
+    /// retransmit, for sender-side recovery of a stall the receiver cannot NAK
+    /// (a frontier hole it never learned exists - the same root cause as the
+    /// end-of-stream tail, but mid-stream when the sender is flow-blocked).
+    last_ack_advance: Instant,
+    last_rto_rtx: Instant,
+    /// Connection id stamped into every `DATA` / `REPAIR`, so the session survives a
+    /// local-address change ([`migrate`](Self::migrate)).
+    conn_id: u64,
+    /// Proactive migration. The OS path-event observer fires
+    /// the instant the kernel re-routes / an interface roams / the path MTU
+    /// drops - ahead of any loss. When its event count advances past
+    /// `last_event_count`, the sender migrates proactively (rebinds + lets the
+    /// receiver pre-validate the new path) so the switch is covered before the
+    /// old path fails - the migration QUIC's reactive design cannot do.
+    net_obs: Option<crate::net_events::NetEventObserver>,
+    last_event_count: u64,
+    /// Migrations triggered by a path event rather than an explicit call.
+    proactive_migrations: u64,
+    /// Optional TLS state: when present, the handshake has run and every data
+    /// datagram is AEAD-sealed / opened with the 1-RTT keys.
+    #[cfg(feature = "tls")]
+    crypto: Option<crate::rlc_crypto::CryptoState>,
+}
+
+impl SensOMaticRlcSender {
+    /// Bind a local socket, connect to `peer`, and code over `symbol_len`-byte
+    /// symbols with a window of `window` source symbols, one repair every
+    /// `step` symbols, at density threshold `dt`.
+    pub fn bind<A: ToSocketAddrs>(
+        local: A,
+        peer: SocketAddr,
+        window: usize,
+        step: usize,
+        dt: u8,
+        symbol_len: usize,
+    ) -> io::Result<Self> {
+        let sock = UdpSocket::bind(local)?;
+        sock.set_nonblocking(true)?;
+        set_buffers(&sock);
+        let conn_id = derive_conn_id(sock.local_addr().map(|a| a.port()).unwrap_or(0));
+        // Auto-detect the datagram backend (io_uring where available, plain
+        // UDP otherwise); the transport's hot loop is unchanged.
+        let sock = crate::dgram::DgramSock::wrap(sock);
+        Ok(Self {
+            sock,
+            peer,
+            enc: RlcEncoder::new(window, step, dt, symbol_len),
+            symbol_len,
+            bbr: crate::bbr::Bbr::new(Instant::now(), (symbol_len + DATA_HDR) as u64),
+            bbr_samples: HashMap::new(),
+            sent: BTreeMap::new(),
+            last_tx: HashMap::new(),
+            acked_through: 0,
+            last_sid: u32::MAX,
+            wire_datagrams: 0,
+            naks_seen: 0,
+            retransmits: 0,
+            acks_seen: 0,
+            challenges_seen: 0,
+            other_seen: 0,
+            last_other_byte: 0,
+            // The flow window caps outstanding (sent-but-not-yet-received)
+            // symbols, which is what paces the sender so a burst cannot overrun
+            // the kernel receive buffer and manufacture loss. Crucially this
+            // counts genuinely-unconfirmed symbols (holes + on-wire), rather than
+            // symbols ahead of the in-order delivery frontier - so a single hole
+            // costs one slot, not the whole window, and the sender keeps the
+            // pipe full while the receiver buffers out-of-order and recovers.
+            flow_window: 128,
+            bbr_cwnd: false,
+            paced: false,
+            pace_bps: 0.0,
+            adaptive_push: false,
+            last_push_adapt: Instant::now(),
+            push_min_bps: 0.0,
+            push_max_bps: f64::INFINITY,
+            fb_loss: 0.0,
+            fb_rate_bps: 0.0,
+            fb_cong: 0.0,
+            max_delivered_bps: 0.0,
+            fb_capacity_bps: 0.0,
+            pair_probe_ctr: 0,
+            push_fraction: std::env::var("SUBETHA_PAIR_FRACTION")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.70)
+                .clamp(0.30, 0.78),
+            push_cooldown: 0,
+            naks_recv_window: 0,
+            sent_window: 0,
+            next_send: None,
+            gso: false,
+            gso_buf: Vec::new(),
+            gso_n: 0,
+            gso_seg: 0,
+            gso_max: 1,
+            start: Instant::now(),
+            // The controller starts from the same initial parameters as the
+            // encoder, so an adaptive run and a static run begin identically and
+            // diverge only as feedback arrives. `hold = 8` ticks of lower demand
+            // before relaxing a knob keeps the parameters from flapping.
+            controller: RlcController::new(window as u16, step as u16, dt.min(15), 8),
+            static_params: false,
+            fec_debug: std::env::var("SUBETHA_FEC_DEBUG").is_ok(),
+            adapt_count: 0,
+            feedback_recv: 0,
+            probe: None,
+            min_rtt_us: u64::MAX,
+            last_ack_advance: Instant::now(),
+            last_rto_rtx: Instant::now(),
+            conn_id,
+            net_obs: None,
+            last_event_count: 0,
+            proactive_migrations: 0,
+            #[cfg(feature = "tls")]
+            crypto: None,
+        })
+    }
+
+    /// Swap the datagram socket for one the caller already built (e.g. a demux
+    /// socket the unified endpoint shares across both codes). The replacement
+    /// should be connected to `peer` and non-blocking; the session conn id from
+    /// the original bind is kept (it only needs to be consistent per session).
+    pub fn set_sock(&mut self, sock: crate::dgram::DgramSock) {
+        self.sock = sock;
+    }
+
+    /// Arm the optional TLS record layer as the client. Call
+    /// [`handshake`](Self::handshake) before sending; every data datagram is
+    /// then AEAD-protected.
+    #[cfg(feature = "tls")]
+    pub fn with_tls_client(mut self, cfg: std::sync::Arc<rustls::ClientConfig>) -> io::Result<Self> {
+        self.crypto = Some(
+            crate::rlc_crypto::CryptoState::new_client(cfg)
+                .map_err(io::Error::other)?,
+        );
+        Ok(self)
+    }
+
+    /// Run the TLS handshake (no-op when TLS is not armed). Blocks until the
+    /// 1-RTT keys are derived.
+    #[cfg(feature = "tls")]
+    pub fn handshake(&mut self) -> io::Result<()> {
+        if let Some(crypto) = self.crypto.as_mut() {
+            drive_handshake(&self.sock, Some(self.peer), crypto, true)?;
+        }
+        Ok(())
+    }
+
+    /// Send one inner datagram to the peer, AEAD-sealing it first when TLS is on.
+    fn wire_send(&mut self, inner: &[u8]) -> io::Result<()> {
+        #[cfg(feature = "tls")]
+        if let Some(c) = &self.crypto {
+            let wire = secure_wrap(c, inner)?;
+            return send_with_retry(&self.sock, &wire, self.peer);
+        }
+        send_with_retry(&self.sock, inner, self.peer)
+    }
+
+    /// Compute the on-wire bytes for `inner` (AEAD-sealed when TLS is armed) and
+    /// either append them to the GSO batch (when GSO is on and the sealed size
+    /// matches the batch's) or send immediately. Each sealed datagram carries
+    /// its own packet number + tag, so a GSO batch of them is independently
+    /// openable by the receiver - the per-packet-AEAD framing is what makes the
+    /// batch legal. The batch flushes when it reaches `gso_max` segments.
+    fn enqueue_wire(&mut self, inner: &[u8]) -> io::Result<()> {
+        #[cfg(feature = "tls")]
+        let wire: Vec<u8> = match &self.crypto {
+            Some(c) => secure_wrap(c, inner)?,
+            None => inner.to_vec(),
+        };
+        #[cfg(not(feature = "tls"))]
+        let wire: Vec<u8> = inner.to_vec();
+        if self.gso {
+            if self.gso_seg == 0 {
+                self.gso_seg = wire.len();
+                self.gso_max = (65535 / self.gso_seg.max(1)).clamp(1, 64);
+            }
+            if wire.len() == self.gso_seg {
+                self.gso_buf.extend_from_slice(&wire);
+                self.gso_n += 1;
+                if self.gso_n >= self.gso_max {
+                    self.flush_gso()?;
+                }
+                return Ok(());
+            }
+            // A differently-sized datagram cannot share the batch: flush the
+            // accumulated segments, then send this one on its own.
+            self.flush_gso()?;
+        }
+        send_with_retry(&self.sock, &wire, self.peer)
+    }
+
+    /// Ship the accumulated GSO batch in one `sendmsg` (the kernel slices it into
+    /// `gso_n` datagrams of `gso_seg` bytes) and reset the batch. A no-op when
+    /// GSO is off or the batch is empty.
+    fn flush_gso(&mut self) -> io::Result<()> {
+        if self.gso_n == 0 {
+            return Ok(());
+        }
+        match send_gso_with_retry(&self.sock, &self.gso_buf, self.gso_seg as u16, self.peer) {
+            Ok(()) => {
+                self.gso_buf.clear();
+                self.gso_n = 0;
+                Ok(())
+            }
+            Err(_) => {
+                // The egress cannot segment (a virtio NIC with
+                // `tx-udp-segmentation` fixed-off and GSO disabled returns EIO):
+                // send this batch one datagram at a time and disable GSO for the
+                // rest of the session, so the lever degrades to the plain path
+                // instead of failing. Take the buffer to avoid borrowing self
+                // both mutably (the sends) and immutably (the slice).
+                let buf = std::mem::take(&mut self.gso_buf);
+                let seg = self.gso_seg.max(1);
+                let mut off = 0;
+                while off < buf.len() {
+                    let end = (off + seg).min(buf.len());
+                    send_with_retry(&self.sock, &buf[off..end], self.peer)?;
+                    off = end;
+                }
+                self.gso = false;
+                self.gso_n = 0;
+                Ok(())
+            }
+        }
+    }
+
+    /// Retransmission timeout: a few RTTs, floored so a near-zero RTT estimate
+    /// (loopback) does not retransmit faster than the receiver can respond.
+    fn rto(&self) -> Duration {
+        let rtt_us = self.min_rtt_us.clamp(1_000, 100_000);
+        Duration::from_micros((3 * rtt_us).clamp(30_000, 300_000))
+    }
+
+    /// Set the in-flight flow-control window (source symbols); the default 1024.
+    pub fn with_flow_window(mut self, window: u32) -> Self {
+        self.flow_window = window.max(1);
+        self
+    }
+
+    /// Drive the in-flight bound from BBR's dynamic congestion window
+    /// (`cwnd_gain * BtlBw * RTprop`) instead of the static `flow_window`. The
+    /// window self-sizes to the path BDP and ProbeBW grows it to discover more
+    /// bandwidth, so the sender fills a high-BDP WAN path instead of pinning at
+    /// the static window. `flow_window` is the bootstrap window until BBR's
+    /// first bandwidth sample lands.
+    pub fn with_bbr_cwnd(mut self, on: bool) -> Self {
+        self.bbr_cwnd = on;
+        self
+    }
+
+    /// Enable UDP GSO (`UDP_SEGMENT`) batching of the steady-state DATA path.
+    /// Equal-size sealed DATA datagrams accumulate and ship in one `sendmsg`,
+    /// cutting the per-symbol syscall cost. Repairs still ship immediately after
+    /// their source window (the batch flushes first), so FEC timing is unchanged.
+    pub fn with_gso(mut self, on: bool) -> Self {
+        self.gso = on;
+        self
+    }
+
+    /// Enable static rate pacing: spread the in-flight window evenly over the
+    /// RTT instead of ack-clocked bursting, so a larger `flow_window` can fill
+    /// the path BDP without bursting the shallow bottleneck buffer (the unpaced
+    /// cliff). Pair with a `flow_window` sized to the BDP.
+    pub fn with_paced(mut self, on: bool) -> Self {
+        self.paced = on;
+        self
+    }
+
+    /// Pace the wire at a fixed `mbit_per_s` (the offensive FEC-push lever):
+    /// drive throughput toward the path's raw capacity, past where a loss-based
+    /// controller backs off, and let the FEC recover the loss from operating
+    /// near the ceiling. Pair with a large `flow_window` and FEC parity (a low
+    /// `step`) so the window does not gate and the induced loss is recoverable.
+    pub fn with_pace_mbit(mut self, mbit_per_s: f64) -> Self {
+        self.pace_bps = (mbit_per_s * 1.0e6 / 8.0).max(0.0);
+        self
+    }
+
+    /// Enable the adaptive FEC-push closed loop, starting at `start_mbit` and
+    /// auto-tuning between `min_mbit` and `max_mbit`. The loop probes the rate up
+    /// while the delivered rate keeps pace (the FEC absorbing the induced loss)
+    /// and backs off to the delivered rate when the path cannot keep up - filling
+    /// the headroom a loss-based controller leaves while surviving a path drop.
+    pub fn with_adaptive_push(mut self, start_mbit: f64, min_mbit: f64, max_mbit: f64) -> Self {
+        self.adaptive_push = true;
+        self.pace_bps = (start_mbit * 1.0e6 / 8.0).max(1.0);
+        self.push_min_bps = (min_mbit * 1.0e6 / 8.0).max(1.0);
+        self.push_max_bps = (max_mbit * 1.0e6 / 8.0).max(self.push_min_bps);
+        self
+    }
+
+    /// One step of the adaptive FEC-push loop, driven by the control plane's
+    /// ground-truth signal: the receiver's measured delivered (goodput) rate. On a
+    /// bufferless path the loss signal is binary (zero below the cliff, a
+    /// catastrophic burst at it) and useless for probing, but the delivered rate
+    /// plateaus at the path capacity, so it is safe to ride. Pace just above the
+    /// delivered rate to fill the path (the FEC recovers the small probe loss);
+    /// because the delivered rate cannot exceed the path, the loop self-limits
+    /// instead of running away. The receiver's measured loss is the safety
+    /// brake: when it nears the FEC's recovery capacity (~1/step), drop the probe
+    /// so the push never outruns what the coding can save. Adapts ~once per RTT.
+    fn adapt_push_rate(&mut self) {
+        if !self.adaptive_push {
+            return;
+        }
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_push_adapt).as_secs_f64();
+        let rtt_s = (self.min_rtt_us.min(200_000)) as f64 / 1.0e6;
+        if dt < rtt_s.max(0.005) {
+            return;
+        }
+        self.last_push_adapt = now;
+        // The NAK rate (FEC misses since the last step) is the cliff-proximity
+        // signal for the rate: a burst of misses past the FEC's recovery capacity
+        // means we overshot the cliff, so back the cruise fraction off. The coding
+        // itself (window / step / density / disable-on-clean) is sized elsewhere -
+        // the sensing controller in apply_feedback owns it, provisioning the FEC
+        // proactively from the receiver's directly-measured loss and burstiness
+        // rather than reactively from these post-miss NAKs. Rate and coding are
+        // orthogonal knobs; this loop drives only the pace.
+        let nak_rate = self.naks_recv_window as f64 / self.sent_window.max(1) as f64;
+        self.naks_recv_window = 0;
+        self.sent_window = 0;
+
+        // Rate: the packet-pair cruise, which is the loss-independent controller. The path
+        // is a sharp goodput cliff (clean below it, collapse on it) well under
+        // the raw link rate, and every loss-derived rate signal (goodput, NAKs,
+        // the congestion classifier) is confounded - random loss looks exactly
+        // like a cliff overshoot, so a controller driven by them cuts when it
+        // should hold and spirals. The receiver's packet-pair capacity estimate
+        // is the one signal random loss cannot confound: the bottleneck imposes
+        // the consecutive-id dispersion gap regardless of how many packets drop.
+        // Cruise just under that measured capacity and let the FEC cover the
+        // residual loss - never probe into the cliff. (fb_cong stays captured
+        // for telemetry only; the path's classifier mis-reads netem loss.)
+        if self.fb_capacity_bps > 0.0 {
+            // The primary path: cruise at a fraction of the measured raw capacity. The
+            // pair dispersion reads the raw bottleneck rate (~the link), but the
+            // operational cliff sits below it (the bufferless bottleneck collapses
+            // before raw capacity), so the fraction stays under it.
+            //
+            // The fraction itself adapts within a bounded safe band from the FEC-miss
+            // (NAK) signal: push toward the cliff when the coding is comfortably
+            // covering (the path is clean, spend the headroom), back off when it
+            // strains (loss is eating into the FEC, widen the margin). Because the
+            // cruise is anchored to the loss-independent capacity and the fraction
+            // is clamped to a band that never reaches the cliff, this cannot
+            // spiral - the worst case is the bottom of the band, still a safe
+            // sub-cliff pace. That is the difference from every loss-confounded
+            // controller that collapsed: bounded fine-tuning, not unbounded chase.
+            // Climb only when the path is genuinely clean (FEC misses near zero);
+            // Hold at the start fraction under moderate loss the FEC is covering;
+            // back off only on a near-cliff NAK spike (> 2% of sends missed), not
+            // on routine FEC-recoverable loss - backing off there just sheds
+            // throughput the coding was handling fine.
+            if nak_rate < 0.002 {
+                self.push_fraction = (self.push_fraction + 0.004).min(PAIR_FRACTION_HI);
+            } else if nak_rate > 0.02 {
+                self.push_fraction = (self.push_fraction - 0.006).max(PAIR_FRACTION_LO);
+            }
+            let target = (self.fb_capacity_bps * self.push_fraction)
+                .clamp(self.push_min_bps, self.push_max_bps);
+            self.pace_bps += 0.25 * (target - self.pace_bps);
+        } else {
+            // Bootstrap, before any capacity sample (about the first feedback interval):
+            // find-then-cruise on goodput until the first packet-pair lands.
+            if self.fb_rate_bps > self.max_delivered_bps {
+                self.max_delivered_bps = self.fb_rate_bps;
+            } else {
+                self.max_delivered_bps *= 0.999;
+            }
+            if self.fb_rate_bps > 0.0 && self.fb_rate_bps < self.max_delivered_bps * 0.7 {
+                self.pace_bps = (self.pace_bps * 0.6).max(self.push_min_bps);
+                self.max_delivered_bps *= 0.9;
+                self.push_cooldown = 16;
+            } else if self.push_cooldown > 0 {
+                self.push_cooldown -= 1;
+            } else {
+                self.pace_bps =
+                    (self.pace_bps * 1.01).clamp(self.push_min_bps, self.push_max_bps);
+            }
+        }
+    }
+
+    /// Migrate to a fresh local socket (a new ephemeral port) - the protocol-side
+    /// effect of a NAT rebinding or an interface switch. The connection id is
+    /// unchanged, so the receiver routes the session to the new address and keeps
+    /// delivering; in-flight state (the retransmit buffer, the flow window, the
+    /// TLS keys) is untouched, so no data is lost across the move.
+    pub fn migrate(&mut self) -> io::Result<()> {
+        let new_sock = UdpSocket::bind("0.0.0.0:0")?;
+        new_sock.set_nonblocking(true)?;
+        set_buffers(&new_sock);
+        self.sock = crate::dgram::DgramSock::wrap(new_sock);
+        // Announce the new address at once by retransmitting the most recent
+        // in-flight symbol from the new socket, so the receiver migrates (and
+        // resumes acking the new address) before the flow window can block
+        // waiting on acks that would otherwise go to the abandoned socket.
+        let last = self
+            .sent
+            .iter()
+            .next_back()
+            .map(|(&sid, sym)| (sid, sym.clone()));
+        if let Some((sid, sym)) = last {
+            // Migration announcement: recovery traffic, sent unpaced - flush the
+            // GSO batch so the announce reaches the new path at once.
+            self.send_data(sid, &sym)?;
+            self.flush_gso()?;
+        }
+        Ok(())
+    }
+
+    /// The connection id stamped into every `DATA` / `REPAIR`.
+    pub fn conn_id(&self) -> u64 {
+        self.conn_id
+    }
+
+    /// The sender's current local socket address (changes across a migration).
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.sock.local_addr()
+    }
+
+    /// The datagram backend this sender's wire I/O resolved to (io_uring
+    /// where available, else plain UDP).
+    pub fn dgram_backend(&self) -> crate::dgram::DgramBackend {
+        self.sock.backend()
+    }
+
+    /// Arm the OS path-event observer so a route / carrier / MTU change
+    /// drives a proactive migration. `iface` names the interface to watch; `None`
+    /// auto-detects the first non-loopback up interface. With the observer armed,
+    /// [`poll_path_event`](Self::poll_path_event) (called from `send_item`)
+    /// rebinds the moment the kernel announces a path change - before loss.
+    pub fn with_path_observer(mut self, iface: Option<String>) -> Self {
+        let obs = crate::net_events::NetEventObserver::start(iface);
+        self.last_event_count = obs.event_count();
+        self.net_obs = Some(obs);
+        self
+    }
+
+    /// Synthesize a path event, as if the OS had announced a route / carrier
+    /// change - drives the `--sim-path-event` demo and the tests on a host where
+    /// flapping a real interface is impractical. The production trigger is the
+    /// armed observer firing on a real OS event.
+    pub fn inject_path_event(&self) {
+        if let Some(obs) = &self.net_obs {
+            obs.inject_event();
+        }
+    }
+
+    /// If the path-event observer has fired since the last check, migrate
+    /// proactively (the new path is then pre-validated by the receiver before the
+    /// old one fails). Returns whether a proactive migration was performed.
+    pub fn poll_path_event(&mut self) -> io::Result<bool> {
+        let count = match &self.net_obs {
+            Some(obs) => obs.event_count(),
+            None => return Ok(false),
+        };
+        if count > self.last_event_count {
+            self.last_event_count = count;
+            self.migrate()?;
+            self.proactive_migrations += 1;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Migrations triggered by a path event (item-12 sensing) rather than an
+    /// explicit [`migrate`](Self::migrate) call. Telemetry.
+    pub fn proactive_migrations(&self) -> u64 {
+        self.proactive_migrations
+    }
+
+    /// Pin the coding parameters at their initial values, ignoring feedback for
+    /// retuning (the static baseline for an adaptive-vs-static comparison).
+    /// Feedback is still received and counted, just never applied.
+    pub fn with_static_params(mut self) -> Self {
+        self.static_params = true;
+        self
+    }
+
+    /// Latency-priority FEC: keep a light repair floor on at all times instead of
+    /// disabling coding on a clean assessment, so an isolated loss recovers
+    /// in-window rather than via an ARQ round trip that head-of-line-stalls the
+    /// in-order stream. The right policy for the latency-priority code (the RLC
+    /// leg of the unified transport, where the loss-driven switch hands bulk /
+    /// high-loss traffic to block-RS and keeps RLC for the low-latency regime).
+    pub fn with_latency_priority(mut self) -> Self {
+        self.controller.set_latency_floor();
+        self
+    }
+
+    /// The live `(window, step, dt, coding_on)` coding parameters (telemetry).
+    pub fn coding_params(&self) -> (u16, u16, u8, bool) {
+        let (w, s, d) = self.enc.params();
+        (w as u16, s as u16, d, self.enc.coding_on())
+    }
+
+    /// Times the live coding parameters changed under feedback (telemetry).
+    pub fn adapt_count(&self) -> u64 {
+        self.adapt_count
+    }
+
+    /// FEEDBACK frames received from the receiver (telemetry).
+    pub fn feedback_recv(&self) -> u64 {
+        self.feedback_recv
+    }
+
+    /// The forward-loss fraction the receiver last fed back over the FEEDBACK
+    /// frame (0.0..=1.0). The unified endpoint reads this to drive the
+    /// loss-driven RLC -> RS code switch.
+    pub fn fb_loss(&self) -> f64 {
+        self.fb_loss
+    }
+
+    /// The RTprop estimate (milliseconds), the minimum delivery round trip seen,
+    /// or `-1.0` before the first sample (telemetry).
+    pub fn rtt_ms(&self) -> f32 {
+        if self.min_rtt_us == u64::MAX {
+            -1.0
+        } else {
+            self.min_rtt_us as f32 / 1000.0
+        }
+    }
+
+    /// The next source id that will be assigned (i.e. the count of items sent).
+    pub fn next_source_id(&self) -> u32 {
+        self.enc.next_source_id()
+    }
+
+    /// Re-base this sender's source-id stream to `base` for a cross-code resync.
+    /// The unified layer calls this when handing the stream back to RLC after
+    /// another code carried the ids in between: RLC's running source id has
+    /// diverged from the global item index (it only advanced for RLC-phase items),
+    /// so the next source symbol must be re-aligned to the global boundary `base`.
+    /// The encoder re-bases (next id `base`, fresh window), the retransmit buffer
+    /// and per-id timers drop (the old tail was delivered by the other code), and
+    /// the delivery frontier moves to `base` so the (now empty) flow window admits
+    /// the resumed stream immediately. BBR's path estimate is kept; only its
+    /// per-id sample map is cleared.
+    pub fn skip_to(&mut self, base: u32) {
+        self.enc.rebase_to(base);
+        self.acked_through = base;
+        self.sent.clear();
+        self.last_tx.clear();
+        self.bbr_samples.clear();
+    }
+
+    /// Current in-flight symbol bound. With `bbr_cwnd`, this is BBR's congestion
+    /// window (`cwnd_gain * BtlBw * RTprop`) in symbols once a bandwidth sample
+    /// exists, bootstrapping from `flow_window` until then; otherwise the static
+    /// `flow_window`. A 4-symbol floor keeps the pipe from fully draining.
+    fn effective_window(&self) -> u32 {
+        if self.bbr_cwnd && self.bbr.has_estimate() {
+            let packet = (self.symbol_len + DATA_HDR) as u64;
+            ((self.bbr.cwnd_bytes() / packet.max(1)) as u32).max(4)
+        } else {
+            self.flow_window
+        }
+    }
+
+    /// Ship one item: pack it into a source symbol, send the data datagram and
+    /// any interleaved repair, then drain incoming NAK / ACK so retransmits and
+    /// window trimming happen promptly.
+    /// True when the flow window is full, so the next [`Self::send_item`] would
+    /// block in its pacing wait. The unified layer polls this to escape an
+    /// extreme-loss stall (a window that will not clear because RLC cannot decode
+    /// the loss) by migrating to RS, rather than blocking here while the warmup
+    /// keeps the loss-driven switch from ever evaluating.
+    pub fn flow_blocked(&self) -> bool {
+        self.sent.len() as u32 >= self.effective_window()
+    }
+
+    /// The receiver's cumulative in-order delivery frontier (every source id below
+    /// it has been delivered). The unified layer reads this to size a cross-code
+    /// handover: it is the boundary up to which RLC has delivered, so RS resends
+    /// the un-acked tail `[acked_through, items_sent)` from there.
+    pub fn acked_through(&self) -> u32 {
+        self.acked_through
+    }
+
+    /// Service inbound ACKs/SACKs and flush any queued (re)transmits once. The
+    /// unified layer calls this in its flow-block escape loop so a window can
+    /// still clear (and retransmits still reach the wire) while it decides
+    /// whether to switch codes.
+    pub fn pump_once(&mut self) -> io::Result<()> {
+        self.flush_gso()?;
+        self.pump()?;
+        self.flush_gso()?;
+        Ok(())
+    }
+
+    pub fn send_item(&mut self, item: &[u8]) -> io::Result<()> {
+        // Proactive migration: if the OS announced a path change since
+        // the last item, migrate now - before loss - so the receiver pre-validates
+        // the new path while the old one still carries data. A no-op when no
+        // observer is armed or none has fired.
+        self.poll_path_event()?;
+        // Flow control: pace while too many symbols are outstanding (sent but
+        // not yet confirmed received), so a burst never overruns the receiver or
+        // the kernel socket buffer. `sent` holds exactly the unconfirmed symbols
+        // (a SACK releases each as it is received), so its length is the
+        // outstanding count - a hole costs one slot, not the whole window.
+        // The in-flight bound is BBR's dynamic cwnd when enabled (re-read each
+        // iteration so an ACK that grows BtlBw immediately relaxes the gate),
+        // else the static flow_window.
+        let start = Instant::now();
+        while self.sent.len() as u32 >= self.effective_window() {
+            // Blocked on the window: get any GSO-batched source symbols on the
+            // wire so they can be acked (and the window can clear), then pump,
+            // then flush again so any retransmits the pump queued go out too -
+            // otherwise a retransmit stuck in the batch could deadlock the wait.
+            self.flush_gso()?;
+            self.pump()?;
+            self.flush_gso()?;
+            if self.sent.len() as u32 >= self.effective_window() {
+                std::thread::sleep(Duration::from_micros(50));
+            }
+            if start.elapsed() > Duration::from_secs(60) {
+                break;
+            }
+        }
+        // Adaptive FEC-push: retune the pacing rate from the delivered-rate
+        // signal (~once per RTT) before pacing this symbol.
+        self.adapt_push_rate();
+        // Packet-pair probe: every Nth symbol under the adaptive push, ship this
+        // one without its pacing gap so it lands back-to-back with the previous -
+        // a tight pair from which the receiver reads the bottleneck dispersion
+        // (capacity). Roughly 6% of symbols; the cruise targets 82% of capacity,
+        // so the small over-rate from the un-paced symbol stays under the cliff.
+        // next_send is left untouched, so the following symbol re-paces from the
+        // prior due instant and the average rate recovers.
+        const PAIR_PROBE_EVERY: u32 = 16;
+        let pair_probe = self.adaptive_push && {
+            self.pair_probe_ctr = self.pair_probe_ctr.wrapping_add(1);
+            self.pair_probe_ctr.is_multiple_of(PAIR_PROBE_EVERY)
+        };
+        // Fixed-rate pacing (the offensive FEC-push lever): pace the wire at the
+        // configured rate regardless of window/RTT, driving throughput toward the
+        // path's raw capacity past where a loss-based controller backs off. The
+        // FEC recovers the loss from operating near the ceiling. Spin-pace for
+        // precision; clamp banked credit to one interval so a stall cannot
+        // re-burst.
+        if self.pace_bps > 0.0 && !pair_probe {
+            let packet = (self.symbol_len + DATA_HDR) as f64;
+            let interval = Duration::from_secs_f64(packet / self.pace_bps);
+            let due = self.next_send.unwrap_or_else(Instant::now);
+            loop {
+                let now = Instant::now();
+                if now >= due {
+                    break;
+                }
+                if due - now > Duration::from_millis(1) {
+                    self.pump()?;
+                    std::thread::sleep(Duration::from_micros(200));
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+            let floor = Instant::now().checked_sub(interval).unwrap_or(due);
+            self.next_send = Some(due.max(floor) + interval);
+        } else if self.bbr_cwnd {
+            let rate = self.bbr.pacing_rate_bps();
+            if rate > 0.0 {
+                let packet = (self.symbol_len + DATA_HDR) as f64;
+                let interval = Duration::from_secs_f64(packet / rate);
+                let due = self.next_send.unwrap_or_else(Instant::now);
+                // Spin-pace: thread::sleep is too coarse at line rate (~20us per
+                // packet), so spin for sub-ms waits and only sleep (pumping ACKs)
+                // for longer ones. Tight pacing keeps in-flight near 1*BDP, so
+                // the 2*BDP cwnd headroom that lets ProbeBW's 1.25x probe fit is
+                // never bursted into all at once (which manufactured the loss).
+                loop {
+                    let now = Instant::now();
+                    if now >= due {
+                        break;
+                    }
+                    if due - now > Duration::from_millis(1) {
+                        self.pump()?;
+                        std::thread::sleep(Duration::from_micros(400));
+                    } else {
+                        std::hint::spin_loop();
+                    }
+                }
+                // Clamp banked credit to one interval so a stall cannot re-burst.
+                let floor = Instant::now().checked_sub(interval).unwrap_or(due);
+                self.next_send = Some(due.max(floor) + interval);
+            }
+        } else if self.paced && self.min_rtt_us != u64::MAX {
+            // Static pacing: spread the window evenly over the RTT - one symbol
+            // every `RTT / window` - so a window sized to the BDP fills the path
+            // without bursting the shallow bottleneck buffer (the unpaced cliff
+            // at >512 in-flight). The pace rate rises with the window, so
+            // `flow_window` alone tunes the target rate (window * pkt / RTT).
+            let win = self.effective_window().max(1) as u64;
+            let interval = Duration::from_micros((self.min_rtt_us / win).max(1));
+            let due = self.next_send.unwrap_or_else(Instant::now);
+            loop {
+                let now = Instant::now();
+                if now >= due {
+                    break;
+                }
+                if due - now > Duration::from_millis(1) {
+                    self.pump()?;
+                    std::thread::sleep(Duration::from_micros(200));
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+            let floor = Instant::now().checked_sub(interval).unwrap_or(due);
+            self.next_send = Some(due.max(floor) + interval);
+        }
+        self.send_item_now(item)
+    }
+
+    /// The send body shared by [`Self::send_item`] (which waits on the flow
+    /// window + paces first) and [`Self::try_send_item`] (which does neither):
+    /// pack the item as a source symbol, enqueue it, ship it plus any due repair,
+    /// and service ACKs.
+    fn send_item_now(&mut self, item: &[u8]) -> io::Result<()> {
+        // A symbol is the length prefix plus the item, so an item that
+        // does not leave room for the prefix has nowhere to go. Refused
+        // here rather than left to the slice copy inside pack_symbol,
+        // which panics, and panics in release too because the assert
+        // guarding it is a debug one.
+        if item.len() + LEN_PREFIX > self.symbol_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "an item of {} bytes does not fit a symbol of {}, which holds \
+                     a {LEN_PREFIX} byte length prefix as well",
+                    item.len(),
+                    self.symbol_len
+                ),
+            ));
+        }
+        let sym = pack_symbol(item, self.symbol_len);
+        let (sid, repair) = self.enc.push_source(&sym);
+        self.last_sid = sid;
+        self.sent.insert(sid, sym.clone());
+        self.sent_window = self.sent_window.saturating_add(1);
+        // Feed BBR the per-symbol rate-sample snapshot, consumed when the ACK
+        // handler delivers this symbol. BBR measures BtlBw and RTprop and
+        // exposes them as telemetry; the flow window, not BBR, bounds what is
+        // in flight.
+        let sample = self.bbr.on_send(Instant::now(), false);
+        self.bbr_samples.insert(sid, sample);
+        // Start an RTprop probe if none is in flight: time this id from send to
+        // the ACK that delivers it.
+        if self.probe.is_none() {
+            self.probe = Some((sid, Instant::now()));
+        }
+        self.send_data(sid, &sym)?;
+        self.last_tx.insert(sid, Instant::now());
+        if let Some(r) = repair {
+            self.send_repair(&r)?;
+        }
+        self.pump()?;
+        Ok(())
+    }
+
+    /// Like [`Self::send_item`] but never blocks on the flow window: returns
+    /// `Ok(false)` without sending when the window is full, so the caller owns the
+    /// wait (and can escape to a stronger code instead of stalling inside a
+    /// blocking send the unified layer cannot see). `Ok(true)` when the item was
+    /// sent. Pacing is skipped (the unified caller drives cadence and leaves
+    /// pacing off); a `poll_path_event` still runs so proactive migration holds.
+    pub fn try_send_item(&mut self, item: &[u8]) -> io::Result<bool> {
+        self.poll_path_event()?;
+        if self.flow_blocked() {
+            self.pump()?;
+            return Ok(false);
+        }
+        self.send_item_now(item)?;
+        Ok(true)
+    }
+
+    /// BBR's measured bottleneck-bandwidth estimate (bytes/s), telemetry.
+    pub fn btlbw_bps(&self) -> f64 {
+        self.bbr.btlbw_bps()
+    }
+
+    /// Transmit-side probe: `(last_sid, wire_datagrams, acked_through,
+    /// outstanding)`. `last_sid` is the source id of the most recently
+    /// packed item (`u32::MAX` before the first); `wire_datagrams`
+    /// counts `DATA` and `REPAIR` datagrams handed to the socket layer
+    /// without error; `outstanding` is the in-flight window occupancy.
+    pub fn tx_probe(&self) -> (u32, u64, u32, usize) {
+        (self.last_sid, self.wire_datagrams, self.acked_through, self.sent.len())
+    }
+
+    /// Control-plane arrivals processed by the pump: `(naks_seen,
+    /// acks_seen, feedback_recv)`. All three frozen while the peer's
+    /// session reports control sends means the frames die between the
+    /// peer's socket and this pump; NAKs seen with `wire_datagrams`
+    /// frozen means the retransmit path is not firing.
+    pub fn ctrl_probe(&self) -> (u64, u64, u64) {
+        (self.naks_seen, self.acks_seen, self.feedback_recv)
+    }
+
+    /// The pump's socket-side queue probe: `(pop_attempts, pop_yields,
+    /// queue_ptr, queue_len)` when the socket is a demux backend, else
+    /// `None`.
+    pub fn sock_probe(&self) -> Option<(u64, u64, u64, u64)> {
+        self.sock.demux_probe()
+    }
+
+    /// Frame types the pump handled outside the counted control arms:
+    /// `(challenges_echoed, default_arm_drops, last_dropped_byte)`.
+    pub fn pump_types(&self) -> (u64, u64, u8) {
+        (self.challenges_seen, self.other_seen, self.last_other_byte)
+    }
+
+    /// Source symbols sent again, whatever asked for it: a NAK from the
+    /// receiver, the RTO on a cumulative ACK that stopped advancing, or the
+    /// end-of-stream tail. A loss the coding window could not cover is
+    /// repaired by one of these, whichever side noticed it first.
+    pub fn retransmits(&self) -> u64 {
+        self.retransmits
+    }
+
+    /// Retransmit `sid` only if it has not been (re)sent within ~1.2 RTT - the
+    /// retransmit-suppression guard that stops the same still-missing symbol from
+    /// being resent on every ~1ms NAK round before its previous copy can be
+    /// acked a round trip later. Returns whether it was actually sent.
+    fn retransmit_if_due(&mut self, sid: u32, sym: &[u8]) -> io::Result<bool> {
+        let rtt_us = self.min_rtt_us.clamp(15_000, 200_000);
+        let cooldown = Duration::from_micros(rtt_us * 6 / 5);
+        let due = self
+            .last_tx
+            .get(&sid)
+            .map(|t| t.elapsed() >= cooldown)
+            .unwrap_or(true);
+        if due {
+            self.send_data(sid, sym)?;
+            self.last_tx.insert(sid, Instant::now());
+            self.retransmits += 1;
+        }
+        Ok(due)
+    }
+
+    fn send_data(&mut self, sid: u32, sym: &[u8]) -> io::Result<()> {
+        let send_us = self.start.elapsed().as_micros() as u32;
+        let mut pkt = Vec::with_capacity(DATA_HDR + sym.len());
+        pkt.push(PKT_RLC_DATA);
+        pkt.extend_from_slice(&self.conn_id.to_le_bytes());
+        pkt.extend_from_slice(&sid.to_le_bytes());
+        pkt.extend_from_slice(&send_us.to_le_bytes());
+        pkt.extend_from_slice(sym);
+        self.enqueue_wire(&pkt)?;
+        self.wire_datagrams += 1;
+        Ok(())
+    }
+
+    fn send_repair(&mut self, r: &RepairSymbol) -> io::Result<()> {
+        // A repair is a different size than a DATA datagram, so it cannot ride
+        // the DATA GSO batch: flush the accumulated source symbols first, so the
+        // repair still ships immediately after the window it protects (FEC timing
+        // unchanged), then send the repair on its own.
+        self.flush_gso()?;
+        let mut pkt = Vec::with_capacity(20 + r.payload.len());
+        pkt.push(PKT_RLC_REPAIR);
+        pkt.extend_from_slice(&self.conn_id.to_le_bytes());
+        pkt.extend_from_slice(&r.repair_key.to_le_bytes());
+        pkt.extend_from_slice(&r.first_source_id.to_le_bytes());
+        pkt.extend_from_slice(&r.window_size.to_le_bytes());
+        pkt.push(r.dt);
+        pkt.extend_from_slice(&r.payload);
+        // Repairs are paced: they are the bulk flow whose FEC escalation must
+        // not overflow the bottleneck queue.
+        self.wire_send(&pkt)?;
+        self.wire_datagrams += 1;
+        Ok(())
+    }
+
+    /// Drain pending NAK / ACK / FEEDBACK datagrams: retransmit NAK'd source
+    /// symbols, advance the acked frontier (trimming the coding window and the
+    /// ARQ hold), and retune the coding from each FEEDBACK through the
+    /// controller. The buffer holds a full 16-source-id NAK (1 + 16*4 = 65).
+    pub fn pump(&mut self) -> io::Result<()> {
+        let mut buf = [0u8; CTRL_BUF];
+        loop {
+            match self.sock.recv_from(&mut buf) {
+                Ok((n, _)) if n >= 1 => {
+                    // Open the AEAD envelope when TLS is on; the handlers always
+                    // see the cleartext inner datagram. A non-sealed frame under
+                    // TLS (a stray handshake retransmit) is skipped.
+                    #[cfg(feature = "tls")]
+                    if self.crypto.is_some() {
+                        let inner = self.crypto.as_ref().and_then(|c| secure_unwrap(c, &buf[..n]));
+                        if let Some(inner) = inner {
+                            self.handle_pump_frame(&inner)?;
+                        }
+                        continue;
+                    }
+                    self.handle_pump_frame(&buf[..n])?;
+                }
+                Ok(_) => {}
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(ref e) if e.kind() == io::ErrorKind::TimedOut => break,
+                // See poll(): a spurious Windows UDP ConnectionReset from an ICMP
+                // port-unreachable is transient, not fatal.
+                Err(ref e) if e.kind() == io::ErrorKind::ConnectionReset => break,
+                Err(e) => return Err(e),
+            }
+        }
+        // RTO recovery: if the cumulative ACK has not advanced for a few RTTs,
+        // the in-order frontier is stuck on a symbol the receiver cannot NAK -
+        // a frontier hole it never learned exists (the same root cause as the
+        // end-of-stream tail, but mid-stream while the sender is flow-blocked
+        // and so never reaches drain_until_acked). Retransmit the lowest unacked
+        // symbols sender-side, the way TCP retransmits on an RTO, so the stall
+        // self-heals instead of hanging on a NAK that can never come.
+        if !self.sent.is_empty()
+            && self.last_ack_advance.elapsed() >= self.rto()
+            && self.last_rto_rtx.elapsed() >= self.rto()
+        {
+            self.retransmit_unacked()?;
+            self.last_rto_rtx = Instant::now();
+        }
+        Ok(())
+    }
+
+    /// Dispatch one (already-decrypted) NAK / ACK / FEEDBACK frame.
+    fn handle_pump_frame(&mut self, m: &[u8]) -> io::Result<()> {
+        let n = m.len();
+        match m[0] {
+            PKT_RLC_NAK => {
+                self.naks_seen += 1;
+                let mut off = 1;
+                while off + 4 <= n {
+                    let sid = u32::from_le_bytes([m[off], m[off + 1], m[off + 2], m[off + 3]]);
+                    off += 4;
+                    // A NAK is an FEC miss: count it for the coordinated
+                    // loss-aware control (parity-up / pace-down) signal.
+                    self.naks_recv_window = self.naks_recv_window.saturating_add(1);
+                    if let Some(sym) = self.sent.get(&sid).cloned() {
+                        // NAK retransmit, suppressed if the same id was resent
+                        // within the last ~1.2 RTT (its prior copy is still in
+                        // flight) - this is what stops the NAK amplification flood.
+                        self.retransmit_if_due(sid, &sym)?;
+                    }
+                }
+            }
+            PKT_RLC_ACK if n >= 5 => {
+                self.acks_seen += 1;
+                // Cumulative in-order received frontier, then an optional
+                // 64-bit SACK bitmap of received ids above it.
+                let through = u32::from_le_bytes([m[1], m[2], m[3], m[4]]);
+                // RTprop: when this ACK delivers the in-flight probe id,
+                // min-filter `now - probe_time` into the RTT estimate.
+                if let Some((psid, ptime)) = self.probe
+                    && through > psid
+                {
+                    let s = ptime.elapsed().as_micros() as u64;
+                    self.min_rtt_us = self.min_rtt_us.min(s);
+                    self.probe = None;
+                }
+                // Collect the rate-sample snapshots of every symbol newly
+                // known-received on this ACK (cumulative advance + SACK), to
+                // feed BBR's delivery-rate estimator one batch per ACK.
+                let mut delivered: Vec<crate::bbr::PacketSample> = Vec::new();
+                if through > self.acked_through {
+                    for sid in self.acked_through..through {
+                        if let Some(s) = self.bbr_samples.remove(&sid) {
+                            delivered.push(s);
+                        }
+                    }
+                    self.acked_through = through;
+                    self.enc.forget_below(through);
+                    self.sent.retain(|&sid, _| sid >= through);
+                    self.last_tx.retain(|&sid, _| sid >= through);
+                    self.last_ack_advance = Instant::now();
+                }
+                // Release each SACK'd (received-above-the-hole) symbol from the
+                // retransmit buffer so it stops counting against the outstanding
+                // window - this is what lets a hole cost one slot, not the window.
+                if n >= 13 {
+                    let sack = u64::from_le_bytes([
+                        m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12],
+                    ]);
+                    for i in 0..64u32 {
+                        if sack & (1u64 << i) != 0 {
+                            let sid = through.wrapping_add(1 + i);
+                            self.sent.remove(&sid);
+                            if let Some(s) = self.bbr_samples.remove(&sid) {
+                                delivered.push(s);
+                            }
+                        }
+                    }
+                }
+                if !delivered.is_empty() {
+                    self.bbr.on_ack(Instant::now(), &delivered);
+                }
+            }
+            PKT_RLC_FEEDBACK if n >= 4 => {
+                self.feedback_recv += 1;
+                self.apply_feedback(m[1], m[2], m[3]);
+                // The receiver's real delivered (goodput) rate rides along when
+                // present (control-plane ground truth for the adaptive push).
+                if n >= 6 {
+                    let rate_mbit = u16::from_le_bytes([m[4], m[5]]) as f64;
+                    self.fb_rate_bps = rate_mbit * 1.0e6 / 8.0;
+                }
+                // Packet-pair capacity, which is loss-independent: the bottleneck
+                // dispersion the receiver read from the tightest consecutive-id
+                // gap. The adaptive push cruises just under it instead of
+                // probing the cliff. 0 means "not measured yet" - ignore it.
+                if n >= 8 {
+                    let cap_mbit = u16::from_le_bytes([m[6], m[7]]) as f64;
+                    if cap_mbit > 0.0 {
+                        self.fb_capacity_bps = cap_mbit * 1.0e6 / 8.0;
+                    }
+                }
+            }
+            PKT_RLC_PATH_CHALLENGE if n >= PATH_FRAME_LEN => {
+                self.challenges_seen += 1;
+                // The receiver is validating this (just-migrated) address. Echo
+                // the connection id + nonce verbatim so it can confirm we hold
+                // the session here and lift its anti-amplification cap.
+                let mut resp = Vec::with_capacity(PATH_FRAME_LEN);
+                resp.push(PKT_RLC_PATH_RESPONSE);
+                resp.extend_from_slice(&m[1..PATH_FRAME_LEN]);
+                // Path-validation control: unpaced.
+                self.wire_send(&resp)?;
+            }
+            _ => {
+                self.other_seen += 1;
+                self.last_other_byte = m[0];
+            }
+        }
+        Ok(())
+    }
+
+    /// Turn one quantized FEEDBACK triple into a channel assessment, run the
+    /// controller, and apply any new coding parameters to the live encoder. A
+    /// no-op when pinned static.
+    fn apply_feedback(&mut self, loss_q8: u8, burst_q8: u8, cong_q8: u8) {
+        // Capture the receiver's real measured loss and congestion fraction for
+        // the adaptive-push loop before anything else - they drive it even when the coding is
+        // static. fb_cong (the Biaz/Spike classifier's congestion share) is the
+        // RFC 9265 signal: the FEC recovers random loss (push through it), but
+        // the rate must still yield to congestion loss (the FEC must not hide
+        // it). Random loss => keep filling; congestion loss => back off.
+        self.fb_loss = loss_q8 as f64 / 255.0;
+        self.fb_cong = cong_q8 as f64 / 255.0;
+        // The static baseline never changes the coding. Otherwise the sensing
+        // controller below owns the coding (window / step / density / disable-on-
+        // clean) from the fused loss + burstiness + congestion signal - including
+        // in adaptive-push mode, where the packet-pair loop owns only the rate
+        // (pace). The two compose without fighting: pace and coding are orthogonal
+        // knobs, so the push fills the wire while the sensing controller sizes the
+        // FEC to the channel the receiver actually measured (proactive provision
+        // from real loss + burst, not reactive from post-miss NAKs).
+        if self.static_params {
+            return;
+        }
+        let snapshot = SensorSnapshot {
+            loss: loss_q8 as f32 / 255.0,
+            burstiness: burst_q8 as f32 / 255.0,
+            // Keep the congestion term in the FEC sizing even though the
+            // classifier is unreliable as a congestion signal here. Measured on
+            // the WAN path: neutralizing it regressed under-loss throughput (5%
+            // 306->281, 8% 291->237). FEC strength and rate are coupled through
+            // the NAK signal - the rate controller backs off on NAK spikes, so
+            // the extra parity the congestion term provisions functions as margin
+            // that keeps FEC misses (and thus NAKs, and thus rate backoff) down.
+            // The over-provision is net-positive, not waste. (Hard data, not
+            // theory: lighter parity -> more misses -> more backoff -> lower rate.)
+            congestion_fraction: cong_q8 as f32 / 255.0,
+            ..SensorSnapshot::default()
+        };
+        // Weight FEC against ARQ by the measured round trip: an expensive NAK
+        // (high RTprop) makes heavier FEC worth it.
+        if self.min_rtt_us != u64::MAX {
+            self.controller.set_rtt_ms(self.min_rtt_us as f32 / 1000.0);
+        }
+        let d = self.controller.decide(&snapshot);
+        let (cw, cs, cd) = self.enc.params();
+        let changed =
+            cw != d.window as usize || cs != d.step as usize || cd != d.dt || self.enc.coding_on() != d.coding_on;
+        if changed {
+            self.enc.set_params(d.window as usize, d.step as usize, d.dt);
+            self.enc.set_coding(d.coding_on);
+            self.adapt_count += 1;
+            if self.fec_debug {
+                eprintln!(
+                    "FECDEC loss={:.3} burst={:.3} cong={:.3} -> win={} step={} dt={} coding={}",
+                    snapshot.loss,
+                    snapshot.burstiness,
+                    snapshot.congestion_fraction,
+                    d.window,
+                    d.step,
+                    d.dt,
+                    d.coding_on,
+                );
+            }
+        }
+    }
+
+    /// Pump NAK / ACK until the receiver has delivered every source id below
+    /// `total`, or the timeout elapses. Returns whether full delivery was acked.
+    ///
+    /// End-of-stream delivery is sender-driven, not NAK-driven. A NAK-only
+    /// scheme cannot recover a lost tail: the receiver only NAKs gaps below
+    /// its `highest_seen`, and when the final source symbols and any trailing
+    /// repair are all lost, `highest_seen` never reaches them - so the
+    /// receiver requests nothing and delivery deadlocks until this timeout.
+    /// (The matrix bench surfaced this as an intermittent ~96%-complete stall
+    /// under loss.) The sender knows exactly which ids are still unacked, so
+    /// it retransmits them on an RTT-paced cadence until the cumulative ACK
+    /// reaches `total`, the way TCP retransmits unacked data on an RTO.
+    pub fn drain_until_acked(&mut self, total: u32, timeout: Duration) -> io::Result<bool> {
+        // Get the final partial GSO batch on the wire before draining, else its
+        // source symbols are never sent and delivery cannot complete.
+        self.flush_gso()?;
+        let start = Instant::now();
+        let mut last_retx = Instant::now();
+        while self.acked_through < total {
+            if start.elapsed() > timeout {
+                return Ok(false);
+            }
+            self.pump()?;
+            if last_retx.elapsed() >= self.tail_rtx_interval() {
+                self.retransmit_unacked()?;
+                // Tail retransmits route through the DATA path (enqueue); flush
+                // so they actually reach the wire on this drain tick.
+                self.flush_gso()?;
+                last_retx = Instant::now();
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Ok(true)
+    }
+
+    /// Retransmit the lowest still-unacked source symbols - the ones blocking
+    /// the receiver's in-order frontier. Only a small batch per call (the
+    /// frontier plus a few, `sent` being an ordered BTreeMap), so this recovers
+    /// the tail / a small hole cluster without itself adding a flood to an
+    /// already-congested link; as each cumulative ACK advances, the next batch
+    /// is exposed. Idempotent at the receiver (it dedups by source id).
+    fn retransmit_unacked(&mut self) -> io::Result<()> {
+        const TAIL_RTX_BATCH: usize = 8;
+        let ids: Vec<u32> = self.sent.keys().copied().take(TAIL_RTX_BATCH).collect();
+        for sid in ids {
+            if let Some(sym) = self.sent.get(&sid).cloned() {
+                // Tail / RTO retransmit, suppressed if its prior copy is still in
+                // flight (same guard as the NAK path).
+                self.retransmit_if_due(sid, &sym)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// RTT-paced retransmit cadence for sender-driven tail recovery: ~2x the
+    /// measured round trip, clamped so it neither floods (a lower bound well
+    /// above one RTT) nor stalls a long time before the drain timeout.
+    fn tail_rtx_interval(&self) -> Duration {
+        // Clamp before doubling: min_rtt_us is u64::MAX until the first RTT
+        // sample lands, so cap it first to avoid an overflow in `2 * rtt_us`.
+        let rtt_us = self.min_rtt_us.clamp(1_000, 100_000);
+        Duration::from_micros((2 * rtt_us).clamp(20_000, 200_000))
+    }
+}
+
+/// Where a decode window's delivery starts. A window that holds id 0, or a
+/// repair whose window starts at it, starts at 0. Otherwise it asks its sender
+/// with a [`StartProbe`], and until the probe settles it delivers nothing and
+/// acknowledges nothing.
+enum StreamStart {
+    /// Delivery runs from `delivered_through`.
+    Settled,
+    Probing(StartProbe),
+}
+
+/// A start probe. Each round is one `NAK` naming id 0, then the ids just below
+/// the lowest id seen, then that lowest id itself, last: the canary. It assumes
+/// a sender serves a `NAK` in order and resends only ids it still holds, so a
+/// canary resent with nothing below it is a round in which the sender held
+/// nothing below it; [`START_PROBE_ROUNDS`] such rounds in a row start the
+/// window at the canary. No clock decides the start: a slow sender delays it.
+struct StartProbe {
+    /// The lowest id seen, and the send stamp of the copy that established it
+    /// or last came back as the canary. A copy stamped later is the sender
+    /// resending it.
+    lowest: Option<(u32, u32)>,
+    /// How many ids below `lowest` the next round names.
+    depth: u32,
+    /// The lowest id when `depth` was last set. Once the window holds every
+    /// id from the lowest up to it, reaching `depth` below it, the whole range
+    /// a round named has come back and the depth doubles.
+    deepened_at: u32,
+    /// When the canary's resent copy arrived in the current round.
+    canary_back_us: Option<f64>,
+    /// Consecutive rounds in which the canary came back and nothing below it
+    /// did.
+    empty_rounds: u32,
+}
+
+impl StartProbe {
+    fn new() -> Self {
+        Self {
+            lowest: None,
+            depth: START_PROBE_DEPTH,
+            deepened_at: 0,
+            canary_back_us: None,
+            empty_rounds: 0,
+        }
+    }
+
+    /// Record one arriving `DATA`. An id below the lowest is the sender
+    /// holding more than the window has seen, which restarts the count of
+    /// empty rounds; a later-stamped copy of the lowest is the canary back.
+    fn saw(&mut self, sid: u32, send_us: u32, arrival_us: f64) {
+        match self.lowest {
+            None => {
+                self.lowest = Some((sid, send_us));
+                self.deepened_at = sid;
+            }
+            Some((lowest, _)) if sid < lowest => {
+                self.lowest = Some((sid, send_us));
+                self.canary_back_us = None;
+                self.empty_rounds = 0;
+            }
+            Some((lowest, stamp)) if sid == lowest && (send_us.wrapping_sub(stamp) as i32) > 0 => {
+                self.lowest = Some((lowest, send_us));
+                self.canary_back_us.get_or_insert(arrival_us);
+            }
+            Some(_) => {}
+        }
+    }
+}
+
+/// One peer's decode window: the state a single connection id owns, and the
+/// only place RLC decoding is implemented. A receiver holds one of these per
+/// live sender, so two peers never share a delivery frontier, a loss estimate,
+/// or a path-validation challenge.
+///
+/// The socket is shared rather than owned: `DgramSock::send_to` and `recv_from`
+/// take `&self`, so a session drives the wire toward its own peer while the
+/// receiver owns the drain. One socket, N sessions.
+struct RlcSession {
+    sock: std::sync::Arc<crate::dgram::DgramSock>,
+    dec: RlcDecoder,
+    symbol_len: usize,
+    /// Next source id to deliver (everything below is delivered, in order).
+    delivered_through: u32,
+    /// `delivered_through` snapshot at the last FEEDBACK, so the feedback can
+    /// carry the receiver's measured delivered (goodput) rate over the control
+    /// plane. That rate is the ground-truth signal the sender's adaptive push
+    /// rides: the cliff shows as a delivered-rate plateau, unlike binary loss.
+    last_fb_delivered: u32,
+    /// Highest source id seen on any `DATA` / `REPAIR`, to know a gap is real.
+    highest_seen: u32,
+    peer: Option<SocketAddr>,
+    last_nak: Instant,
+    /// Telemetry: source symbols recovered by RLC (no retransmit needed) and
+    /// NAKs sent (the ARQ floor).
+    rlc_recovered: u64,
+    naks_sent: u64,
+    /// Cumulative ACK frames this session sent toward its peer.
+    acks_sent: u64,
+    /// When the last ACK left, for the idle re-ack pacing.
+    last_ack_sent: Instant,
+    /// The delivery frontier the last ACK carried; a frontier past it
+    /// sends immediately.
+    last_acked_through: u32,
+    /// Control sends silently dropped: no peer address, or the
+    /// anti-amplification budget was exhausted while unvalidated.
+    sends_skipped: u64,
+    /// Diagnostic loss injection: drop this percent of incoming DATA datagrams
+    /// (seeded) to exercise RLC recovery on a lossless link.
+    drop_pct: u32,
+    drop_rng: u64,
+    /// Gilbert-Elliott burst-loss injection (per-10000 transition probabilities
+    /// `p` Good->Bad and `r` Bad->Good). Mean burst `10000 / r`, steady loss
+    /// `p / (p + r)`. `r = 0` disables it (the Bernoulli `drop_pct` path is used
+    /// instead). The erasure is a deterministic function of the source id, not
+    /// of arrival timing, so two different codes (adaptive vs static) experience
+    /// the identical loss process - a fair A/B - and a retransmit of an erased
+    /// id is never erased a second time, so ARQ always converges.
+    ge_loss_p: u32,
+    ge_loss_r: u32,
+    ge_bad: bool,
+    /// Next source id whose erasure decision is undecided; the chain advances in
+    /// id order, memoizing each decision in `ge_decided`.
+    ge_pos: u32,
+    ge_decided: HashMap<u32, bool>,
+    /// Erased ids whose first transmission has already been dropped, so a
+    /// retransmit passes through.
+    ge_dropped_once: BTreeSet<u32>,
+    /// Lifetime loss accounting (stable telemetry, vs the recency-weighted EWMA
+    /// the controller consumes): source ids that were lost, over ids delivered.
+    total_lost: u64,
+    total_delivered: u64,
+    /// Monotonic start, for the relative one-way trip time the Spike arm reads.
+    /// Copied from the receiver so every session stamps arrivals on the one
+    /// clock the drain measures them with.
+    start: Instant,
+    /// Arrival time (microseconds since `start`) of the previous DATA, stamped in
+    /// the receive drain loop ahead of any decode, for inter-arrival spacing and
+    /// the relative one-way trip time - so neither is polluted by the Gaussian
+    /// solve, which runs once after the whole batch is drained.
+    last_arrival_us: Option<f64>,
+    /// Last DATA source id seen, for the packet-pair (dispersion) capacity
+    /// probe: when the next consecutive id arrives, the gap between the two is
+    /// the bottleneck's transmission time for one packet - which the bottleneck
+    /// imposes regardless of how many other packets are dropped, so it measures
+    /// path capacity independently of loss (the one signal random loss cannot
+    /// confound). The sender ships occasional back-to-back pairs to drive it.
+    last_data_sid: Option<u32>,
+    /// Recent consecutive-id arrival gaps (microseconds) above the NAPI floor,
+    /// a circular window. The raw distribution is bimodal: a near-zero mass from
+    /// NAPI/GRO batching (multiple packets drained in one softirq poll share a
+    /// timestamp) and the real bottleneck-dispersion cluster at ~18-26us. The
+    /// `min` is poison (it grabs the batch noise); a low percentile of the
+    /// floor-filtered gaps isolates the true dispersion robustly. Capacity =
+    /// wire_bytes*8 / percentile_gap. Empty until enough gaps land.
+    pair_ring: Vec<f64>,
+    pair_ring_pos: usize,
+    /// Diagnostic: when `SUBETHA_PAIR_DEBUG` is set, log every consecutive-id gap
+    /// so the true dispersion distribution can be read (and NAPI-batch noise vs
+    /// real bottleneck spacing separated). Empty / unused otherwise.
+    pair_debug: bool,
+    pair_gap_log: Vec<f64>,
+    /// Last FEEDBACK send instant (rate-limited like the ACK).
+    last_feedback: Instant,
+    /// Gilbert-Elliott fit of the forward loss trace -> mean burst length, fed
+    /// in delivery order as the contiguous frontier advances.
+    burst_model: BurstModel,
+    /// Congestion-vs-wireless loss differentiation (Biaz + Spike) -> congestion
+    /// share of recent loss.
+    loss_class: LossClassSensor,
+    /// EWMA of the per-source-id lost indicator (1 = lost, 0 = arrived),
+    /// folded in delivery order: the measured forward loss rate.
+    loss_ewma: f32,
+    /// Sliding window of the last `LOSS_WINDOW` lost-indicators, and the count of
+    /// losses within it. The loss rate the controller provisions FEC against is
+    /// `lost / max(len, LOSS_WINDOW_MIN_FILL)`. A windowed rate (not the burst
+    /// model's cumulative `losses/n`, which is anchored by startup samples and
+    /// never forgets - it read 44% during a 6% transfer and only relaxed at the
+    /// very end) tracks the true sustained loss quickly; the MIN_FILL denominator
+    /// suppresses the cold-start spike that otherwise drives FEC straight to max.
+    loss_window: VecDeque<bool>,
+    loss_window_lost: u32,
+    /// Source ids the FEC recovered (no original DATA needed). Pending the
+    /// deferred loss accounting: a FEC-recovered id whose original DATA later
+    /// arrives was merely reordered, not lost.
+    fec_recovered: BTreeSet<u32>,
+    /// Source ids whose original DATA arrived (any time), to distinguish a
+    /// reordered-then-recovered id from a genuinely-lost one.
+    data_arrived: BTreeSet<u32>,
+    /// Delivered ids awaiting loss accounting, `(sid, account_at_us, was_fec,
+    /// was_nak)`: the fold into the burst model / loss rate is deferred by the
+    /// reorder grace so a late original can correct a reorder mis-counted as loss.
+    loss_pending: VecDeque<(u32, f64, bool, bool)>,
+    nakd: BTreeSet<u32>,
+    /// When each currently-missing id was first detected as a gap (microseconds
+    /// since `start`), so a NAK waits out a reorder-tolerance grace before
+    /// declaring it lost - on a jittery path a packet may simply be reordered,
+    /// not dropped, and NAKing it early counts a false loss.
+    gap_since: BTreeMap<u32, f64>,
+    /// FEEDBACK frames sent (telemetry).
+    feedback_sent: u64,
+    /// The connection id this session decodes. The receiver keys its session
+    /// map by the same value, so a frame reaches exactly the window that owns
+    /// its id.
+    cid: u64,
+    /// How many times this session migrated to a new peer address - the count
+    /// is the proof the connection survived a 4-tuple change.
+    migrations: u64,
+    /// Where delivery starts, and while that is not yet known, the probe
+    /// finding it.
+    stream_start: StreamStart,
+    /// Test-only loss at the head of the stream: the first `head_drop` `DATA`
+    /// datagrams to arrive are dropped, first copies only so a resend passes,
+    /// and with `head_drop_repairs` so is every `REPAIR` that arrives before
+    /// they have all gone.
+    #[cfg(test)]
+    head_drop: u32,
+    #[cfg(test)]
+    head_drop_repairs: bool,
+    #[cfg(test)]
+    head_dropped: BTreeSet<u32>,
+    /// Path validation. When the session appears at a fresh address the
+    /// receiver migrates optimistically (it keeps delivering - the AEAD / id
+    /// already authenticate the frame) but marks the new address unvalidated and
+    /// challenges it: `pending_challenge` holds `(addr, nonce, sent_at)` and the
+    /// peer is trusted for reachability only once a matching `PATH_RESPONSE`
+    /// returns. `peer_validated` gates the anti-amplification cap; `prev_peer`
+    /// is the address to revert to if validation times out (a spoofed move).
+    peer_validated: bool,
+    pending_challenge: Option<(SocketAddr, u64, Instant)>,
+    prev_peer: Option<SocketAddr>,
+    /// Monotonic nonce source for challenges (mixed through splitmix64 so the
+    /// emitted nonce is not a guessable counter).
+    challenge_seq: u64,
+    /// Anti-amplification accounting toward the unvalidated address: the receiver
+    /// will not send more than `AMPLIFICATION_FACTOR x` the bytes it has received
+    /// from that address until the path validates.
+    unval_recv_bytes: u64,
+    unval_sent_bytes: u64,
+    /// Successful path validations and validation timeouts (reverts). Telemetry.
+    path_validations: u64,
+    path_validation_failures: u64,
+    /// `DATA` / `REPAIR` frames too short for their header, dropped without a
+    /// decode. Telemetry.
+    malformed_frames: u64,
+    /// The 1-RTT keys for this peer, shared with the receiver when the session
+    /// opens: the receiver opens inbound datagrams with them, this session
+    /// seals its control sends. There is one handshake per receiver, so a TLS
+    /// receiver serves one peer.
+    #[cfg(feature = "tls")]
+    crypto: Option<std::sync::Arc<crate::rlc_crypto::CryptoState>>,
+}
+
+/// Receiver side of the RLC transport.
+///
+/// Owns the socket and the drain; every frame is routed by its connection id
+/// to the `RlcSession` that owns it, so a node receiving from several peers
+/// at once decodes each stream in its own window instead of one session
+/// evicting another.
+pub struct SensOMaticRlcReceiver {
+    sock: std::sync::Arc<crate::dgram::DgramSock>,
+    symbol_len: usize,
+    /// Monotonic start, shared with every session so arrival stamps taken in
+    /// the drain and deadlines evaluated inside a session share one clock.
+    start: Instant,
+    /// Live decode windows by connection id, and the ids in first-seen order so
+    /// delivery across peers is deterministic rather than hash-ordered.
+    sessions: HashMap<u64, RlcSession>,
+    order: Vec<u64>,
+    /// Connection ids that have asked for a window and are under challenge:
+    /// `cid -> (addr, nonce, sent_at)`. Bounded, so a forged-id spray cannot
+    /// grow this either.
+    pending_admissions: HashMap<u64, PendingAdmission>,
+    /// Ceiling on live windows and on candidates under challenge. `None` is
+    /// unbounded; set by [`with_session_ceiling`](Self::with_session_ceiling).
+    /// A peer turned away by it is counted in `session_refusals`.
+    session_ceiling: Option<usize>,
+    session_refusals: u64,
+    challenge_seq: u64,
+    session_changed: bool,
+    session_admissions: u64,
+    session_admission_failures: u64,
+    /// Per-session service errors. Servicing a session sends its feedback,
+    /// so each failure is a peer that was not told what this receiver is
+    /// missing. One session's failure must not abort the others, which is
+    /// why it does not propagate, but it is counted rather than discarded.
+    session_service_errors: u64,
+    /// Frames that named no session and were attributed to none: a frame
+    /// without a connection id that is not a PATH_RESPONSE, or a PATH_RESPONSE
+    /// whose id holds no live window and answers no admission challenge.
+    /// Counted with the last such type byte (0 for an empty datagram); never
+    /// routed, so no session's address moves on their account.
+    unattributed_frames: u64,
+    last_unattributed_byte: u8,
+    /// First kernel RX timestamp (nanoseconds, `SO_TIMESTAMPNS`) seen, so the
+    /// per-packet arrival the congestion detectors read is a small offset from
+    /// it. `None` until the first stamped datagram (or always, where the kernel
+    /// timestamp is unavailable and the drain-loop clock is used instead).
+    kts_base_ns: Option<i128>,
+    /// Diagnostic loss injection, held here and stamped onto each session as it
+    /// is created: `with_debug_loss` / `with_gilbert_loss` are builder calls
+    /// that run before any peer has been seen.
+    drop_pct: u32,
+    drop_seed: u64,
+    ge_loss_p: u32,
+    ge_loss_r: u32,
+    pair_debug: bool,
+    /// Test-only head loss, stamped onto each session as it opens; see
+    /// [`set_head_loss`](Self::set_head_loss).
+    #[cfg(test)]
+    head_drop: u32,
+    #[cfg(test)]
+    head_drop_repairs: bool,
+    /// The 1-RTT keys from the handshake, held until the first session opens
+    /// and then moved into it. `tls_armed` outlives the move, so a second
+    /// connection id can still be refused after the keys are gone.
+    /// The receiver's keys, shared with the session that serves the peer:
+    /// the receiver opens inbound datagrams with them and the session seals
+    /// its control sends.
+    #[cfg(feature = "tls")]
+    crypto: Option<std::sync::Arc<crate::rlc_crypto::CryptoState>>,
+    #[cfg(feature = "tls")]
+    handshake_peer: Option<SocketAddr>,
+    /// Whether TLS was armed at all. A TLS receiver serves one peer, so this
+    /// gates admission of any id beyond the first.
+    #[cfg(feature = "tls")]
+    tls_armed: bool,
+}
+
+impl RlcSession {
+    /// A fresh decode window for `cid`, sharing the receiver's socket and clock.
+    fn new(
+        cid: u64,
+        sock: std::sync::Arc<crate::dgram::DgramSock>,
+        symbol_len: usize,
+        start: Instant,
+    ) -> Self {
+        Self {
+            sock,
+            // Horizon is sized to the coding window (the adaptive RLC window
+            // caps at 64), not the flow window: a sliding-window repair can only
+            // span its own window, so a gap older than ~one window has no repair
+            // covering it and is unrecoverable by RLC regardless of horizon -
+            // that gap is the ARQ floor's job. 128 = 2x the max window keeps the
+            // Gaussian solve small (the dominant per-repair cost under loss).
+            dec: RlcDecoder::new(symbol_len).with_horizon(128),
+            symbol_len,
+            delivered_through: 0,
+            last_fb_delivered: 0,
+            highest_seen: 0,
+            peer: None,
+            last_nak: Instant::now(),
+            rlc_recovered: 0,
+            naks_sent: 0,
+            acks_sent: 0,
+            last_ack_sent: Instant::now(),
+            last_acked_through: u32::MAX,
+            sends_skipped: 0,
+            drop_pct: 0,
+            drop_rng: 0,
+            ge_loss_p: 0,
+            ge_loss_r: 0,
+            ge_bad: false,
+            ge_pos: 0,
+            ge_decided: HashMap::new(),
+            ge_dropped_once: BTreeSet::new(),
+            total_lost: 0,
+            total_delivered: 0,
+            loss_window: VecDeque::with_capacity(LOSS_WINDOW),
+            loss_window_lost: 0,
+            last_data_sid: None,
+            pair_ring: Vec::with_capacity(PAIR_RING_CAP),
+            pair_ring_pos: 0,
+            pair_debug: false,
+            pair_gap_log: Vec::new(),
+            start,
+            last_arrival_us: None,
+            last_feedback: Instant::now(),
+            burst_model: BurstModel::new(),
+            loss_class: LossClassSensor::new(),
+            loss_ewma: 0.0,
+            fec_recovered: BTreeSet::new(),
+            data_arrived: BTreeSet::new(),
+            loss_pending: VecDeque::new(),
+            nakd: BTreeSet::new(),
+            gap_since: BTreeMap::new(),
+            feedback_sent: 0,
+            cid,
+            migrations: 0,
+            stream_start: StreamStart::Probing(StartProbe::new()),
+            #[cfg(test)]
+            head_drop: 0,
+            #[cfg(test)]
+            head_drop_repairs: false,
+            #[cfg(test)]
+            head_dropped: BTreeSet::new(),
+            peer_validated: true,
+            pending_challenge: None,
+            prev_peer: None,
+            challenge_seq: 0,
+            unval_recv_bytes: 0,
+            unval_sent_bytes: 0,
+            path_validations: 0,
+            path_validation_failures: 0,
+            malformed_frames: 0,
+            #[cfg(feature = "tls")]
+            crypto: None,
+        }
+    }
+
+    /// How many times the session migrated to a new peer address (connection-id
+    /// routing surviving a 4-tuple change). Telemetry.
+    pub fn migrations(&self) -> u64 {
+        self.migrations
+    }
+
+    /// How many new peer addresses were confirmed reachable by the
+    /// PATH_CHALLENGE / PATH_RESPONSE exchange. Telemetry.
+    pub fn path_validations(&self) -> u64 {
+        self.path_validations
+    }
+
+    /// How many candidate addresses failed to answer the challenge within
+    /// `CHALLENGE_TIMEOUT` and were reverted (a spoofed move). Telemetry.
+    pub fn path_validation_failures(&self) -> u64 {
+        self.path_validation_failures
+    }
+
+    /// `DATA` / `REPAIR` frames too short for their header; each was dropped
+    /// without a decode.
+    pub fn malformed_frames(&self) -> u64 {
+        self.malformed_frames
+    }
+
+    /// The peer address the receiver is currently routing the session to.
+    pub fn peer(&self) -> Option<SocketAddr> {
+        self.peer
+    }
+
+    /// Send one inner datagram to the learned peer, AEAD-sealing it when TLS is
+    /// on. While the peer address is unvalidated (a migration in flight) the send
+    /// is held to the anti-amplification cap: at most `AMPLIFICATION_FACTOR x` the
+    /// bytes received from that address, so a spoofed move cannot make the
+    /// receiver flood a victim. A dropped send is silently skipped - validation
+    /// completes within a round trip and the cap lifts.
+    fn wire_send_to_peer(&mut self, inner: &[u8]) -> io::Result<()> {
+        let Some(peer) = self.peer else {
+            self.sends_skipped += 1;
+            return Ok(());
+        };
+        if !self.peer_validated {
+            let budget = self.unval_recv_bytes.saturating_mul(AMPLIFICATION_FACTOR);
+            if self.unval_sent_bytes.saturating_add(inner.len() as u64) > budget {
+                self.sends_skipped += 1;
+                return Ok(());
+            }
+            self.unval_sent_bytes = self.unval_sent_bytes.saturating_add(inner.len() as u64);
+        }
+        #[cfg(feature = "tls")]
+        if let Some(c) = &self.crypto {
+            let wire = secure_wrap(c, inner)?;
+            return send_with_retry(&self.sock, &wire, peer);
+        }
+        send_with_retry(&self.sock, inner, peer)
+    }
+
+    /// Source symbols recovered by RLC without a retransmit (telemetry).
+    pub fn rlc_recovered(&self) -> u64 {
+        self.rlc_recovered
+    }
+
+    /// NAKs sent - the ARQ floor for losses the coding window could not cover.
+    pub fn naks_sent(&self) -> u64 {
+        self.naks_sent
+    }
+
+    /// FEEDBACK frames sent to the sender (telemetry).
+    pub fn feedback_sent(&self) -> u64 {
+        self.feedback_sent
+    }
+
+    /// The receiver's current measured channel assessment: `(loss, mean_burst,
+    /// congestion_fraction)`. `loss` here is the stable lifetime loss rate (lost
+    /// ids over delivered) for honest telemetry; the controller is fed the
+    /// recency-weighted EWMA instead. Mean burst is `-1.0` before the
+    /// Gilbert-Elliott fit converges.
+    pub fn channel_estimate(&self) -> (f32, f32, f32) {
+        let mean_burst = self.burst_model.mean_burst_len().map(|m| m as f32).unwrap_or(-1.0);
+        let loss = if self.total_delivered == 0 {
+            0.0
+        } else {
+            self.total_lost as f32 / self.total_delivered as f32
+        };
+        (loss, mean_burst, self.loss_class.congestion_fraction())
+    }
+
+    /// Bernoulli diagnostic drop (call-based): a fresh draw per new DATA arrival.
+    fn roll_drop(&mut self) -> bool {
+        if self.drop_pct == 0 {
+            return false;
+        }
+        self.drop_rng = self
+            .drop_rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((self.drop_rng >> 33) % 100) < self.drop_pct as u64
+    }
+
+    /// Gilbert-Elliott erasure decision for the first transmission of `sid`. The
+    /// two-state chain is advanced in source-id order and memoized, so the
+    /// erasure pattern is a deterministic function of the id sequence and the
+    /// seed - identical across codes - and a retransmit of an erased id (already
+    /// dropped once) passes through so ARQ converges.
+    fn ge_erase_first(&mut self, sid: u32) -> bool {
+        while self.ge_pos <= sid {
+            let bad = self.ge_bad;
+            self.drop_rng = self
+                .drop_rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let roll = ((self.drop_rng >> 33) as u32) % 10000;
+            if self.ge_bad {
+                if roll < self.ge_loss_r {
+                    self.ge_bad = false;
+                }
+            } else if roll < self.ge_loss_p {
+                self.ge_bad = true;
+            }
+            self.ge_decided.insert(self.ge_pos, bad);
+            self.ge_pos += 1;
+        }
+        if *self.ge_decided.get(&sid).unwrap_or(&false) && !self.ge_dropped_once.contains(&sid) {
+            self.ge_dropped_once.insert(sid);
+            return true;
+        }
+        false
+    }
+
+    /// Whether the test-only head loss takes this `DATA`: a first copy while
+    /// fewer than `head_drop` have gone. A resend of a dropped id passes.
+    #[cfg(test)]
+    fn drop_head_data(&mut self, sid: u32) -> bool {
+        if self.head_dropped.contains(&sid) || self.head_dropped.len() as u32 >= self.head_drop {
+            return false;
+        }
+        self.head_dropped.insert(sid)
+    }
+
+    /// Re-base this receiver's delivery to start at `base` for a cross-code
+    /// resync. The unified layer calls this when the stream returns to RLC after
+    /// another code carried the ids in between: the in-order frontier moves to
+    /// `base`, the decoder drops every stored symbol (the abandoned pre-`base`
+    /// range), and the gap / NAK / loss-accounting tracking for ids below `base`
+    /// is cleared so the receiver never NAKs a hole that will not be filled over
+    /// RLC (the other code delivered those ids), nor replays a stale buffered tail.
+    /// The resync names where the stream stands, so it settles the window's
+    /// start as well.
+    pub fn skip_to(&mut self, base: u32) {
+        self.stream_start = StreamStart::Settled;
+        self.delivered_through = base;
+        self.highest_seen = base;
+        self.dec.rebase_to(base);
+        self.gap_since.retain(|&sid, _| sid >= base);
+        self.nakd.retain(|&sid| sid >= base);
+        self.data_arrived.retain(|&sid| sid >= base);
+        self.fec_recovered.retain(|&sid| sid >= base);
+        self.loss_pending.retain(|&(sid, ..)| sid >= base);
+    }
+
+    /// Everything the session does after the receiver's drain has handed it
+    /// this tick's frames: recover, deliver in order, account for loss, and
+    /// service its control plane (challenges, NAK, ACK, feedback). Delivered
+    /// items are appended to `tagged` under this session's connection id.
+    ///
+    /// The drain itself lives on the receiver, because one socket feeds every
+    /// session and the arrival stamp must come from the read, not from here.
+    /// Returns whether anything was delivered, which the receiver folds into
+    /// its idle backoff.
+    fn service(&mut self, tagged: &mut Vec<(u64, Vec<u8>)>) -> io::Result<bool> {
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        let out = &mut out;
+        // One recovery pass over the whole drained batch (repairs were stored,
+        // not solved, during the drain).
+        let recovered = self.dec.recover();
+        for s in &recovered {
+            self.fec_recovered.insert(*s);
+        }
+        self.rlc_recovered += recovered.len() as u64;
+        let now_us = self.start.elapsed().as_micros() as f64;
+        // Reorder grace (microseconds): how long to wait before declaring a gap
+        // lost, scaled to the path's recent delay spread (jitter), floored 1ms.
+        let grace = (2.0 * self.loss_class.recent_owd_spread_us()).clamp(1000.0, 50_000.0);
+        let settled = self.settle_start(now_us, grace);
+        if settled {
+            self.deliver(out, now_us, grace);
+            self.flush_loss_accounting(now_us);
+        }
+        // Path validation: retire a stale challenge (revert a spoofed
+        // move) and (re)issue the outstanding one now that the drain has credited
+        // the anti-amplification budget.
+        self.expire_stale_challenge();
+        self.maybe_send_challenge()?;
+        if settled {
+            self.maybe_nak()?;
+            self.send_ack()?;
+        } else {
+            self.send_start_probe()?;
+        }
+        self.maybe_feedback()?;
+        let delivered = !out.is_empty();
+        tagged.extend(out.drain(..).map(|item| (self.cid, item)));
+        Ok(delivered)
+    }
+
+    /// Settle the window's start once the evidence is in, and say whether it
+    /// is settled. Id 0 held, received or recovered from repairs, starts it
+    /// at 0. Otherwise a probe round closes a reorder grace after its canary
+    /// came back, and the last of [`START_PROBE_ROUNDS`] empty rounds starts
+    /// it at the canary.
+    fn settle_start(&mut self, now_us: f64, grace: f64) -> bool {
+        let StreamStart::Probing(probe) = &mut self.stream_start else {
+            return true;
+        };
+        if self.dec.has(0) {
+            self.stream_start = StreamStart::Settled;
+            return true;
+        }
+        let (Some((lowest, _)), Some(back)) = (probe.lowest, probe.canary_back_us) else {
+            return false;
+        };
+        if now_us - back < grace {
+            return false;
+        }
+        probe.canary_back_us = None;
+        probe.empty_rounds += 1;
+        if probe.empty_rounds < START_PROBE_ROUNDS {
+            return false;
+        }
+        self.settle_at(lowest);
+        true
+    }
+
+    /// Start delivery at `base`, keeping every symbol the window holds from
+    /// `base` up. The rate the next `FEEDBACK` reports counts from here, so
+    /// the ids below `base` are not reported as delivered.
+    fn settle_at(&mut self, base: u32) {
+        self.stream_start = StreamStart::Settled;
+        self.delivered_through = base;
+        self.last_fb_delivered = base;
+        self.highest_seen = self.highest_seen.max(base);
+        self.dec.forget_below(base);
+        self.data_arrived.retain(|&sid| sid >= base);
+        self.fec_recovered.retain(|&sid| sid >= base);
+    }
+
+    /// Send one start-probe round: a `NAK` naming id 0, the ids just below
+    /// the lowest id seen, and that lowest id last. Paced like an ordinary
+    /// `NAK` round, and reaching twice as deep once a whole range it named has
+    /// come back.
+    fn send_start_probe(&mut self) -> io::Result<()> {
+        if self.last_nak.elapsed() < Duration::from_millis(1) || self.peer.is_none() {
+            return Ok(());
+        }
+        let StreamStart::Probing(probe) = &mut self.stream_start else {
+            return Ok(());
+        };
+        let Some((lowest, _)) = probe.lowest else {
+            return Ok(());
+        };
+        if probe.deepened_at - lowest >= probe.depth
+            && (lowest..probe.deepened_at).all(|sid| self.dec.has(sid))
+        {
+            probe.depth = (probe.depth * 2).min(START_PROBE_MAX_DEPTH);
+            probe.deepened_at = lowest;
+        }
+        let lo = lowest.saturating_sub(probe.depth).max(1);
+        let mut pkt = Vec::with_capacity(1 + 4 * NAK_MAX_IDS);
+        pkt.push(PKT_RLC_NAK);
+        for sid in std::iter::once(0).chain(lo..=lowest) {
+            pkt.extend_from_slice(&sid.to_le_bytes());
+        }
+        self.wire_send_to_peer(&pkt)?;
+        self.naks_sent += 1;
+        self.last_nak = Instant::now();
+        Ok(())
+    }
+
+    /// Handle one inner frame the receiver has routed to this session. Returns
+    /// `false` for a frame this session does not own, so it is not counted as
+    /// received.
+    fn route_and_process(&mut self, inner: &[u8], from: SocketAddr, arrival_us: f64) -> bool {
+        // A PATH_RESPONSE answers an outstanding challenge: it is routed by id
+        // and by the nonce, not delivered as data.
+        if inner.first() == Some(&PKT_RLC_PATH_RESPONSE) {
+            self.handle_path_response(inner, from);
+            return true;
+        }
+        match frame_conn_id(inner) {
+            Some(cid) if cid == self.cid => match self.peer {
+                // First frame of this session: bind the address without
+                // counting a migration - there was nothing to migrate from.
+                None => self.peer = Some(from),
+                // Same session, new address -> the peer rebound. Migrate
+                // optimistically (keep delivering - the id / AEAD already
+                // authenticate the frame) but mark the address unvalidated
+                // and challenge it before trusting it for our own sends.
+                Some(p) if p != from => {
+                    self.prev_peer = self.peer;
+                    self.peer = Some(from);
+                    self.migrations += 1;
+                    self.begin_path_validation(from);
+                }
+                Some(_) => {}
+            },
+            // The receiver routes by connection id, so a frame carrying a
+            // different one reaching this window is a mis-route rather than a
+            // restart. A restarted peer arrives with a new id and is challenged
+            // by the receiver, which opens a session for it on the answer.
+            Some(_) => return false,
+            // A frame without an id proves nothing about which session sent
+            // it, so it neither binds nor moves this session's address.
+            None => return false,
+        }
+        // Anti-amplification: count bytes received from an as-yet-unvalidated
+        // peer, so our reply budget tracks what the address actually sent us.
+        if !self.peer_validated && self.peer == Some(from) {
+            self.unval_recv_bytes = self.unval_recv_bytes.saturating_add(inner.len() as u64);
+        }
+        self.process(inner, arrival_us);
+        true
+    }
+
+    /// Begin validating a new candidate peer address: mark it unvalidated, reset
+    /// the anti-amplification accounting, and arm an outstanding challenge with a
+    /// fresh nonce. The challenge itself is emitted from
+    /// [`service`](Self::service) (see
+    /// [`maybe_send_challenge`](Self::maybe_send_challenge)) once the drain has
+    /// credited the received bytes, so the very first challenge fits the cap.
+    fn begin_path_validation(&mut self, addr: SocketAddr) {
+        self.peer_validated = false;
+        self.unval_recv_bytes = 0;
+        self.unval_sent_bytes = 0;
+        let nonce = self.next_challenge_nonce();
+        self.pending_challenge = Some((addr, nonce, Instant::now()));
+    }
+
+    /// Send one control frame to an address that is not necessarily the
+    /// established peer.
+    ///
+    /// Cleartext even when TLS is armed: a candidate session cannot open the
+    /// established session's keys. Carries no amplification accounting - a
+    /// [`PATH_FRAME_LEN`]-byte frame emitted only in response to a full data
+    /// datagram.
+    /// An unguessable challenge nonce. Seeded from the high-resolution monotonic
+    /// clock (never on the wire) mixed through splitmix64, so an off-path
+    /// attacker that can read the cleartext connection id still cannot predict
+    /// the value it would have to echo.
+    fn next_challenge_nonce(&mut self) -> u64 {
+        self.challenge_seq = self.challenge_seq.wrapping_add(1);
+        let entropy = self.start.elapsed().as_nanos() as u64;
+        let mut x = entropy
+            ^ self.challenge_seq.rotate_left(32)
+            ^ self.cid;
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        x ^ (x >> 31)
+    }
+
+    /// (Re)send the outstanding PATH_CHALLENGE `[type][conn-id][nonce]`. Called
+    /// once per poll while a challenge is pending, so a lost challenge is
+    /// retransmitted; subject to the anti-amplification cap via
+    /// [`wire_send_to_peer`](Self::wire_send_to_peer).
+    fn maybe_send_challenge(&mut self) -> io::Result<()> {
+        let Some((addr, nonce, _)) = self.pending_challenge else {
+            return Ok(());
+        };
+        if self.peer != Some(addr) {
+            return Ok(());
+        }
+        let mut pkt = Vec::with_capacity(PATH_FRAME_LEN);
+        pkt.push(PKT_RLC_PATH_CHALLENGE);
+        pkt.extend_from_slice(&self.cid.to_le_bytes());
+        pkt.extend_from_slice(&nonce.to_le_bytes());
+        self.wire_send_to_peer(&pkt)
+    }
+
+    /// Validate an incoming PATH_RESPONSE: it must carry this session's id, come
+    /// from the address under challenge, and echo the exact nonce. On a match the
+    /// address is confirmed reachable and the anti-amplification cap is lifted.
+    fn handle_path_response(&mut self, inner: &[u8], from: SocketAddr) {
+        if inner.len() < PATH_FRAME_LEN {
+            return;
+        }
+        let cid = u64::from_le_bytes(inner[1..9].try_into().unwrap());
+        let nonce = u64::from_le_bytes(inner[9..17].try_into().unwrap());
+        // An answer for a candidate session carries an id this window does not
+        // own; the receiver intercepts those before routing, so anything
+        // reaching here must match.
+        if self.cid != cid {
+            return;
+        }
+        if let Some((addr, want, _)) = self.pending_challenge
+            && addr == from
+            && want == nonce
+        {
+            self.peer_validated = true;
+            self.pending_challenge = None;
+            self.prev_peer = None;
+            self.path_validations += 1;
+        }
+    }
+
+    /// Expire an unanswered challenge: if no PATH_RESPONSE arrived within
+    /// [`CHALLENGE_TIMEOUT`], the move was spoofed (a genuine peer answers within
+    /// a round trip), so revert to the previous address and lift the cap.
+    fn expire_stale_challenge(&mut self) {
+        if let Some((_, _, sent)) = self.pending_challenge
+            && sent.elapsed() > CHALLENGE_TIMEOUT
+        {
+            if let Some(prev) = self.prev_peer {
+                self.peer = Some(prev);
+            }
+            self.pending_challenge = None;
+            self.prev_peer = None;
+            self.peer_validated = true;
+            self.path_validation_failures += 1;
+        }
+    }
+
+    fn process(&mut self, pkt: &[u8], arrival_us: f64) {
+        match pkt[0] {
+            PKT_RLC_DATA if pkt.len() >= DATA_HDR + self.symbol_len => {
+                let sid = u32::from_le_bytes([pkt[9], pkt[10], pkt[11], pkt[12]]);
+                let send_us = u32::from_le_bytes([pkt[13], pkt[14], pkt[15], pkt[16]]);
+                #[cfg(test)]
+                if self.drop_head_data(sid) {
+                    return;
+                }
+                // Inject diagnostic loss. The Gilbert-Elliott path erases per the
+                // deterministic id-indexed chain (retransmits pass); the Bernoulli
+                // path draws per new arrival. Either way a retransmit always gets
+                // through, so the ARQ floor converges.
+                let erase = if self.ge_loss_r > 0 {
+                    self.ge_erase_first(sid)
+                } else {
+                    !self.dec.has(sid) && self.roll_drop()
+                };
+                if erase {
+                    return;
+                }
+                // The original DATA for this id arrived (possibly reordered, after
+                // the FEC already recovered it): record it so the deferred loss
+                // accounting does not count a reordered id as a loss.
+                self.data_arrived.insert(sid);
+                // Feed the congestion classifier with the drain-loop arrival
+                // stamp: inter-arrival spacing (Biaz) and the relative one-way
+                // trip time (Spike). A constant clock offset cancels in the Spike
+                // min/max range.
+                if let Some(prev) = self.last_arrival_us {
+                    self.loss_class.observe_interarrival(arrival_us - prev);
+                }
+                self.loss_class.observe_owd(arrival_us - send_us as f64);
+                // A forward jump past the highest seen reveals a gap whose width
+                // is the consecutive-loss count Biaz / Spike classify.
+                let prev_highest = self.highest_seen;
+                if let Some(prev) = self.last_arrival_us
+                    && sid > prev_highest + 1
+                {
+                    self.loss_class.classify(sid - prev_highest - 1, arrival_us - prev);
+                }
+                // Packet-pair dispersion: when this id is exactly one past the
+                // last DATA, the gap to it is the bottleneck's per-packet
+                // transmission time (the sender ships occasional back-to-back
+                // pairs to surface the tight gaps). Keep the minimum - the
+                // bottleneck imposes it regardless of how many other ids drop,
+                // so it measures capacity independently of loss.
+                if self.last_data_sid == Some(sid.wrapping_sub(1))
+                    && let Some(prev) = self.last_arrival_us
+                {
+                    let gap = arrival_us - prev;
+                    // Keep only gaps above the NAPI-batch floor; the near-zero
+                    // mass (same-poll arrivals) would poison a min/low-percentile
+                    // read of the true bottleneck dispersion.
+                    if gap >= PAIR_GAP_FLOOR_US {
+                        if self.pair_ring.len() < PAIR_RING_CAP {
+                            self.pair_ring.push(gap);
+                        } else {
+                            self.pair_ring[self.pair_ring_pos] = gap;
+                            self.pair_ring_pos = (self.pair_ring_pos + 1) % PAIR_RING_CAP;
+                        }
+                    }
+                    if self.pair_debug && gap > 0.0 {
+                        self.pair_gap_log.push(gap);
+                    }
+                }
+                if let StreamStart::Probing(probe) = &mut self.stream_start {
+                    probe.saw(sid, send_us, arrival_us);
+                }
+                self.last_data_sid = Some(sid);
+                self.last_arrival_us = Some(arrival_us);
+                self.highest_seen = self.highest_seen.max(sid);
+                // Store only - the batched recovery pass after the drain solves.
+                self.dec.on_source(sid, &pkt[DATA_HDR..DATA_HDR + self.symbol_len]);
+            }
+            PKT_RLC_REPAIR if pkt.len() >= 20 => {
+                #[cfg(test)]
+                if self.head_drop_repairs && (self.head_dropped.len() as u32) < self.head_drop {
+                    return;
+                }
+                let repair_key = u32::from_le_bytes([pkt[9], pkt[10], pkt[11], pkt[12]]);
+                let first_source_id = u32::from_le_bytes([pkt[13], pkt[14], pkt[15], pkt[16]]);
+                let window_size = u16::from_le_bytes([pkt[17], pkt[18]]);
+                let dt = pkt[19];
+                let payload = pkt[20..].to_vec();
+                if payload.len() != self.symbol_len {
+                    return;
+                }
+                // A repair covering id 0 is the sender still holding it.
+                if first_source_id == 0 && matches!(self.stream_start, StreamStart::Probing(_)) {
+                    self.stream_start = StreamStart::Settled;
+                }
+                self.highest_seen = self
+                    .highest_seen
+                    .max(first_source_id.wrapping_add(window_size as u32).saturating_sub(1));
+                // Store the repair only; the batched recovery pass solves.
+                self.dec.add_repair(RepairSymbol {
+                    repair_key,
+                    first_source_id,
+                    window_size,
+                    dt,
+                    payload,
+                });
+            }
+            _ => self.malformed_frames += 1,
+        }
+    }
+
+    fn deliver(&mut self, out: &mut Vec<Vec<u8>>, now_us: f64, grace: f64) {
+        while let Some(sym) = self.dec.get(self.delivered_through) {
+            out.push(unpack_symbol(sym));
+            // Deliver the data immediately (no added latency), but defer the loss
+            // accounting by the reorder grace: a FEC-recovered id whose original
+            // arrives within the grace was reordered, not lost.
+            let sid = self.delivered_through;
+            let was_fec = self.fec_recovered.contains(&sid);
+            let was_nak = self.nakd.contains(&sid);
+            self.loss_pending.push_back((sid, now_us + grace, was_fec, was_nak));
+            // The injector's per-id memo is only needed until the id is
+            // delivered; prune it so a long-lived flow does not grow unbounded.
+            self.ge_decided.remove(&sid);
+            self.ge_dropped_once.remove(&sid);
+            self.delivered_through = self.delivered_through.wrapping_add(1);
+        }
+        // Everything below the delivery frontier is done; free it.
+        self.dec.forget_below(self.delivered_through);
+    }
+
+    /// Fold the deferred loss accounting for delivered ids whose reorder grace
+    /// has elapsed, in delivery order. An id is lost when it had to be NAK'd, or
+    /// the FEC recovered it and its original `DATA` never arrived (a recovered id
+    /// whose original later arrived was merely reordered).
+    fn flush_loss_accounting(&mut self, now_us: f64) {
+        while let Some(&(sid, account_at, was_fec, was_nak)) = self.loss_pending.front() {
+            if account_at > now_us {
+                break;
+            }
+            self.loss_pending.pop_front();
+            let lost = was_nak || (was_fec && !self.data_arrived.contains(&sid));
+            self.burst_model.observe(lost);
+            // Smooth (1/128) so the loss the sender provisions the rate against
+            // tracks the sustained loss, not per-burst spikes (the burst length,
+            // which the window provisions against, comes from the burst model).
+            let x = if lost { 1.0 } else { 0.0 };
+            self.loss_ewma += (x - self.loss_ewma) * (1.0 / 128.0);
+            // Sliding-window loss counter: push this outcome, evict the oldest.
+            self.loss_window.push_back(lost);
+            if lost {
+                self.loss_window_lost += 1;
+            }
+            if self.loss_window.len() > LOSS_WINDOW
+                && let Some(true) = self.loss_window.pop_front()
+            {
+                self.loss_window_lost -= 1;
+            }
+            self.total_delivered += 1;
+            if lost {
+                self.total_lost += 1;
+            }
+            self.fec_recovered.remove(&sid);
+            self.data_arrived.remove(&sid);
+            self.nakd.remove(&sid);
+        }
+    }
+
+    /// NAK the missing source ids still blocking delivery. Rate-limited (one
+    /// round per interval) so a stalled gap does not flood the sender, but a
+    /// whole batch of gaps is requested per round so ARQ recovers them in
+    /// parallel rather than one per round trip. The interval gives the RLC
+    /// window a chance to recover the gap first (FEC-primary, ARQ-fallback).
+    fn maybe_nak(&mut self) -> io::Result<()> {
+        // 1ms between NAK rounds: long enough that the FEC window gets many
+        // repairs to recover a hole first (FEC-primary), short enough that a
+        // hole the window cannot cover is retransmitted before the sender's
+        // flow runway is exhausted waiting on it.
+        if self.last_nak.elapsed() < Duration::from_millis(1) {
+            return Ok(());
+        }
+        let now_us = self.start.elapsed().as_micros() as f64;
+        // Reorder tolerance: a gap is only NAK'd after it has been missing for
+        // this long, so a merely-reordered packet (which arrives within the
+        // path's delay spread) is not declared lost and NAK'd as a false loss.
+        // Scales with the recent ROTT spread (the jitter), floored at 1ms.
+        let grace = (2.0 * self.loss_class.recent_owd_spread_us()).clamp(1000.0, 50_000.0);
+        let mut missing = Vec::new();
+        // Scan from the delivery frontier up to a bounded window: the lowest
+        // gaps are the ones blocking delivery, and the window covers the reorder
+        // span without an unbounded scan when delivery is deeply stalled.
+        let scan_end = self.highest_seen.min(self.delivered_through.wrapping_add(1024));
+        let mut sid = self.delivered_through;
+        while sid <= scan_end {
+            if self.dec.has(sid) {
+                self.gap_since.remove(&sid);
+            } else {
+                let first = *self.gap_since.entry(sid).or_insert(now_us);
+                if now_us - first >= grace && missing.len() < 16 {
+                    missing.push(sid);
+                }
+            }
+            sid = sid.wrapping_add(1);
+        }
+        // Drop gap records below the delivery frontier (delivered = not a gap).
+        let dt = self.delivered_through;
+        self.gap_since.retain(|&k, _| k >= dt);
+        if missing.is_empty() {
+            return Ok(());
+        }
+        if self.peer.is_some() {
+            let mut pkt = Vec::with_capacity(1 + 4 * missing.len());
+            pkt.push(PKT_RLC_NAK);
+            for &m in &missing {
+                pkt.extend_from_slice(&m.to_le_bytes());
+                // A NAK'd id is a loss the coding window did not cover; record it
+                // so the loss trace counts it even once the retransmit arrives.
+                self.nakd.insert(m);
+            }
+            self.wire_send_to_peer(&pkt)?;
+            self.naks_sent += 1;
+            self.last_nak = Instant::now();
+        }
+        Ok(())
+    }
+
+    fn send_ack(&mut self) -> io::Result<()> {
+        // An ACK goes out immediately whenever the delivery frontier advanced,
+        // so a live flow's window releases at wire latency. A frontier that
+        // has not moved re-acks at most once per interval: the cumulative
+        // frontier + SACK bitmap carries the full receive state, so each ACK
+        // supersedes every prior one and the idle re-ack is pure keep-current.
+        if self.delivered_through == self.last_acked_through
+            && self.last_ack_sent.elapsed() < Duration::from_millis(10)
+        {
+            return Ok(());
+        }
+        if self.peer.is_some() {
+            // Cumulative in-order received frontier plus a 64-bit SACK bitmap of
+            // ids received above the current hole (`delivered_through` is the
+            // first missing id). The sender releases each SACK'd id from its
+            // retransmit buffer, so a hole does not stall the outstanding window.
+            let mut sack = 0u64;
+            for i in 0..64u32 {
+                if self.dec.has(self.delivered_through.wrapping_add(1 + i)) {
+                    sack |= 1u64 << i;
+                }
+            }
+            let mut pkt = Vec::with_capacity(13);
+            pkt.push(PKT_RLC_ACK);
+            pkt.extend_from_slice(&self.delivered_through.to_le_bytes());
+            pkt.extend_from_slice(&sack.to_le_bytes());
+            self.wire_send_to_peer(&pkt)?;
+            self.acks_sent += 1;
+            self.last_ack_sent = Instant::now();
+            self.last_acked_through = self.delivered_through;
+        }
+        Ok(())
+    }
+
+    /// Periodically ship the fused channel assessment back to the sender so its
+    /// controller can retune the coding. Rate-limited to one frame per interval;
+    /// each signal is quantized to a byte (so a fully-decayed estimate rounds to
+    /// an exact zero, the disable-on-clean trigger). Sent on every interval, not
+    /// only under loss, so a clean spell is reported and coding eventually winds
+    /// down.
+    /// Windowed forward-loss rate the controller provisions FEC against. The
+    /// MIN_FILL denominator suppresses a cold-start spike (a few early losses
+    /// divide by the floor, not the tiny actual count).
+    fn windowed_loss(&self) -> f32 {
+        self.loss_window_lost as f32 / self.loss_window.len().max(LOSS_WINDOW_MIN_FILL) as f32
+    }
+
+    fn maybe_feedback(&mut self) -> io::Result<()> {
+        if self.last_feedback.elapsed() < Duration::from_millis(10) || self.peer.is_none() {
+            return Ok(());
+        }
+        // The loss the sender provisions the rate against is a windowed rate over
+        // recent deliveries. The burst model's `p/(p+r)` reduces algebraically to
+        // the cumulative `losses/n` - anchored by startup samples, it never
+        // forgets, so an early loss cluster (or small-sample noise) read 44% loss
+        // during a true-6% transfer and held FEC at its heaviest until the very
+        // end. The windowed rate tracks the sustained loss quickly; the burst
+        // model still supplies burstiness (mean burst) below.
+        let loss = self.windowed_loss();
+        let loss_q8 = (loss.clamp(0.0, 1.0) * 255.0).round() as u8;
+        // burstiness is mean_burst / 16, the convention the snapshot and the RLC
+        // window map both use; before the fit converges it reads 0 (isolated).
+        let burstiness = self
+            .burst_model
+            .mean_burst_len()
+            .map(|m| (m as f32 / 16.0).clamp(0.0, 1.0))
+            .unwrap_or(0.0);
+        let burst_q8 = (burstiness * 255.0).round() as u8;
+        let cong_q8 = (self.loss_class.congestion_fraction().clamp(0.0, 1.0) * 255.0).round() as u8;
+        // The receiver's measured delivered (goodput) rate since the last feedback:
+        // source symbols delivered in-order over the interval. This is the
+        // ground-truth signal the sender's adaptive push rides - it plateaus at
+        // the path capacity (unlike the binary loss signal), so it is safe to
+        // probe against. Quantized to a u16 Mbit/s (0..65535).
+        let interval_s = self.last_feedback.elapsed().as_secs_f64().max(1e-3);
+        let delivered = self.delivered_through.wrapping_sub(self.last_fb_delivered) as f64;
+        let rate_mbit =
+            (delivered * self.symbol_len as f64 * 8.0 / interval_s / 1.0e6).clamp(0.0, 65535.0);
+        let rate_q16 = (rate_mbit.round() as u16).to_le_bytes();
+        self.last_fb_delivered = self.delivered_through;
+        // Packet-pair capacity estimate (Mbit/s): on-wire bytes / the tightest
+        // consecutive-id gap. The bottleneck imposes that gap independently of
+        // loss, so this is the one rate signal random loss cannot confound - the
+        // sender cruises just under it. 0 until a pair has been seen. Decay the
+        // gap upward slightly so the estimate tracks down if the path slows.
+        let wire_bytes = (self.symbol_len + 70) as f64;
+        let cap_mbit = if self.pair_ring.len() >= 32 {
+            let mut s = self.pair_ring.clone();
+            s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let idx = (s.len() * PAIR_PERCENTILE_NUM / PAIR_PERCENTILE_DEN).min(s.len() - 1);
+            let gap = s[idx].max(PAIR_GAP_FLOOR_US);
+            (wire_bytes * 8.0 / gap).clamp(0.0, 65535.0)
+        } else {
+            0.0
+        };
+        let cap_q16 = (cap_mbit.round() as u16).to_le_bytes();
+        // Diagnostic: dump the consecutive-id gap distribution every ~4k samples
+        // so the true bottleneck dispersion can be separated from NAPI-batch
+        // noise. Percentiles in microseconds; the implied capacity (Mbit/s) for
+        // a few of them lets the right floor / estimator be chosen empirically.
+        if self.pair_debug && self.pair_gap_log.len() >= 4000 {
+            let mut g = std::mem::take(&mut self.pair_gap_log);
+            g.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let n = g.len();
+            let pc = |p: f64| g[((n as f64 * p) as usize).min(n - 1)];
+            let cap = |us: f64| if us > 0.0 { wire_bytes * 8.0 / us } else { 0.0 };
+            eprintln!(
+                "PAIRGAP n={n} us[min={:.1} p1={:.1} p5={:.1} p10={:.1} p25={:.1} p50={:.1} p75={:.1}] \
+                 cap_at_p25={:.0} EST_FED={cap_mbit:.0} Mbit (floored p25, ring={})",
+                pc(0.0), pc(0.01), pc(0.05), pc(0.10), pc(0.25), pc(0.50), pc(0.75),
+                cap(pc(0.25)), self.pair_ring.len(),
+            );
+        }
+        let pkt = [
+            PKT_RLC_FEEDBACK,
+            loss_q8,
+            burst_q8,
+            cong_q8,
+            rate_q16[0],
+            rate_q16[1],
+            cap_q16[0],
+            cap_q16[1],
+        ];
+        self.wire_send_to_peer(&pkt)?;
+        self.feedback_sent += 1;
+        self.last_feedback = Instant::now();
+        Ok(())
+    }
+}
+
+impl SensOMaticRlcReceiver {
+    /// Bind a receiver over `symbol_len`-byte symbols. No session exists until
+    /// a peer is seen; each connection id that arrives opens its own.
+    pub fn bind<A: ToSocketAddrs>(local: A, symbol_len: usize) -> io::Result<Self> {
+        let sock = UdpSocket::bind(local)?;
+        sock.set_nonblocking(true)?;
+        set_buffers(&sock);
+        // Auto-detect the datagram backend (io_uring where available, plain
+        // UDP otherwise); kernel RX timestamps are enabled by the wrapper.
+        let sock = crate::dgram::DgramSock::wrap(sock);
+        Ok(Self {
+            sock: std::sync::Arc::new(sock),
+            symbol_len,
+            start: Instant::now(),
+            sessions: HashMap::new(),
+            order: Vec::new(),
+            pending_admissions: HashMap::new(),
+            session_ceiling: None,
+            session_refusals: 0,
+            session_service_errors: 0,
+            unattributed_frames: 0,
+            last_unattributed_byte: 0,
+            challenge_seq: 0,
+            session_changed: false,
+            session_admissions: 0,
+            session_admission_failures: 0,
+            kts_base_ns: None,
+            drop_pct: 0,
+            drop_seed: 0,
+            ge_loss_p: 0,
+            ge_loss_r: 0,
+            pair_debug: std::env::var("SUBETHA_PAIR_DEBUG").is_ok(),
+            #[cfg(test)]
+            head_drop: 0,
+            #[cfg(test)]
+            head_drop_repairs: false,
+            #[cfg(feature = "tls")]
+            crypto: None,
+            #[cfg(feature = "tls")]
+            handshake_peer: None,
+            #[cfg(feature = "tls")]
+            tls_armed: false,
+        })
+    }
+
+    /// Swap the datagram socket for one the caller already built (a demux
+    /// socket the unified endpoint shares across both codes). Live sessions
+    /// pick the new socket up, since they hold the same handle.
+    pub fn set_sock(&mut self, sock: crate::dgram::DgramSock) {
+        let sock = std::sync::Arc::new(sock);
+        self.sock = std::sync::Arc::clone(&sock);
+        for cid in &self.order {
+            if let Some(s) = self.sessions.get_mut(cid) {
+                s.sock = std::sync::Arc::clone(&sock);
+            }
+        }
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.sock.local_addr()
+    }
+
+    /// Which datagram backend the socket resolved to.
+    pub fn dgram_backend(&self) -> crate::dgram::DgramBackend {
+        self.sock.backend()
+    }
+
+    /// Arm the optional TLS record layer as the server. Call
+    /// [`handshake`](Self::handshake) before polling for data.
+    ///
+    /// A TLS receiver serves one peer: there is a single handshake, so exactly
+    /// one session can hold the resulting keys. A second connection id arriving
+    /// on a TLS receiver is refused rather than admitted unsealed.
+    #[cfg(feature = "tls")]
+    pub fn with_tls_server(mut self, cfg: std::sync::Arc<rustls::ServerConfig>) -> io::Result<Self> {
+        self.crypto = Some(std::sync::Arc::new(
+            crate::rlc_crypto::CryptoState::new_server(cfg).map_err(io::Error::other)?,
+        ));
+        self.tls_armed = true;
+        Ok(self)
+    }
+
+    /// Run the TLS handshake as the server (no-op when TLS is not armed). Blocks
+    /// until the client connects and the 1-RTT keys are derived; learns the peer.
+    /// Runs before any session opens, while the receiver alone holds the keys.
+    #[cfg(feature = "tls")]
+    pub fn handshake(&mut self) -> io::Result<()> {
+        if let Some(shared) = self.crypto.as_mut() {
+            let crypto = std::sync::Arc::get_mut(shared).ok_or_else(|| {
+                io::Error::other("tls handshake after a session already holds the keys")
+            })?;
+            let peer = drive_handshake(&self.sock, None, crypto, false)?;
+            self.handshake_peer = Some(peer);
+        }
+        Ok(())
+    }
+
+    /// Drop `pct` percent of incoming DATA (seeded) to exercise recovery on a
+    /// lossless link. Stamped onto each session as it opens, so every peer sees
+    /// the same injected rate.
+    pub fn with_debug_loss(mut self, pct: u32, seed: u64) -> Self {
+        self.drop_pct = pct.min(100);
+        self.drop_seed = seed | 1;
+        self
+    }
+
+    /// Gilbert-Elliott burst-loss injection, per-10000 transition probabilities.
+    pub fn with_gilbert_loss(mut self, p_per_10k: u32, r_per_10k: u32, seed: u64) -> Self {
+        self.ge_loss_p = p_per_10k;
+        self.ge_loss_r = r_per_10k;
+        self.drop_seed = seed | 1;
+        self
+    }
+
+    /// Test-only loss at the head of every session opened from here on: its
+    /// first `datagrams` `DATA` datagrams are lost, first copies only so a
+    /// resend passes, and with `repairs` so is every `REPAIR` that arrives
+    /// before they have all gone.
+    #[cfg(test)]
+    pub(crate) fn set_head_loss(&mut self, datagrams: u32, repairs: bool) {
+        self.head_drop = datagrams;
+        self.head_drop_repairs = repairs;
+    }
+
+    /// Open a session for `cid`, or `None` if the id is refused: a TLS receiver
+    /// holds one handshake and serves the peer those keys belong to, and a
+    /// declared ceiling bounds how many peers are carried. Each refusal is
+    /// counted in `session_refusals`.
+    fn open_session(&mut self, cid: u64) -> Option<&mut RlcSession> {
+        if !self.sessions.contains_key(&cid) {
+            if self.session_ceiling.is_some_and(|max| self.sessions.len() >= max) {
+                self.session_refusals += 1;
+                return None;
+            }
+            #[cfg(feature = "tls")]
+            if self.tls_armed && !self.sessions.is_empty() {
+                self.session_refusals += 1;
+                return None;
+            }
+            let mut s = RlcSession::new(
+                cid,
+                std::sync::Arc::clone(&self.sock),
+                self.symbol_len,
+                self.start,
+            );
+            s.drop_pct = self.drop_pct;
+            s.drop_rng = self.drop_seed;
+            s.ge_loss_p = self.ge_loss_p;
+            s.ge_loss_r = self.ge_loss_r;
+            s.pair_debug = self.pair_debug;
+            #[cfg(test)]
+            {
+                s.head_drop = self.head_drop;
+                s.head_drop_repairs = self.head_drop_repairs;
+            }
+            #[cfg(feature = "tls")]
+            {
+                s.crypto = self.crypto.clone();
+                s.peer = self.handshake_peer;
+            }
+            self.sessions.insert(cid, s);
+            self.order.push(cid);
+        }
+        self.sessions.get_mut(&cid)
+    }
+
+    /// Read whatever has arrived and deliver in-order items, each tagged with
+    /// the connection id of the peer that sent it.
+    ///
+    /// This is the call a node receiving from several peers wants: ordering is
+    /// guaranteed within a connection id, and nothing orders one peer against
+    /// another. [`poll`](Self::poll) is the same drain with the tag dropped.
+    ///
+    /// With TLS armed the receiver serves one peer: there is a single
+    /// handshake, so concurrent senders cannot each establish keys.
+    pub fn poll_from(&mut self) -> io::Result<Vec<(u64, Vec<u8>)>> {
+        let mut out: Vec<(u64, Vec<u8>)> = Vec::new();
+        // Room for the inner `DATA` / `REPAIR` plus the AEAD envelope (type + pn + tag)
+        // when TLS is on.
+        let mut buf = vec![0u8; self.symbol_len + 64];
+        let mut received = 0usize;
+        let mut resets = 0usize;
+        // Drain pass: pull every available datagram, stamping its arrival time
+        // and routing it to the session that owns its id, with no Gaussian solve
+        // in the loop - so the arrival stamp the congestion classifier reads
+        // reflects the network, not the decode backlog.
+        loop {
+            match self.sock.recv_with_kts(&mut buf) {
+                Ok((n, from, kts)) if n >= 1 => {
+                    // Prefer the kernel RX timestamp (offset by the first one to
+                    // keep the magnitude small); fall back to the drain-loop
+                    // clock where it is unavailable.
+                    let arrival_us = match kts {
+                        Some(ns) => {
+                            let base = *self.kts_base_ns.get_or_insert(ns);
+                            (ns - base) as f64 / 1000.0
+                        }
+                        None => self.start.elapsed().as_micros() as f64,
+                    };
+                    // Open the AEAD envelope when TLS is on; the FEC sees the
+                    // cleartext inner datagram. A non-sealed frame (a stray
+                    // handshake retransmit) is skipped. Routing runs on the
+                    // cleartext, since the connection id is inside.
+                    #[cfg(feature = "tls")]
+                    if self.crypto.is_some() {
+                        let inner = self.crypto.as_ref().and_then(|c| secure_unwrap(c, &buf[..n]));
+                        if let Some(inner) = inner
+                            && self.route_datagram(&inner, from, arrival_us)
+                        {
+                            received += 1;
+                        }
+                        continue;
+                    }
+                    let n = n.min(buf.len());
+                    let frame = buf[..n].to_vec();
+                    if self.route_datagram(&frame, from, arrival_us) {
+                        received += 1;
+                    }
+                }
+                Ok(_) => {}
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(ref e) if e.kind() == io::ErrorKind::TimedOut => break,
+                // Windows reports an ICMP port-unreachable provoked by a
+                // preceding send as ConnectionReset on the next receive. It
+                // describes that send, not the datagrams queued behind it, so
+                // the drain continues: ending it here strands every peer whose
+                // datagrams sit after the reset while the receiver keeps
+                // feeding a dead peer and re-arming the ICMP each tick.
+                // Bounded so a socket that only ever resets still terminates.
+                Err(ref e) if e.kind() == io::ErrorKind::ConnectionReset => {
+                    resets += 1;
+                    if resets >= MAX_DRAIN_RESETS {
+                        break;
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        // Retire admission challenges that went unanswered, then (re)send the
+        // ones still outstanding - after the drain, so an answer that arrived
+        // this tick is not challenged again.
+        self.expire_stale_admissions();
+        self.send_admission_challenges()?;
+        // Service every live session in first-seen order, so delivery across
+        // peers is deterministic rather than hash-ordered.
+        // A session's service error is a send toward its own peer and stays
+        // with that session. Every session is serviced each tick, and `out`
+        // keeps this tick's items.
+        let ids = self.order.clone();
+        for cid in ids {
+            if let Some(mut s) = self.sessions.remove(&cid) {
+                let r = s.service(&mut out);
+                self.sessions.insert(cid, s);
+                if let Err(e) = r {
+                    self.session_service_errors += 1;
+                    if self.session_service_errors == 1 {
+                        eprintln!(
+                            "subetha: RLC session {cid} could not be serviced: {e} - \
+                             its peer has not been told what this receiver is missing"
+                        );
+                    }
+                }
+            }
+        }
+        // Idle backoff: the socket is non-blocking, so when nothing arrived and
+        // nothing delivered, yield briefly instead of busy-spinning the caller.
+        if received == 0 && out.is_empty() {
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        Ok(out)
+    }
+
+    /// Route one cleartext datagram to the session that owns its connection id.
+    ///
+    /// The first id a receiver sees is admitted outright: there is no
+    /// established session for a forgery to disturb, and this is the ordinary
+    /// point-to-point case. Every id after that is challenged before a decode
+    /// window is opened for it, so an off-path attacker cannot make a receiver
+    /// allocate state by spraying connection ids it cannot receive answers for.
+    ///
+    /// Only `DATA` and `REPAIR` carry a connection id, and a `PATH_RESPONSE` carries
+    /// the id of the window it answers. Nothing else has an owner here: such a
+    /// frame is counted in [`unattributed_frames`](Self::unattributed_frames)
+    /// and reaches no session, so no session's address moves on the word of a
+    /// frame that could have come from anyone.
+    fn route_datagram(&mut self, inner: &[u8], from: SocketAddr, arrival_us: f64) -> bool {
+        // An answer to an outstanding admission challenge opens a window. It is
+        // checked before the id is resolved: the candidate has no session yet,
+        // so resolving first would route the answer to an unrelated window.
+        if self.try_admit(inner, from) {
+            return true;
+        }
+        let cid = match frame_conn_id(inner) {
+            Some(cid) => cid,
+            None => match path_response_conn_id(inner) {
+                // A migration answer for a live window goes to that window;
+                // one for an unknown id is not a request to open one.
+                Some(cid) if self.sessions.contains_key(&cid) => cid,
+                _ => {
+                    self.unattributed_frames += 1;
+                    self.last_unattributed_byte = match inner.first() {
+                        Some(byte) => *byte,
+                        None => 0,
+                    };
+                    return false;
+                }
+            },
+        };
+        if !self.sessions.contains_key(&cid) && !self.sessions.is_empty() {
+            self.begin_admission(cid, from);
+            return false;
+        }
+        match self.open_session(cid) {
+            Some(s) => s.route_and_process(inner, from, arrival_us),
+            None => false,
+        }
+    }
+
+    /// Read whatever has arrived and deliver in-order items. Peer attribution is
+    /// dropped; use [`poll_from`](Self::poll_from) when a node receives from
+    /// several peers and needs to know which sent what.
+    /// Datagrams this receiver's kernel dropped because the receive buffer
+    /// was full, and what the count is worth on this host.
+    pub fn kernel_drops(&self) -> (u64, crate::dgram::DropReport) {
+        self.sock.kernel_drops()
+    }
+
+    pub fn poll(&mut self) -> io::Result<Vec<Vec<u8>>> {
+        Ok(self.poll_from()?.into_iter().map(|(_, item)| item).collect())
+    }
+
+    /// Re-base every live session's delivery to start at `base` for a
+    /// cross-code resync (each session's own `skip_to`).
+    pub fn skip_to(&mut self, base: u32) {
+        for s in self.sessions.values_mut() {
+            s.skip_to(base);
+        }
+    }
+
+    /// The connection ids with a live decode window, in first-seen order.
+    pub fn live_sessions(&self) -> Vec<u64> {
+        self.order.clone()
+    }
+
+    /// Bound the live windows and the candidates under challenge at `max`.
+    /// Unbounded unless set. A peer turned away by the ceiling is counted in
+    /// [`session_refusals`](Self::session_refusals) rather than dropped
+    /// silently.
+    pub fn with_session_ceiling(mut self, max: usize) -> Self {
+        self.session_ceiling = Some(max.max(1));
+        self
+    }
+
+    /// Peers refused a decode window, by a declared ceiling or by TLS already
+    /// holding its one handshake. Non-zero means a peer that reached this
+    /// receiver was not served.
+    pub fn session_refusals(&self) -> u64 {
+        self.session_refusals
+    }
+
+    /// Whether a session was admitted since the last call. Edge-triggered:
+    /// reading it clears it.
+    pub fn take_session_changed(&mut self) -> bool {
+        std::mem::replace(&mut self.session_changed, false)
+    }
+
+    /// Per-session service errors. Non-zero means a peer was not told what
+    /// this receiver is missing, which from its side is indistinguishable
+    /// from a receiver that stopped asking.
+    pub fn session_service_errors(&self) -> u64 {
+        self.session_service_errors
+    }
+
+    /// `(frames, last type byte)` for frames that named no session: a frame
+    /// without a connection id that is not a PATH_RESPONSE, or a PATH_RESPONSE
+    /// for an id with no live window that answered no admission challenge.
+    /// Non-zero under a stray or misconfigured sender (a TLS sender at a
+    /// cleartext receiver sends only id-less frames); none of them moved any
+    /// session's address. The byte is 0 for an empty datagram.
+    pub fn unattributed_frames(&self) -> (u64, u8) {
+        (self.unattributed_frames, self.last_unattributed_byte)
+    }
+
+    /// `DATA` / `REPAIR` frames too short for their header, summed over every
+    /// session; each was dropped without a decode.
+    pub fn malformed_frames(&self) -> u64 {
+        self.sessions.values().map(|s| s.malformed_frames()).sum()
+    }
+
+    /// `(sessions admitted, challenges that went unanswered)`. The second
+    /// rising without the first is what a forged connection id looks like from
+    /// here. Use [`session_admissions_for`](Self::session_admissions_for) to
+    /// attribute an admission to one connection id.
+    pub fn session_adoption_counts(&self) -> (u64, u64) {
+        (self.session_admissions, self.session_admission_failures)
+    }
+
+    /// Whether `cid` holds an admitted session, and the address it answered
+    /// its challenge from. `None` for an id never admitted.
+    pub fn session_admissions_for(&self, cid: u64) -> Option<SocketAddr> {
+        self.sessions.get(&cid).and_then(|s| s.peer())
+    }
+
+    /// An unguessable admission-challenge nonce, mixed through splitmix64 so an
+    /// off-path attacker that can read the cleartext connection id still cannot
+    /// predict the value it would have to echo.
+    fn next_admission_nonce(&mut self, cid: u64) -> u64 {
+        self.challenge_seq = self.challenge_seq.wrapping_add(1);
+        let entropy = self.start.elapsed().as_nanos() as u64;
+        let mut x = entropy ^ self.challenge_seq.rotate_left(32) ^ cid;
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        x ^ (x >> 31)
+    }
+
+    /// Arm a challenge for a connection id asking to be admitted. An id already
+    /// under challenge from the same address keeps its nonce, so it is not
+    /// rolled faster than an answer can return. A declared ceiling bounds the
+    /// candidates held at once; refusals are counted in `session_refusals`.
+    fn begin_admission(&mut self, cid: u64, addr: SocketAddr) {
+        if self.session_ceiling.is_some_and(|max| self.pending_admissions.len() >= max) {
+            self.session_refusals += 1;
+            return;
+        }
+        if let Some(p) = self.pending_admissions.get(&cid)
+            && p.addr == addr
+        {
+            return;
+        }
+        let nonce = self.next_admission_nonce(cid);
+        self.pending_admissions.insert(cid, PendingAdmission {
+            addr,
+            nonce,
+            armed_at: Instant::now(),
+            last_sent: None,
+        });
+    }
+
+    /// (Re)send outstanding admission challenges, carrying the candidate id so
+    /// the responder's verbatim echo identifies which candidate an answer
+    /// belongs to. Each entry is resent at most once per
+    /// [`ADMISSION_RESEND_INTERVAL`], so a candidate that services its socket
+    /// on a coarse cadence finds a bounded backlog, not a poll-rate flood.
+    fn send_admission_challenges(&mut self) -> io::Result<()> {
+        let now = Instant::now();
+        let pending: Vec<(u64, SocketAddr, u64)> = self
+            .pending_admissions
+            .iter_mut()
+            .filter(|(_, p)| {
+                p.last_sent.is_none_or(|t| now.duration_since(t) >= ADMISSION_RESEND_INTERVAL)
+            })
+            .map(|(cid, p)| {
+                p.last_sent = Some(now);
+                (*cid, p.addr, p.nonce)
+            })
+            .collect();
+        for (cid, addr, nonce) in pending {
+            let mut pkt = Vec::with_capacity(PATH_FRAME_LEN);
+            pkt.push(PKT_RLC_PATH_CHALLENGE);
+            pkt.extend_from_slice(&cid.to_le_bytes());
+            pkt.extend_from_slice(&nonce.to_le_bytes());
+            send_with_retry(&self.sock, &pkt, addr)?;
+        }
+        Ok(())
+    }
+
+    /// Drop admission challenges that went unanswered past [`CHALLENGE_TIMEOUT`]
+    /// and count them. A genuine peer answers within a round trip; a forged id
+    /// never answers, so this is the counter that rises under a forgery.
+    fn expire_stale_admissions(&mut self) {
+        let before = self.pending_admissions.len();
+        self.pending_admissions
+            .retain(|_, p| p.armed_at.elapsed() < CHALLENGE_TIMEOUT);
+        self.session_admission_failures += (before - self.pending_admissions.len()) as u64;
+    }
+
+    /// Admit a candidate whose challenge nonce came back from the address it
+    /// was sent to. Return-routability is what this proves, which an off-path
+    /// attacker cannot supply.
+    fn try_admit(&mut self, inner: &[u8], from: SocketAddr) -> bool {
+        if inner.len() < PATH_FRAME_LEN || inner.first() != Some(&PKT_RLC_PATH_RESPONSE) {
+            return false;
+        }
+        let cid = u64::from_le_bytes(inner[1..9].try_into().unwrap());
+        let nonce = u64::from_le_bytes(inner[9..17].try_into().unwrap());
+        let Some(p) = self.pending_admissions.get(&cid) else {
+            return false;
+        };
+        if p.addr != from || p.nonce != nonce {
+            return false;
+        }
+        self.pending_admissions.remove(&cid);
+        if let Some(s) = self.open_session(cid) {
+            s.peer = Some(from);
+            // What this sender sent before admission was dropped; its window
+            // starts from id 0 or from a probe, as any window does.
+            self.session_admissions += 1;
+            self.session_changed = true;
+            return true;
+        }
+        false
+    }
+
+    /// Address migrations summed over every peer.
+    pub fn migrations(&self) -> u64 {
+        self.sessions.values().map(|s| s.migrations()).sum()
+    }
+
+    /// Successful path validations, summed over every peer.
+    pub fn path_validations(&self) -> u64 {
+        self.sessions.values().map(|s| s.path_validations()).sum()
+    }
+
+    /// Path-validation timeouts (reverts), summed over every peer.
+    pub fn path_validation_failures(&self) -> u64 {
+        self.sessions.values().map(|s| s.path_validation_failures()).sum()
+    }
+
+    /// The address of the most recently opened session, or `None` before any
+    /// peer is seen. Ambiguous once several peers are live - prefer
+    /// [`peer_of`](Self::peer_of).
+    pub fn peer(&self) -> Option<SocketAddr> {
+        self.order.last().and_then(|cid| self.sessions.get(cid)).and_then(|s| s.peer())
+    }
+
+    /// One session's delivery position: `(delivered_through, highest_seen)`.
+    /// `highest_seen` ahead of `delivered_through` is a window holding frames
+    /// behind a gap, or one still finding where its stream starts, which
+    /// holds `delivered_through` at 0; the two equal and unmoving is a window
+    /// with nothing to do.
+    pub fn session_frontier(&self, cid: u64) -> Option<(u32, u32)> {
+        self.sessions.get(&cid).map(|s| (s.delivered_through, s.highest_seen))
+    }
+
+    /// One session's control plane: `(naks_sent, acks_sent,
+    /// sends_skipped, peer_validated)`. `sends_skipped` counts control
+    /// frames dropped for a missing peer address or an exhausted
+    /// anti-amplification budget - those still return Ok to the
+    /// service, so `acks_sent` alone cannot tell a send from a skip.
+    pub fn session_control(&self, cid: u64) -> Option<(u64, u64, u64, bool)> {
+        self.sessions
+            .get(&cid)
+            .map(|s| (s.naks_sent, s.acks_sent, s.sends_skipped, s.peer_validated))
+    }
+
+    /// The address a given connection id is currently bound to.
+    pub fn peer_of(&self, cid: u64) -> Option<SocketAddr> {
+        self.sessions.get(&cid).and_then(|s| s.peer())
+    }
+
+    /// Source symbols recovered by RLC without a retransmit, summed over peers.
+    pub fn rlc_recovered(&self) -> u64 {
+        self.sessions.values().map(|s| s.rlc_recovered()).sum()
+    }
+
+    /// NAKs sent (the ARQ floor), summed over peers.
+    pub fn naks_sent(&self) -> u64 {
+        self.sessions.values().map(|s| s.naks_sent()).sum()
+    }
+
+    /// FEEDBACK frames sent, summed over peers.
+    pub fn feedback_sent(&self) -> u64 {
+        self.sessions.values().map(|s| s.feedback_sent()).sum()
+    }
+
+    /// The channel estimate of the most recently opened session. Per-peer by
+    /// nature - a mesh node has one estimate per path, not one for the node.
+    pub fn channel_estimate(&self) -> (f32, f32, f32) {
+        self.order
+            .last()
+            .and_then(|cid| self.sessions.get(cid))
+            .map(|s| s.channel_estimate())
+            .unwrap_or((0.0, 0.0, 0.0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    /// Every RLC packet type this module puts on the wire has a row in the
+    /// specification's packet-type table.
+    #[test]
+    fn the_rlc_packet_types_are_all_in_the_wire_specification() {
+        let mut types = vec![
+            (PKT_RLC_DATA, "source symbol"),
+            (PKT_RLC_REPAIR, "repair symbol"),
+            (PKT_RLC_NAK, "negative acknowledgment"),
+            (PKT_RLC_ACK, "acknowledgment"),
+            (PKT_RLC_FEEDBACK, "feedback"),
+            (PKT_RLC_PATH_CHALLENGE, "path challenge"),
+            (PKT_RLC_PATH_RESPONSE, "path response"),
+        ];
+        // Spent whether or not this build compiles the record layer, so
+        // they are asserted unconditionally and named by their numbers
+        // where the constants do not exist.
+        #[cfg(feature = "tls")]
+        types.extend_from_slice(&[
+            (PKT_RLC_CRYPTO, "handshake flight"),
+            (PKT_RLC_CRYPTO_ACK, "handshake flight acknowledgment"),
+            (PKT_RLC_SECURE, "sealed envelope"),
+        ]);
+        #[cfg(not(feature = "tls"))]
+        types.extend_from_slice(&[
+            (15, "handshake flight"),
+            (16, "handshake flight acknowledgment"),
+            (17, "sealed envelope"),
+        ]);
+        crate::spec_doc::assert_listed("sens_rlc", &types);
+    }
+
+    /// Telemetry a loopback round-trip returns: RLC recoveries, the NAKs the
+    /// receiver sent and the symbols the sender retransmitted (the ARQ floor,
+    /// asked for by either side), plus the sender's adaptation count and
+    /// feedback received.
+    struct RoundTrip {
+        recovered: u64,
+        naks: u64,
+        retransmits: u64,
+        adapt_count: u64,
+        feedback_recv: u64,
+    }
+
+    /// How loss is injected on the receiver: a flat Bernoulli percent, a
+    /// Gilbert-Elliott burst chain `(p, r)` per-10000, or the first `n` `DATA`
+    /// datagrams of the stream, with every `REPAIR` that arrives before them
+    /// when the flag is set.
+    #[derive(Clone, Copy)]
+    enum Loss {
+        Bernoulli(u32),
+        Gilbert(u32, u32),
+        Head(u32, bool),
+    }
+
+    /// Real loopback sockets, real UDP datagrams, with `loss` injected on the
+    /// receiver. When `static_params`, the sender is pinned at its initial code
+    /// (the static baseline); otherwise the sensing feedback adapts it.
+    /// Delivery must be exact and in order regardless.
+    fn run_loopback(n: u64, loss: Loss, seed: u64, static_params: bool) -> RoundTrip {
+        let item_len = 32usize;
+        let symbol_len = 64usize;
+        let (addr_tx, addr_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let rx = std::thread::spawn(move || {
+            let mut recv = SensOMaticRlcReceiver::bind("127.0.0.1:0", symbol_len).unwrap();
+            recv = match loss {
+                Loss::Bernoulli(pct) => recv.with_debug_loss(pct, seed),
+                Loss::Gilbert(p, r) => recv.with_gilbert_loss(p, r, seed),
+                Loss::Head(datagrams, repairs) => {
+                    recv.set_head_loss(datagrams, repairs);
+                    recv
+                }
+            };
+            addr_tx.send(recv.local_addr().unwrap()).unwrap();
+            let mut got: Vec<u64> = Vec::new();
+            let start = Instant::now();
+            while (got.len() as u64) < n {
+                if start.elapsed() > Duration::from_secs(20) {
+                    break;
+                }
+                for item in recv.poll().unwrap() {
+                    got.push(u64::from_le_bytes(item[..8].try_into().unwrap()));
+                }
+            }
+            for _ in 0..50 {
+                recv.poll().ok();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            done_tx.send(()).ok();
+            (got, recv.rlc_recovered(), recv.naks_sent())
+        });
+
+        let recv_addr = addr_rx.recv().unwrap();
+        let tx = std::thread::spawn(move || {
+            let mut send =
+                SensOMaticRlcSender::bind("127.0.0.1:0", recv_addr, 16, 2, 15, symbol_len).unwrap();
+            if static_params {
+                send = send.with_static_params();
+            }
+            for i in 0..n {
+                let mut item = vec![0u8; item_len];
+                item[..8].copy_from_slice(&i.to_le_bytes());
+                send.send_item(&item).unwrap();
+            }
+            send.drain_until_acked(n as u32, Duration::from_secs(15)).unwrap();
+            done_rx.recv_timeout(Duration::from_secs(20)).ok();
+            (send.adapt_count(), send.feedback_recv(), send.retransmits())
+        });
+
+        let (got, recovered, naks) = rx.join().unwrap();
+        let (adapt_count, feedback_recv, retransmits) = tx.join().unwrap();
+        let expected: Vec<u64> = (0..n).collect();
+        assert_eq!(got, expected, "RLC transport must deliver every item in order");
+        RoundTrip { recovered, naks, retransmits, adapt_count, feedback_recv }
+    }
+
+    /// Two independent senders, each with its own connection id, delivering to
+    /// one receiver at the same time - the replication-mesh shape, where a node
+    /// receives from several peers concurrently rather than from one peer that
+    /// restarted. Every item of both streams must arrive.
+    ///
+    /// Each sender tags its items with its own index in the high byte so the
+    /// two streams stay distinguishable after interleaving; ordering is asserted
+    /// within a stream, since nothing orders one sender against another.
+    /// A peer that dies with unrecovered gaps leaves the receiver sending
+    /// NAKs and feedback to a closed port. On Windows each of those provokes
+    /// an ICMP that surfaces as ConnectionReset on the receiver's next
+    /// receive; the drain must read past it, or every peer whose datagrams
+    /// queue behind the reset goes dark while a peer ahead of it keeps
+    /// flowing.
+    #[test]
+    fn survivors_deliver_while_the_receiver_naks_a_dead_peer() {
+        let item_len = 32usize;
+        let symbol_len = 64usize;
+        let rounds: u64 = 12;
+        let peers: u64 = 3;
+
+        let (addr_tx, addr_rx) = mpsc::channel();
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let rx = std::thread::spawn(move || {
+            // Injected loss guarantees peer 2 dies with gaps outstanding, so
+            // the receiver keeps re-requesting from a port that answers with
+            // ICMP only.
+            let mut recv = SensOMaticRlcReceiver::bind("127.0.0.1:0", symbol_len)
+                .unwrap()
+                .with_debug_loss(20, 9);
+            addr_tx.send(recv.local_addr().unwrap()).unwrap();
+            let mut got: Vec<(u64, u64)> = Vec::new();
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(12) && stop_rx.try_recv().is_err() {
+                for item in recv.poll().unwrap_or_default() {
+                    let tagged = u64::from_le_bytes(item[..8].try_into().unwrap());
+                    got.push((tagged >> 56, tagged & 0x00FF_FFFF_FFFF_FFFF));
+                }
+            }
+            got
+        });
+
+        let recv_addr = addr_rx.recv().unwrap();
+        let mut handles = Vec::new();
+        for p in 0..peers {
+            handles.push(std::thread::spawn(move || {
+                let mut send =
+                    SensOMaticRlcSender::bind("127.0.0.1:0", recv_addr, 16, 2, 15, symbol_len)
+                        .unwrap();
+                // Stagger the first item so the receiver's first-seen order is
+                // peer 0, then the dying peer 1, then peer 2. A survivor has to
+                // sit behind the dead session in service order for its fate to
+                // depend on how the receiver treats the dead one.
+                std::thread::sleep(Duration::from_millis(150 * p));
+                if p == 1 {
+                    // Burst and die: no drain, socket closed on drop, gaps left
+                    // for the receiver to chase.
+                    for i in 0..rounds {
+                        let mut item = vec![0u8; item_len];
+                        item[..8].copy_from_slice(&((p << 56) | i).to_le_bytes());
+                        send.send_item(&item).ok();
+                    }
+                    return;
+                }
+                for i in 0..rounds {
+                    let mut item = vec![0u8; item_len];
+                    item[..8].copy_from_slice(&((p << 56) | i).to_le_bytes());
+                    if send.send_item(&item).is_err() {
+                        break;
+                    }
+                    send.pump_once().ok();
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                let hold = Instant::now();
+                while hold.elapsed() < Duration::from_secs(3) {
+                    send.pump_once().ok();
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }));
+        }
+        for h in handles {
+            h.join().ok();
+        }
+        stop_tx.send(()).ok();
+        let got = rx.join().unwrap();
+
+        for p in [0u64, 2] {
+            let mine: Vec<u64> = got.iter().filter(|(t, _)| *t == p).map(|(_, i)| *i).collect();
+            assert_eq!(
+                mine,
+                (0..rounds).collect::<Vec<_>>(),
+                "surviving peer {p} went dark while the receiver chased the dead peer; \
+                 got {} of {rounds}",
+                mine.len(),
+            );
+        }
+    }
+
+    /// Connection ids drawn back to back must differ. Derived from the wall
+    /// clock alone they did not: 1000 draws yielded 484 distinct values on a
+    /// Windows host, so two peers sharing a port collided.
+    #[test]
+    fn connection_ids_drawn_in_a_tight_loop_are_distinct() {
+        let ids: std::collections::BTreeSet<u64> =
+            (0..1000).map(|_| derive_conn_id(40_000)).collect();
+        assert_eq!(ids.len(), 1000, "only {} distinct ids in 1000 draws", ids.len());
+    }
+
+    /// Three peers sending sparsely - one small item every 300ms, the shape a
+    /// heartbeat has - with one going silent partway. The surviving two must
+    /// keep delivering.
+    ///
+    /// The existing multi-peer tests push their items in a burst, so no expiry
+    /// timer ever fires between two frames of the same peer. A mesh sends one
+    /// item per interval, which leaves every timeout in the receiver free to
+    /// run in the gaps.
+    #[test]
+    fn three_sparse_senders_keep_delivering_after_one_goes_silent() {
+        let item_len = 32usize;
+        let symbol_len = 64usize;
+        let rounds: u64 = 10;
+        let silent_after: u64 = 3;
+        let peers: u64 = 3;
+
+        let (addr_tx, addr_rx) = mpsc::channel();
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let rx = std::thread::spawn(move || {
+            let mut recv = SensOMaticRlcReceiver::bind("127.0.0.1:0", symbol_len).unwrap();
+            addr_tx.send(recv.local_addr().unwrap()).unwrap();
+            let mut got: Vec<(u64, u64)> = Vec::new();
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(12)
+                && stop_rx.try_recv().is_err()
+            {
+                for item in recv.poll().unwrap_or_default() {
+                    let tagged = u64::from_le_bytes(item[..8].try_into().unwrap());
+                    got.push((tagged >> 56, tagged & 0x00FF_FFFF_FFFF_FFFF));
+                }
+            }
+            (got, recv.live_sessions().len())
+        });
+
+        let recv_addr = addr_rx.recv().unwrap();
+        let mut handles = Vec::new();
+        for p in 0..peers {
+            handles.push(std::thread::spawn(move || {
+                let mut send =
+                    SensOMaticRlcSender::bind("127.0.0.1:0", recv_addr, 16, 2, 15, symbol_len)
+                        .unwrap();
+                // The third peer stops early, as a node dying mid-run does.
+                let n = if p == 2 { silent_after } else { rounds };
+                for i in 0..n {
+                    let mut item = vec![0u8; item_len];
+                    item[..8].copy_from_slice(&((p << 56) | i).to_le_bytes());
+                    if send.send_item(&item).is_err() {
+                        break;
+                    }
+                    send.pump_once().ok();
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+                // Keep the survivors' sockets alive so their sessions stay live.
+                if p != 2 {
+                    let hold = Instant::now();
+                    while hold.elapsed() < Duration::from_secs(2) {
+                        send.pump_once().ok();
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().ok();
+        }
+        stop_tx.send(()).ok();
+        let (got, live) = rx.join().unwrap();
+
+        for p in 0..2u64 {
+            let mine: Vec<u64> = got.iter().filter(|(t, _)| *t == p).map(|(_, i)| *i).collect();
+            assert_eq!(
+                mine,
+                (0..rounds).collect::<Vec<_>>(),
+                "surviving peer {p} stopped being delivered ({live} windows live); \
+                 got {} of {rounds}",
+                mine.len(),
+            );
+        }
+    }
+
+    #[test]
+    fn two_concurrent_senders_both_deliver() {
+        let item_len = 32usize;
+        let symbol_len = 64usize;
+        let per_sender: u64 = 200;
+        let senders = 2u64;
+        let total = per_sender * senders;
+
+        let (addr_tx, addr_rx) = mpsc::channel();
+        let rx = std::thread::spawn(move || {
+            let mut recv = SensOMaticRlcReceiver::bind("127.0.0.1:0", symbol_len).unwrap();
+            addr_tx.send(recv.local_addr().unwrap()).unwrap();
+            let mut got: Vec<(u64, u64)> = Vec::new();
+            let start = Instant::now();
+            while (got.len() as u64) < total {
+                if start.elapsed() > Duration::from_secs(20) {
+                    break;
+                }
+                for item in recv.poll().unwrap() {
+                    let tagged = u64::from_le_bytes(item[..8].try_into().unwrap());
+                    got.push((tagged >> 56, tagged & 0x00FF_FFFF_FFFF_FFFF));
+                }
+            }
+            got
+        });
+
+        let recv_addr = addr_rx.recv().unwrap();
+        let mut handles = Vec::new();
+        for s in 0..senders {
+            handles.push(std::thread::spawn(move || {
+                let mut send =
+                    SensOMaticRlcSender::bind("127.0.0.1:0", recv_addr, 16, 2, 15, symbol_len)
+                        .unwrap();
+                // Bounded by wall clock, not just by item count: a sender whose
+                // symbols are never acked stalls in send_item's flow-control
+                // wait (60s per item), so an unbounded loop would hang the suite
+                // instead of reporting how far this sender got.
+                let start = Instant::now();
+                let mut pushed = 0u64;
+                for i in 0..per_sender {
+                    if start.elapsed() > Duration::from_secs(10) {
+                        break;
+                    }
+                    let mut item = vec![0u8; item_len];
+                    item[..8].copy_from_slice(&((s << 56) | i).to_le_bytes());
+                    if send.send_item(&item).is_err() {
+                        break;
+                    }
+                    pushed += 1;
+                }
+                send.drain_until_acked(pushed as u32, Duration::from_secs(5)).ok();
+                (send.conn_id(), pushed)
+            }));
+        }
+        let sent: Vec<(u64, u64)> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_ne!(sent[0].0, sent[1].0, "independent senders must carry distinct connection ids");
+        for (s, (cid, pushed)) in sent.iter().enumerate() {
+            assert_eq!(
+                *pushed, per_sender,
+                "sender {s} (cid {cid}) wedged after {pushed}/{per_sender} items - its symbols \
+                 are not being acked, so send_item is stuck on the flow window",
+            );
+        }
+
+        let got = rx.join().unwrap();
+        for s in 0..senders {
+            let mine: Vec<u64> = got.iter().filter(|(tag, _)| *tag == s).map(|(_, i)| *i).collect();
+            assert_eq!(
+                mine,
+                (0..per_sender).collect::<Vec<_>>(),
+                "sender {s} (cid {}) must deliver every item in order alongside the other sender",
+                sent[s as usize].0,
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_clean() {
+        // Exact in-order delivery on a clean link is asserted inside the
+        // harness (got == expected). `recovered` / `naks` are telemetry only:
+        // even a clean loopback drops a few datagrams under the send burst
+        // (kernel socket-buffer pressure), which the RLC + ARQ floor absorbs,
+        // so neither is asserted to be zero.
+        run_loopback(500, Loss::Bernoulli(0), 1, false);
+    }
+
+    #[test]
+    fn loopback_isolated_loss_recovers_via_rlc() {
+        // ~6% isolated-ish loss: the dense window recovers most without ARQ.
+        let rt = run_loopback(800, Loss::Bernoulli(6), 7, false);
+        assert!(rt.recovered > 0, "RLC must recover losses without a retransmit");
+    }
+
+    #[test]
+    fn loopback_heavy_loss_arq_floor() {
+        // Pinned at the static initial code (window 16), a Gilbert-Elliott
+        // channel with mean burst 25 (r=400 -> 10000/400) exceeds the window, so
+        // the longest bursts cannot be FEC-recovered and must fall to the ARQ
+        // floor. Deterministic erasure passes retransmits, so ARQ converges and
+        // delivery is exact (asserted inside the harness). Either side can
+        // start that repair: the receiver NAKs a hole once it has been missing
+        // longer than its jitter-scaled reorder grace, and the sender resends
+        // its lowest unacked symbols when the cumulative ACK stops advancing,
+        // so which one fires first depends on the host's timing.
+        let rt = run_loopback(600, Loss::Gilbert(100, 400), 1234, true);
+        assert!(
+            rt.naks + rt.retransmits > 0,
+            "bursts beyond the static window must be repaired by retransmission: \
+             naks={}, retransmits={}",
+            rt.naks,
+            rt.retransmits
+        );
+    }
+
+    /// A stream that loses the first copy of each of its first datagrams, and
+    /// every repair until those are gone, is delivered from its first item.
+    #[test]
+    fn a_stream_whose_head_was_lost_is_delivered_from_its_first_item() {
+        run_loopback(100, Loss::Head(20, true), 1, true);
+    }
+
+    /// The same loss with the stream's early repairs getting through: every
+    /// item is delivered, from the first.
+    #[test]
+    fn a_stream_whose_head_was_lost_but_not_its_repairs_is_delivered_from_its_first_item() {
+        run_loopback(100, Loss::Head(10, false), 1, true);
+    }
+
+    /// One sender's items as two receivers, bound in turn on one port,
+    /// delivered them, and the send calls that failed on the sender's side
+    /// with the kind of the last, which a sender meets while no receiver is
+    /// bound.
+    struct Restart {
+        before: Vec<u64>,
+        after: Vec<u64>,
+        send_errors: (u64, Option<io::ErrorKind>),
+    }
+
+    /// Poll `recv` until it has taken `each` items from every one of `peers`
+    /// senders or `deadline` has passed, and return them by sender. The
+    /// receiver is dropped on return, which frees its port.
+    fn take_items(
+        mut recv: SensOMaticRlcReceiver,
+        peers: u64,
+        each: usize,
+        deadline: Duration,
+    ) -> Vec<Vec<u64>> {
+        let mut got: Vec<Vec<u64>> = vec![Vec::new(); peers as usize];
+        let start = Instant::now();
+        while got.iter().any(|g| g.len() < each) && start.elapsed() < deadline {
+            for item in recv.poll().expect("the receiver polls") {
+                let tagged = u64::from_le_bytes(item[..8].try_into().unwrap());
+                got[(tagged >> 56) as usize].push(tagged & 0x00FF_FFFF_FFFF_FFFF);
+            }
+        }
+        got
+    }
+
+    /// Bind a receiver to `addr` again once the one holding it has closed.
+    /// Another socket can take the port in the moment it is free, so the
+    /// bind is retried until `deadline` has passed, and how often and for
+    /// how long it was refused is printed.
+    fn bind_again(
+        addr: SocketAddr,
+        symbol_len: usize,
+        deadline: Duration,
+    ) -> SensOMaticRlcReceiver {
+        let start = Instant::now();
+        let mut refused = 0u32;
+        loop {
+            match SensOMaticRlcReceiver::bind(addr, symbol_len) {
+                Ok(rx) => {
+                    if refused > 0 {
+                        eprintln!(
+                            "the bind to {addr} was refused {refused} times over {:?}",
+                            start.elapsed()
+                        );
+                    }
+                    return rx;
+                }
+                Err(e) if e.kind() == io::ErrorKind::AddrInUse && start.elapsed() < deadline => {
+                    refused += 1;
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => panic!(
+                    "could not bind {addr} again, refused {refused} times over {:?}: {e}",
+                    start.elapsed()
+                ),
+            }
+        }
+    }
+
+    /// A receiver restarted under `peers` live senders. The first takes
+    /// `first` items from every sender and is dropped; the replacement binds
+    /// the same port against senders already well into their streams, with
+    /// the first `head` `DATA` datagrams of each of its windows lost along
+    /// with every `REPAIR` ahead of them, and takes `second` from each.
+    fn restarted_receiver(peers: u64, first: usize, second: usize, head: u32) -> Vec<Restart> {
+        let item_len = 32usize;
+        let symbol_len = 64usize;
+        let deadline = Duration::from_secs(10);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_rx = SensOMaticRlcReceiver::bind("127.0.0.1:0", symbol_len).unwrap();
+        let addr = first_rx.local_addr().unwrap();
+
+        let mut handles = Vec::new();
+        for p in 0..peers {
+            let stop = std::sync::Arc::clone(&stop);
+            handles.push(std::thread::spawn(move || {
+                let mut send =
+                    SensOMaticRlcSender::bind("127.0.0.1:0", addr, 16, 2, 15, symbol_len).unwrap();
+                // Each item carries its sender and its own source id, so what
+                // a receiver delivers names exactly the ids it got. A send
+                // that fails while no receiver is bound has still queued its
+                // item for retransmission, and the sender's last source id
+                // says whether this one was taken.
+                let mut errors = (0u64, None);
+                let mut next: u64 = 0;
+                while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                    let mut item = vec![0u8; item_len];
+                    item[..8].copy_from_slice(&((p << 56) | next).to_le_bytes());
+                    if let Err(e) = send.try_send_item(&item) {
+                        errors = (errors.0 + 1, Some(e.kind()));
+                    }
+                    if send.tx_probe().0 == next as u32 {
+                        next += 1;
+                    }
+                    if let Err(e) = send.pump_once() {
+                        errors = (errors.0 + 1, Some(e.kind()));
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                errors
+            }));
+        }
+
+        let before = take_items(first_rx, peers, first, deadline);
+        let mut second_rx = bind_again(addr, symbol_len, deadline);
+        second_rx.set_head_loss(head, true);
+        let after = take_items(second_rx, peers, second, deadline);
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        let send_errors = handles.into_iter().map(|h| h.join().unwrap());
+        before
+            .into_iter()
+            .zip(after)
+            .zip(send_errors)
+            .map(|((before, after), send_errors)| Restart {
+                before,
+                after,
+                send_errors,
+            })
+            .collect()
+    }
+
+    /// What a restart must preserve for each sender: the first receiver
+    /// delivered from 0 in order, and the replacement delivered in order from
+    /// no later than the item after the last one the first receiver took, so
+    /// nothing was lost across the restart.
+    fn assert_resumed(restarts: &[Restart], first: usize, second: usize) {
+        for (p, r) in restarts.iter().enumerate() {
+            let errors = r.send_errors;
+            assert!(
+                r.before.len() >= first,
+                "sender {p}: the first receiver took {} of {first} items; send errors {errors:?}",
+                r.before.len()
+            );
+            assert_eq!(
+                r.before,
+                (0..r.before.len() as u64).collect::<Vec<_>>(),
+                "sender {p}: the first receiver must deliver from 0 in order"
+            );
+            assert!(
+                r.after.len() >= second,
+                "sender {p}: the replacement took {} of {second} items, after the first \
+                 receiver took {}; send errors {errors:?}",
+                r.after.len(),
+                r.before.len()
+            );
+            let from = r.after[0];
+            assert_eq!(
+                r.after,
+                (from..from + r.after.len() as u64).collect::<Vec<_>>(),
+                "sender {p}: the replacement must deliver in order"
+            );
+            assert!(
+                from <= r.before.len() as u64,
+                "sender {p}: the replacement started at item {from}, past the {} the first \
+                 receiver took, so items were lost across the restart",
+                r.before.len()
+            );
+        }
+    }
+
+    /// Poll the receiver until a `NAK` it sends to `peer` names exactly
+    /// `expected`, sending it every `DATA` in `resend` again before each poll
+    /// since a datagram can be dropped on its way. Returns whether one did
+    /// before `deadline`, and the last `NAK` it sent.
+    fn probe_names(
+        recv: &mut SensOMaticRlcReceiver,
+        peer: &UdpSocket,
+        resend: &[Vec<u8>],
+        expected: &[u32],
+        deadline: Duration,
+    ) -> (bool, Option<Vec<u32>>) {
+        let to = recv.local_addr().unwrap();
+        let start = Instant::now();
+        let mut buf = [0u8; CTRL_BUF];
+        let mut last = None;
+        while start.elapsed() < deadline {
+            for frame in resend {
+                peer.send_to(frame, to).unwrap();
+            }
+            recv.poll().expect("the receiver polls");
+            loop {
+                let n = match peer.recv_from(&mut buf) {
+                    Ok((n, _)) => n,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("the stand-in sender could not read: {e}"),
+                };
+                if n < 1 || buf[0] != PKT_RLC_NAK {
+                    continue;
+                }
+                let ids: Vec<u32> = buf[1..n]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| u32::from_le_bytes(*c))
+                    .collect();
+                if ids == expected {
+                    return (true, Some(ids));
+                }
+                last = Some(ids);
+            }
+        }
+        (false, last)
+    }
+
+    /// A window that has not seen id 0 names, in one `NAK`, id 0 first, the
+    /// ids just below the lowest id it has seen, and that lowest id last. Once
+    /// the whole range it named has come back it reaches twice as deep below
+    /// the new lowest.
+    #[test]
+    fn a_start_probe_names_zero_first_and_its_canary_last_and_deepens() {
+        let symbol_len = 64usize;
+        let mut recv = SensOMaticRlcReceiver::bind("127.0.0.1:0", symbol_len).unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let data = |sid: u32| {
+            let mut frame = vec![PKT_RLC_DATA];
+            frame.extend_from_slice(&7u64.to_le_bytes());
+            frame.extend_from_slice(&sid.to_le_bytes());
+            frame.extend_from_slice(&sid.to_le_bytes());
+            frame.extend_from_slice(&vec![0u8; symbol_len]);
+            frame
+        };
+        let deadline = Duration::from_secs(5);
+
+        let expected: Vec<u32> = std::iter::once(0).chain(84..=100).collect();
+        let (named, last) = probe_names(&mut recv, &peer, &[data(100)], &expected, deadline);
+        assert!(
+            named,
+            "a window that has seen only id 100 must name id 0, the 16 ids below it and \
+             then 100; its last NAK named {last:?}"
+        );
+
+        let range: Vec<Vec<u8>> = (84..100).map(data).collect();
+        let expected: Vec<u32> = std::iter::once(0).chain(52..=84).collect();
+        let (named, last) = probe_names(&mut recv, &peer, &range, &expected, deadline);
+        assert!(
+            named,
+            "once the whole range came back the next round must reach 32 below 84; its \
+             last NAK named {last:?}"
+        );
+    }
+
+    /// A restarted receiver joins a stream already well into its ids. Its
+    /// window must start where the sender's stream stands, the lowest id the
+    /// sender still holds, even when the first datagrams it receives are lost
+    /// and the first one that gets through is above that.
+    #[test]
+    fn a_restarted_receiver_resumes_where_the_stream_stands() {
+        let restarts = restarted_receiver(1, 40, 40, 4);
+        assert_resumed(&restarts, 40, 40);
+    }
+
+    /// A receiver restarted under two senders serves the first to reach it
+    /// outright and admits the second by challenge. The admitted window must
+    /// resume its sender's stream where it stands too, and not wait for ids
+    /// the sender released when the first receiver acknowledged them.
+    #[test]
+    fn a_restarted_receiver_resumes_an_admitted_peer_where_its_stream_stands() {
+        let restarts = restarted_receiver(2, 40, 40, 0);
+        assert_resumed(&restarts, 40, 40);
+    }
+
+    #[test]
+    fn loopback_adaptive_feedback_retunes_the_code() {
+        // The sensing-driven half end to end over real sockets: under loss
+        // heavier than the initial code provisions, the receiver fits the
+        // channel, feeds it back, and the controller escalates the live code at
+        // once (25% loss -> step 1, tighter than the initial step 2), so the
+        // retune is deterministic regardless of how fast the stream completes.
+        let rt = run_loopback(1500, Loss::Bernoulli(25), 99, false);
+        assert!(rt.feedback_recv > 0, "feedback must reach the adaptive sender");
+        assert!(
+            rt.adapt_count > 0,
+            "loss heavier than the initial code must retune it at least once",
+        );
+    }
+
+    #[test]
+    fn loopback_gilbert_burst_delivers_exactly() {
+        // A Gilbert-Elliott burst channel (mean burst 10000/250 = 40, steady
+        // loss 80/(80+250) ~= 24%): adaptive coding plus the ARQ floor still
+        // deliver every item in order (asserted inside the harness).
+        let rt = run_loopback(800, Loss::Gilbert(80, 250), 2024, false);
+        // A bursty channel this heavy needs the ARQ floor for the longest
+        // bursts, started by the receiver's NAK or the sender's own resend.
+        assert!(
+            rt.naks + rt.retransmits > 0,
+            "long bursts beyond the window must be repaired by retransmission: \
+             naks={}, retransmits={}",
+            rt.naks,
+            rt.retransmits
+        );
+    }
+
+    /// The client rebinds its socket mid-stream (a NAT rebinding / interface
+    /// switch); the receiver follows the connection id to the new address and
+    /// still delivers every item in order.
+    #[test]
+    fn loopback_connection_survives_migration() {
+        let (item_len, symbol_len, n) = (32usize, 64usize, 2000u64);
+        let (addr_tx, addr_rx) = mpsc::channel();
+
+        let rx = std::thread::spawn(move || {
+            let mut recv = SensOMaticRlcReceiver::bind("127.0.0.1:0", symbol_len).unwrap();
+            addr_tx.send(recv.local_addr().unwrap()).unwrap();
+            let mut got: Vec<u64> = Vec::new();
+            let start = Instant::now();
+            while (got.len() as u64) < n {
+                if start.elapsed() > Duration::from_secs(20) {
+                    break;
+                }
+                for item in recv.poll().unwrap() {
+                    got.push(u64::from_le_bytes(item[..8].try_into().unwrap()));
+                }
+            }
+            for _ in 0..50 {
+                recv.poll().ok();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            (got, recv.migrations())
+        });
+
+        let recv_addr = addr_rx.recv().unwrap();
+        let tx = std::thread::spawn(move || {
+            let mut send =
+                SensOMaticRlcSender::bind("127.0.0.1:0", recv_addr, 16, 2, 15, symbol_len).unwrap();
+            for i in 0..n {
+                // Rebind to a new local port halfway through - the receiver must
+                // follow the connection id, not the 4-tuple.
+                if i == n / 2 {
+                    send.migrate().unwrap();
+                }
+                let mut item = vec![0u8; item_len];
+                item[..8].copy_from_slice(&i.to_le_bytes());
+                send.send_item(&item).unwrap();
+            }
+            send.drain_until_acked(n as u32, Duration::from_secs(15)).unwrap();
+        });
+
+        let (got, migrations) = rx.join().unwrap();
+        tx.join().unwrap();
+        assert_eq!(
+            got,
+            (0..n).collect::<Vec<_>>(),
+            "every item must be delivered across the migration"
+        );
+        assert!(
+            migrations >= 1,
+            "the receiver must have followed the connection to the new address"
+        );
+    }
+
+    /// An OS path event drives a proactive migration, and the
+    /// receiver validates the new address by challenge / response before trusting
+    /// it - every item still delivered, the move validated, no revert.
+    #[test]
+    fn loopback_proactive_migration_validates_the_new_path() {
+        let (item_len, symbol_len, n) = (32usize, 64usize, 2000u64);
+        let (addr_tx, addr_rx) = mpsc::channel();
+
+        let rx = std::thread::spawn(move || {
+            let mut recv = SensOMaticRlcReceiver::bind("127.0.0.1:0", symbol_len).unwrap();
+            addr_tx.send(recv.local_addr().unwrap()).unwrap();
+            let mut got: Vec<u64> = Vec::new();
+            let start = Instant::now();
+            while (got.len() as u64) < n {
+                if start.elapsed() > Duration::from_secs(20) {
+                    break;
+                }
+                for item in recv.poll().unwrap() {
+                    got.push(u64::from_le_bytes(item[..8].try_into().unwrap()));
+                }
+            }
+            for _ in 0..50 {
+                recv.poll().ok();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            (
+                got,
+                recv.migrations(),
+                recv.path_validations(),
+                recv.path_validation_failures(),
+            )
+        });
+
+        let recv_addr = addr_rx.recv().unwrap();
+        let tx = std::thread::spawn(move || {
+            let mut send = SensOMaticRlcSender::bind("127.0.0.1:0", recv_addr, 16, 2, 15, symbol_len)
+                .unwrap()
+                .with_path_observer(None);
+            for i in 0..n {
+                // Mid-stream, synthesize an OS path event; the next send migrates
+                // proactively and the receiver pre-validates the new address.
+                if i == n / 2 {
+                    send.inject_path_event();
+                }
+                let mut item = vec![0u8; item_len];
+                item[..8].copy_from_slice(&i.to_le_bytes());
+                send.send_item(&item).unwrap();
+            }
+            send.drain_until_acked(n as u32, Duration::from_secs(15)).unwrap();
+            send.proactive_migrations()
+        });
+
+        let (got, migrations, validations, failures) = rx.join().unwrap();
+        let proactive = tx.join().unwrap();
+        assert_eq!(
+            got,
+            (0..n).collect::<Vec<_>>(),
+            "every item delivered across the proactive migration"
+        );
+        assert!(migrations >= 1, "the receiver followed the connection to the new address");
+        assert!(validations >= 1, "the new path was validated by challenge / response");
+        assert_eq!(failures, 0, "a genuine migration must not fail validation");
+        assert!(proactive >= 1, "the path event must have driven a proactive migration");
+    }
+
+    /// A datagram that names no session - a bare type byte, or a PATH_RESPONSE
+    /// for an id that holds no window - is counted and reaches no session, so
+    /// the bound peer's address does not move and its stream keeps flowing.
+    #[test]
+    fn stray_datagrams_move_no_session_and_are_counted() {
+        let symbol_len = 64usize;
+        let mut recv = SensOMaticRlcReceiver::bind("127.0.0.1:0", symbol_len).unwrap();
+        let recv_addr = recv.local_addr().unwrap();
+        let mut send = SensOMaticRlcSender::bind("127.0.0.1:0", recv_addr, 16, 2, 15, symbol_len).unwrap();
+        let real_peer = send.local_addr().unwrap();
+        let cid = send.conn_id();
+
+        for i in 0u64..20 {
+            let mut item = vec![0u8; 16];
+            item[..8].copy_from_slice(&i.to_le_bytes());
+            send.send_item(&item).unwrap();
+        }
+        // The receiver polls while the sender pumps its own tail recovery,
+        // which is what carries a datagram the kernel dropped under load,
+        // loopback included, as a retransmit rather than a missing item.
+        let start = Instant::now();
+        let mut got = 0u64;
+        while got < 20 && start.elapsed() < Duration::from_secs(5) {
+            got += recv.poll().unwrap().len() as u64;
+            send.drain_until_acked(20, Duration::from_millis(2)).unwrap();
+        }
+        assert_eq!(got, 20, "the first batch must be delivered");
+        assert_eq!(recv.peer_of(cid), Some(real_peer), "bound to the real peer first");
+
+        // A stray socket sends a frame of an unknown type, then a PATH_RESPONSE
+        // for a connection id no window holds.
+        let stray = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let stray_addr = stray.local_addr().unwrap();
+        stray.send_to(&[0xEE], recv_addr).unwrap();
+        let mut answer = Vec::with_capacity(PATH_FRAME_LEN);
+        answer.push(PKT_RLC_PATH_RESPONSE);
+        answer.extend_from_slice(&(cid ^ 0x5555_5555_5555_5555).to_le_bytes());
+        answer.extend_from_slice(&7u64.to_le_bytes());
+        stray.send_to(&answer, recv_addr).unwrap();
+        let start = Instant::now();
+        while recv.unattributed_frames().0 < 2 && start.elapsed() < Duration::from_secs(5) {
+            recv.poll().unwrap();
+        }
+        assert_eq!(
+            recv.unattributed_frames(),
+            (2, PKT_RLC_PATH_RESPONSE),
+            "both stray frames counted, the last type byte kept"
+        );
+        assert_eq!(recv.peer_of(cid), Some(real_peer), "the session's address did not move");
+        assert_ne!(recv.peer_of(cid), Some(stray_addr));
+        assert_eq!(recv.migrations(), 0, "a stray frame is not a migration");
+        assert_eq!(recv.live_sessions(), vec![cid], "no window was opened for the stray id");
+        assert_eq!(recv.session_adoption_counts().0, 0, "no admission was begun for the stray id");
+
+        // The stream continues to the real peer: its control traffic still
+        // reaches it, so the second batch is acked.
+        for i in 20u64..40 {
+            let mut item = vec![0u8; 16];
+            item[..8].copy_from_slice(&i.to_le_bytes());
+            send.send_item(&item).unwrap();
+        }
+        let start = Instant::now();
+        let mut got = 0u64;
+        while got < 20 && start.elapsed() < Duration::from_secs(5) {
+            got += recv.poll().unwrap().len() as u64;
+            send.drain_until_acked(40, Duration::from_millis(2)).unwrap();
+        }
+        assert_eq!(got, 20, "the second batch must be delivered after the stray frames");
+        assert!(
+            send.drain_until_acked(40, Duration::from_secs(5)).is_ok(),
+            "the real peer must still be acked"
+        );
+        assert_eq!(recv.malformed_frames(), 0);
+    }
+
+    /// With two peers live, the older one migrates: its PATH_RESPONSE names its
+    /// own window and validates it, whichever peer was admitted last.
+    #[test]
+    fn an_older_peer_validates_its_migration_while_a_newer_peer_is_live() {
+        let (item_len, symbol_len, n) = (32usize, 64usize, 300u64);
+        let mut recv = SensOMaticRlcReceiver::bind("127.0.0.1:0", symbol_len).unwrap();
+        let recv_addr = recv.local_addr().unwrap();
+        let mut a = SensOMaticRlcSender::bind("127.0.0.1:0", recv_addr, 16, 2, 15, symbol_len).unwrap();
+        let mut b = SensOMaticRlcSender::bind("127.0.0.1:0", recv_addr, 16, 2, 15, symbol_len).unwrap();
+        let (cid_a, cid_b) = (a.conn_id(), b.conn_id());
+        let a_old = a.local_addr().unwrap();
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+
+        let rx = std::thread::spawn(move || {
+            let mut got_a = 0u64;
+            let mut got_b = 0u64;
+            while stop_rx.try_recv().is_err() {
+                for (cid, _) in recv.poll_from().unwrap() {
+                    if cid == cid_a {
+                        got_a += 1;
+                    } else if cid == cid_b {
+                        got_b += 1;
+                    }
+                }
+            }
+            // Drain what the senders' final acks left, then report.
+            for _ in 0..50 {
+                for (cid, _) in recv.poll_from().unwrap() {
+                    if cid == cid_a {
+                        got_a += 1;
+                    } else if cid == cid_b {
+                        got_b += 1;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            (
+                got_a,
+                got_b,
+                recv.live_sessions(),
+                recv.peer_of(cid_a),
+                recv.path_validations(),
+                recv.path_validation_failures(),
+                recv.unattributed_frames(),
+            )
+        });
+
+        let item = |i: u64| {
+            let mut item = vec![0u8; item_len];
+            item[..8].copy_from_slice(&i.to_le_bytes());
+            item
+        };
+        // A first, then B, so B is the most recently admitted window.
+        for i in 0..n {
+            a.send_item(&item(i)).unwrap();
+        }
+        a.drain_until_acked(n as u32, Duration::from_secs(15)).unwrap();
+        for i in 0..n {
+            b.send_item(&item(i)).unwrap();
+        }
+        b.drain_until_acked(n as u32, Duration::from_secs(15)).unwrap();
+        // The older peer rebinds and keeps sending; the receiver challenges the
+        // new address and A's answer must reach A's window, not B's.
+        a.migrate().unwrap();
+        // The migrated socket is bound unspecified, so only its port names it;
+        // the receiver sees it from the loopback address.
+        let a_new_port = a.local_addr().unwrap().port();
+        for i in n..2 * n {
+            a.send_item(&item(i)).unwrap();
+        }
+        a.drain_until_acked((2 * n) as u32, Duration::from_secs(15)).unwrap();
+        stop_tx.send(()).unwrap();
+
+        let (got_a, got_b, live, peer_a, validations, failures, unattributed) = rx.join().unwrap();
+        assert_eq!(got_a, 2 * n, "every item from the migrating peer delivered");
+        assert_eq!(got_b, n, "every item from the newer peer delivered");
+        assert_eq!(live, vec![cid_a, cid_b], "A admitted first, B last");
+        assert_ne!(peer_a, Some(a_old), "A's window left A's old address");
+        assert_eq!(
+            peer_a.map(|p| p.port()),
+            Some(a_new_port),
+            "A's window follows A to its new port"
+        );
+        assert!(validations >= 1, "A's PATH_RESPONSE validated A's window");
+        assert_eq!(failures, 0, "a genuine migration must not time out");
+        assert_eq!(unattributed, (0, 0), "every frame named its window");
+    }
+
+    /// Security property: a forged DATA frame from an unrelated address
+    /// (correct connection id, but an address that cannot answer the challenge)
+    /// must not permanently hijack the session - the receiver challenges the new
+    /// address, gets no response, and reverts to the real peer, which keeps
+    /// delivering.
+    #[test]
+    fn spoofed_move_fails_validation_and_reverts() {
+        let symbol_len = 64usize;
+        let mut recv = SensOMaticRlcReceiver::bind("127.0.0.1:0", symbol_len).unwrap();
+        let recv_addr = recv.local_addr().unwrap();
+        let mut send = SensOMaticRlcSender::bind("127.0.0.1:0", recv_addr, 16, 2, 15, symbol_len).unwrap();
+        let real_peer = send.local_addr().unwrap();
+        let cid = send.conn_id();
+
+        // Deliver a few items so the receiver is bound to the real peer. The
+        // sender is pumped while they arrive, so a burst dropped whole on its
+        // way is resent.
+        for i in 0u64..20 {
+            let mut item = vec![0u8; 16];
+            item[..8].copy_from_slice(&i.to_le_bytes());
+            send.send_item(&item).unwrap();
+        }
+        let start = Instant::now();
+        let mut got = 0u64;
+        while got < 20 && start.elapsed() < Duration::from_secs(5) {
+            got += recv.poll().unwrap().len() as u64;
+            send.pump_once().expect("the sender pumps");
+        }
+        assert_eq!(recv.peer(), Some(real_peer), "bound to the real peer first");
+
+        // An attacker socket forges a DATA frame with the right connection id.
+        let attacker = UdpSocket::bind("127.0.0.1:0").unwrap();
+        attacker.set_nonblocking(true).unwrap();
+        let attacker_addr = attacker.local_addr().unwrap();
+        let mut forged = Vec::new();
+        forged.push(PKT_RLC_DATA);
+        forged.extend_from_slice(&cid.to_le_bytes());
+        forged.extend_from_slice(&9999u32.to_le_bytes()); // some source id
+        forged.extend_from_slice(&0u32.to_le_bytes()); // send-ts
+        forged.extend_from_slice(&vec![0u8; symbol_len]);
+        attacker.send_to(&forged, recv_addr).unwrap();
+
+        // The receiver migrates optimistically to the attacker address and
+        // challenges it. The attacker never answers (it drains and ignores any
+        // challenge), so after the timeout the receiver must revert.
+        let start = Instant::now();
+        while start.elapsed() < CHALLENGE_TIMEOUT + Duration::from_millis(300) {
+            recv.poll().ok();
+            // Drain the attacker socket so its buffer does not fill; never reply.
+            let mut b = [0u8; 256];
+            while attacker.recv_from(&mut b).is_ok() {}
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            recv.path_validations() == 0,
+            "the spoofed address must never validate"
+        );
+        assert!(
+            recv.path_validation_failures() >= 1,
+            "the unanswered challenge must time out as a failure"
+        );
+        assert_ne!(
+            recv.peer(),
+            Some(attacker_addr),
+            "the receiver must not be left pointing at the spoofed address"
+        );
+        assert_eq!(recv.peer(), Some(real_peer), "it reverts to the real peer");
+    }
+
+    /// The blocking handshake driver alone, both roles on real loopback
+    /// sockets: the server learns its peer from the first flight and both
+    /// sides reach 1-RTT keys that agree.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn drive_handshake_completes_both_roles_over_loopback() {
+        use crate::rlc_crypto;
+        let (cert, key) = rlc_crypto::self_signed_cert().expect("cert");
+        let scfg = rlc_crypto::server_config(&cert, &key).expect("server cfg");
+        let ccfg = rlc_crypto::client_config(&cert).expect("client cfg");
+
+        let server_udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        server_udp.set_nonblocking(true).unwrap();
+        let server_addr = server_udp.local_addr().unwrap();
+        let client_udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        client_udp.set_nonblocking(true).unwrap();
+        let client_addr = client_udp.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            let sock = crate::dgram::DgramSock::from_udp(server_udp);
+            let mut crypto = rlc_crypto::CryptoState::new_server(scfg).expect("server");
+            let peer = drive_handshake(&sock, None, &mut crypto, false).expect("server handshake");
+            (peer, crypto)
+        });
+        let client = std::thread::spawn(move || {
+            let sock = crate::dgram::DgramSock::from_udp(client_udp);
+            let mut crypto = rlc_crypto::CryptoState::new_client(ccfg).expect("client");
+            drive_handshake(&sock, Some(server_addr), &mut crypto, true).expect("client handshake");
+            crypto
+        });
+        let (peer, server_crypto) = server.join().expect("server thread");
+        let client_crypto = client.join().expect("client thread");
+        assert_eq!(peer, client_addr, "the server learns its peer from the first flight");
+
+        let plaintext = b"both roles".to_vec();
+        let mut wire = plaintext.clone();
+        let pn = client_crypto.seal(&mut wire).expect("seal");
+        let n = server_crypto.open(pn, &mut wire).expect("open");
+        assert_eq!(&wire[..n], &plaintext[..]);
+    }
+
+    /// The sender's and receiver's own `handshake()` wrappers complete against
+    /// each other with no data phase: the receiver learns the sender's
+    /// address and both are armed to seal.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn sender_and_receiver_handshake_wrappers_complete() {
+        use crate::rlc_crypto;
+        let (cert, key) = rlc_crypto::self_signed_cert().expect("cert");
+        let scfg = rlc_crypto::server_config(&cert, &key).expect("server cfg");
+        let ccfg = rlc_crypto::client_config(&cert).expect("client cfg");
+        let (addr_tx, addr_rx) = mpsc::channel();
+        let rx = std::thread::spawn(move || {
+            let mut recv = SensOMaticRlcReceiver::bind("127.0.0.1:0", 64)
+                .unwrap()
+                .with_tls_server(scfg)
+                .unwrap();
+            addr_tx.send(recv.local_addr().unwrap()).unwrap();
+            recv.handshake().expect("server handshake");
+            recv.handshake_peer
+        });
+        let recv_addr = addr_rx.recv().unwrap();
+        let tx = std::thread::spawn(move || {
+            let mut send = SensOMaticRlcSender::bind("127.0.0.1:0", recv_addr, 16, 2, 15, 64)
+                .unwrap()
+                .with_tls_client(ccfg)
+                .unwrap();
+            send.handshake().expect("client handshake");
+            send.local_addr().ok()
+        });
+        let peer = rx.join().unwrap();
+        let sender_addr = tx.join().unwrap();
+        assert!(peer.is_some(), "the receiver learns its peer");
+        assert_eq!(peer, sender_addr, "and it is the sender's address");
+    }
+
+    /// Real loopback sockets with the TLS record layer on: the client and server
+    /// run the TLS 1.3 handshake over the transport, then every data datagram is
+    /// AEAD-sealed. Delivery must be exact and in order through the encryption.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn loopback_tls_handshake_and_encrypted_delivery() {
+        use crate::rlc_crypto;
+        let (cert, key) = rlc_crypto::self_signed_cert().expect("cert");
+        let scfg = rlc_crypto::server_config(&cert, &key).expect("server cfg");
+        let ccfg = rlc_crypto::client_config(&cert).expect("client cfg");
+        let (item_len, symbol_len, n) = (32usize, 64usize, 500u64);
+        let (addr_tx, addr_rx) = mpsc::channel();
+
+        let rx = std::thread::spawn(move || {
+            let mut recv = SensOMaticRlcReceiver::bind("127.0.0.1:0", symbol_len)
+                .unwrap()
+                .with_tls_server(scfg)
+                .unwrap();
+            addr_tx.send(recv.local_addr().unwrap()).unwrap();
+            recv.handshake().expect("server handshake");
+            let mut got: Vec<u64> = Vec::new();
+            let start = Instant::now();
+            while (got.len() as u64) < n {
+                if start.elapsed() > Duration::from_secs(20) {
+                    break;
+                }
+                for item in recv.poll().unwrap() {
+                    got.push(u64::from_le_bytes(item[..8].try_into().unwrap()));
+                }
+            }
+            for _ in 0..50 {
+                recv.poll().ok();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            got
+        });
+
+        let recv_addr = addr_rx.recv().unwrap();
+        let tx = std::thread::spawn(move || {
+            let mut send = SensOMaticRlcSender::bind("127.0.0.1:0", recv_addr, 16, 2, 15, symbol_len)
+                .unwrap()
+                .with_tls_client(ccfg)
+                .unwrap();
+            send.handshake().expect("client handshake");
+            for i in 0..n {
+                let mut item = vec![0u8; item_len];
+                item[..8].copy_from_slice(&i.to_le_bytes());
+                send.send_item(&item).unwrap();
+            }
+            send.drain_until_acked(n as u32, Duration::from_secs(15)).unwrap();
+        });
+
+        let got = rx.join().unwrap();
+        tx.join().unwrap();
+        assert_eq!(
+            got,
+            (0..n).collect::<Vec<_>>(),
+            "TLS transport must deliver every item in order through the encryption"
+        );
+    }
+}

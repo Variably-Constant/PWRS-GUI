@@ -1,0 +1,19 @@
+diff --git a/src/platform_impl/macos/app_state.rs b/src/platform_impl/macos/app_state.rs
+index dd2ccd1..9ee4490 100644
+--- a/src/platform_impl/macos/app_state.rs
++++ b/src/platform_impl/macos/app_state.rs
+@@ -133,8 +133,12 @@ impl ApplicationDelegate {
+         }
+ 
+         window_activation_hack(&app);
+-        #[allow(deprecated)]
+-        app.activateIgnoringOtherApps(self.ivars().activate_ignoring_other_apps);
++        // An application built not to activate ignoring other apps requests
++        // no activation at all, as macOS 14 activates one that passes false.
++        if self.ivars().activate_ignoring_other_apps {
++            #[allow(deprecated)]
++            app.activateIgnoringOtherApps(true);
++        }
+ 
+         if self.ivars().default_menu {
+             // The menubar initialization should be before the `NewEvents` event, to allow

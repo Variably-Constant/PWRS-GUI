@@ -1,0 +1,341 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 91deb0a..c179fff 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -255,6 +255,9 @@ version = "0.6"
+ [target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies.objc2]
+ version = "0.6"
+ 
++[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies.async-channel]
++version = "2.5.0"
++
+ [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies.dbus]
+ version = "0.9"
+ optional = true
+diff --git a/src/event_loop.rs b/src/event_loop.rs
+index eb73dbb..007fc05 100644
+--- a/src/event_loop.rs
++++ b/src/event_loop.rs
+@@ -306,7 +306,14 @@ impl<T> EventLoopWindowTarget<T> {
+   /// - **iOS / Android:** Unsupported.
+   #[inline]
+   pub fn set_progress_bar(&self, _progress: ProgressBarState) {
+-    #[cfg(any(target_os = "linux", target_os = "macos"))]
++    #[cfg(any(
++      target_os = "linux",
++      target_os = "dragonfly",
++      target_os = "freebsd",
++      target_os = "netbsd",
++      target_os = "openbsd",
++      target_os = "macos",
++    ))]
+     self.p.set_progress_bar(_progress)
+   }
+ 
+diff --git a/src/platform_impl/linux/channel.rs b/src/platform_impl/linux/channel.rs
+new file mode 100644
+index 0000000..af58ca4
+--- /dev/null
++++ b/src/platform_impl/linux/channel.rs
+@@ -0,0 +1,60 @@
++// SPDX-License-Identifier: Apache-2.0
++
++//! A channel whose receiving end runs on a GTK main context: what any
++//! thread sends is passed, in order, to a closure on the context's thread.
++
++use gtk::glib::{ControlFlow, MainContext};
++
++/// The sending end; a clone sends to the same receiver.
++pub struct Sender<T>(async_channel::Sender<T>);
++
++impl<T> Clone for Sender<T> {
++  fn clone(&self) -> Self {
++    Self(self.0.clone())
++  }
++}
++
++impl<T> Sender<T> {
++  /// Queues `message` for the receiving end; fails once that end has stopped.
++  pub fn send(&self, message: T) -> Result<(), async_channel::TrySendError<T>> {
++    self.0.try_send(message)
++  }
++}
++
++/// The receiving end, until it is attached to a main context.
++pub struct Receiver<T>(async_channel::Receiver<T>);
++
++impl<T: 'static> Receiver<T> {
++  /// Passes each message to `on_message` on `context`, or on the thread's
++  /// default context when `None`, until it returns `Break` or every sender
++  /// is dropped. Called on the thread that owns the context.
++  pub fn attach(
++    self,
++    context: Option<&MainContext>,
++    mut on_message: impl FnMut(T) -> ControlFlow + 'static,
++  ) {
++    let context = context
++      .cloned()
++      .unwrap_or_else(MainContext::ref_thread_default);
++    let receiver = self.0;
++    context.spawn_local(async move {
++      loop {
++        match receiver.recv().await {
++          Ok(message) => {
++            if on_message(message).is_break() {
++              break;
++            }
++          }
++          // Every sender is dropped, so no message can arrive.
++          Err(async_channel::RecvError) => break,
++        }
++      }
++    });
++  }
++}
++
++/// A channel without a bound.
++pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
++  let (sender, receiver) = async_channel::unbounded();
++  (Sender(sender), Receiver(receiver))
++}
+diff --git a/src/platform_impl/linux/device.rs b/src/platform_impl/linux/device.rs
+index f31971d..157eed7 100644
+--- a/src/platform_impl/linux/device.rs
++++ b/src/platform_impl/linux/device.rs
+@@ -3,15 +3,14 @@ use std::{
+   ptr,
+ };
+ 
+-use gtk::glib;
+ use x11_dl::{xinput2, xlib};
+ 
+ use crate::event::{DeviceEvent, ElementState, RawKeyEvent};
+ 
+-use super::keycode_from_scancode;
++use super::{channel::Sender, keycode_from_scancode};
+ 
+ /// Spawn Device event thread. Only works on x11 since wayland doesn't have such global events.
+-pub fn spawn(device_tx: glib::Sender<DeviceEvent>) {
++pub fn spawn(device_tx: Sender<DeviceEvent>) {
+   std::thread::spawn(move || unsafe {
+     let xlib = xlib::Xlib::open().unwrap();
+     let xinput2 = xinput2::XInput2::open().unwrap();
+diff --git a/src/platform_impl/linux/event_loop.rs b/src/platform_impl/linux/event_loop.rs
+index 53ab9e1..e18ca8b 100644
+--- a/src/platform_impl/linux/event_loop.rs
++++ b/src/platform_impl/linux/event_loop.rs
+@@ -16,7 +16,7 @@ use cairo::{RectangleInt, Region};
+ use crossbeam_channel::SendError;
+ use gdk::{Cursor, CursorType, EventKey, EventMask, ScrollDirection, WindowEdge, WindowState};
+ use gio::Cancellable;
+-use glib::{source::Priority, MainContext};
++use glib::MainContext;
+ use gtk::{
+   cairo, gdk, gio,
+   glib::{self},
+@@ -42,7 +42,7 @@ use crate::{
+ };
+ 
+ use super::{
+-  keyboard,
++  channel, keyboard,
+   monitor::{self, MonitorHandle},
+   taskbar, util,
+   window::{WindowId, WindowRequest},
+@@ -59,7 +59,7 @@ pub struct EventLoopWindowTarget<T> {
+   /// Window Ids of the application
+   pub(crate) windows: Rc<RefCell<HashSet<WindowId>>>,
+   /// Window requests sender
+-  pub(crate) window_requests_tx: glib::Sender<(WindowId, WindowRequest)>,
++  pub(crate) window_requests_tx: channel::Sender<(WindowId, WindowRequest)>,
+   /// Draw event sender
+   pub(crate) draw_tx: crossbeam_channel::Sender<WindowId>,
+   _marker: std::marker::PhantomData<T>,
+@@ -243,7 +243,7 @@ impl<T: 'static> EventLoop<T> {
+     let user_event_tx = event_tx.clone();
+ 
+     // Create event loop window target.
+-    let (window_requests_tx, window_requests_rx) = glib::MainContext::channel(Priority::default());
++    let (window_requests_tx, window_requests_rx) = channel::channel();
+     let display = gdk::Display::default()
+       .expect("GdkDisplay not found. This usually means `gkt_init` hasn't called yet.");
+     let window_target = EventLoopWindowTarget {
+@@ -258,7 +258,7 @@ impl<T: 'static> EventLoop<T> {
+     // Spawn x11 thread to receive Device events.
+     #[cfg(feature = "x11")]
+     let run_device_thread = if window_target.is_x11() {
+-      let (device_tx, device_rx) = glib::MainContext::channel(glib::Priority::default());
++      let (device_tx, device_rx) = channel::channel();
+       let user_event_tx = user_event_tx.clone();
+       let run_device_thread = Rc::new(AtomicBool::new(true));
+       let run = run_device_thread.clone();
+diff --git a/src/platform_impl/linux/mod.rs b/src/platform_impl/linux/mod.rs
+index aa31754..73c5608 100644
+--- a/src/platform_impl/linux/mod.rs
++++ b/src/platform_impl/linux/mod.rs
+@@ -2,6 +2,7 @@
+ // Copyright 2021-2023 Tauri Programme within The Commons Conservancy
+ // SPDX-License-Identifier: Apache-2.0
+ 
++mod channel;
+ #[cfg(feature = "x11")]
+ mod device;
+ mod event_loop;
+diff --git a/src/platform_impl/linux/portal.rs b/src/platform_impl/linux/portal.rs
+index c0df6a4..f2bd704 100644
+--- a/src/platform_impl/linux/portal.rs
++++ b/src/platform_impl/linux/portal.rs
+@@ -5,10 +5,11 @@ use dbus::{
+   message::MatchRule,
+   Error,
+ };
+-use gtk::glib::{ControlFlow, MainContext, Priority, Sender};
++use gtk::glib::ControlFlow;
+ use log::warn;
+ use std::{thread, time::Duration};
+ 
++use super::channel::{self, Sender};
+ use crate::{
+   platform_impl::{platform::window::WindowRequest, WindowId},
+   window::Theme,
+@@ -34,7 +35,7 @@ pub fn theme() -> Result<Theme, Error> {
+ pub fn receive_theme_changed(window_tx: Sender<(WindowId, WindowRequest)>) -> Result<(), Error> {
+   let conn = SyncConnection::new_session()?;
+   let match_rule = MatchRule::new_signal("org.freedesktop.portal.Settings", "SettingChanged");
+-  let (tx, rx) = MainContext::channel(Priority::DEFAULT);
++  let (tx, rx) = channel::channel();
+ 
+   conn.add_match(match_rule, move |_: (), _, msg| {
+     let mut iter = msg.iter_init();
+diff --git a/src/platform_impl/linux/window.rs b/src/platform_impl/linux/window.rs
+index 4e40847..8fc028b 100644
+--- a/src/platform_impl/linux/window.rs
++++ b/src/platform_impl/linux/window.rs
+@@ -31,6 +31,7 @@ use crate::{
+ };
+ 
+ use super::{
++  channel,
+   event_loop::EventLoopWindowTarget,
+   monitor::{self, MonitorHandle},
+   util, Parent, PlatformSpecificWindowBuilderAttributes,
+@@ -52,7 +53,7 @@ pub struct Window {
+   pub(crate) window: gtk::ApplicationWindow,
+   pub(crate) default_vbox: Option<gtk::Box>,
+   /// Window requests sender
+-  pub(crate) window_requests_tx: glib::Sender<(WindowId, WindowRequest)>,
++  pub(crate) window_requests_tx: channel::Sender<(WindowId, WindowRequest)>,
+   scale_factor: Rc<AtomicI32>,
+   inner_position: Rc<(AtomicI32, AtomicI32)>,
+   outer_position: Rc<(AtomicI32, AtomicI32)>,
+@@ -87,7 +88,8 @@ impl Window {
+
+     let mut window_builder = gtk::ApplicationWindow::builder()
+       .application(app)
+-      .accept_focus(attributes.focusable && attributes.focused);
++      .accept_focus(attributes.focusable && attributes.focused)
++      .focus_on_map(attributes.focusable && attributes.focused);
+     if let Parent::ChildOf(parent) = pl_attribs.parent {
+       window_builder = window_builder.transient_for(&parent);
+     }
+@@ -239,6 +241,20 @@ impl Window {
+         glib::Propagation::Proceed
+       });
+       signal_id.borrow_mut().replace(id);
++      // A window built without the focus requests none when it first maps,
++      // at its creation or later: GTK then gives it a user time of 0, the
++      // EWMH's way of telling a window manager not to focus it, whenever its
++      // accept-focus comes back. A map after that may take the focus.
++      let mapped_id = Rc::new(RefCell::new(None));
++      let mapped_id_ = mapped_id.clone();
++      let id = window.connect_map_event(move |window, _| {
++        if let Some(id) = mapped_id_.take() {
++          window.set_focus_on_map(true);
++          window.disconnect(id);
++        }
++        glib::Propagation::Proceed
++      });
++      mapped_id.borrow_mut().replace(id);
+     }
+
+     // Check if we should paint the transparent background ourselves.
+diff --git a/src/platform_impl/macos/app_state.rs b/src/platform_impl/macos/app_state.rs
+index 6a4c9bb..0da737d 100644
+--- a/src/platform_impl/macos/app_state.rs
++++ b/src/platform_impl/macos/app_state.rs
+@@ -287,9 +287,12 @@ impl AppState {
+       let mtm = MainThreadMarker::new().unwrap();
+       let ns_app = NSApp(mtm);
+       window_activation_hack(&ns_app);
+-      let ignore = get_aux_state_mut(app_delegate).activate_ignoring_other_apps;
+-      #[allow(deprecated)]
+-      ns_app.activateIgnoringOtherApps(ignore);
++      // An application set not to activate ignoring other apps requests no
++      // activation at all, as macOS 14 activates one that passes false.
++      if get_aux_state_mut(app_delegate).activate_ignoring_other_apps {
++        #[allow(deprecated)]
++        ns_app.activateIgnoringOtherApps(true);
++      }
+ 
+       let dock_visible = get_aux_state_mut(app_delegate).dock_visibility;
+       if !dock_visible {
+diff --git a/src/platform_impl/windows/window.rs b/src/platform_impl/windows/window.rs
+index c92bcfa..8aa9deb 100644
+--- a/src/platform_impl/windows/window.rs
++++ b/src/platform_impl/windows/window.rs
+@@ -132,6 +132,13 @@ impl Window {
+       WindowState::set_window_flags(window_state.lock(), window.hwnd(), |f| {
+         f.set(WindowFlags::VISIBLE, visible)
+       });
++      // A window built not to take the focus takes none when it is first
++      // shown, at its creation or later; a show after that activates it.
++      if visible {
++        window_state
++          .lock()
++          .set_window_flags_in_place(|f| f.remove(WindowFlags::MARKER_DONT_FOCUS));
++      }
+     });
+   }
+
+@@ -1363,7 +1370,6 @@ unsafe fn init<T: 'static>(
+
+   let fullscreen = attributes.fullscreen.clone();
+   let maximized = attributes.maximized;
+-  let focused = attributes.focused;
+   let menu = pl_attribs.menu;
+
+   let mut initdata = InitData {
+@@ -1412,13 +1418,6 @@ unsafe fn init<T: 'static>(
+     window.set_maximized(true);
+   }
+
+-  if !focused {
+-    window
+-      .window_state
+-      .lock()
+-      .set_window_flags_in_place(|f| f.remove(WindowFlags::MARKER_DONT_FOCUS));
+-  }
+-
+   Ok(window)
+ }
+
+diff --git a/src/window.rs b/src/window.rs
+index 6973f3a..eb48e5c 100644
+--- a/src/window.rs
++++ b/src/window.rs
+@@ -1225,7 +1225,14 @@ impl Window {
+   ///
+   /// - **iOS / Android / Windows:** Unsupported.
+   pub fn set_visible_on_all_workspaces(&self, #[allow(unused)] visible: bool) {
+-    #[cfg(any(target_os = "macos", target_os = "linux"))]
++    #[cfg(any(
++      target_os = "linux",
++      target_os = "dragonfly",
++      target_os = "freebsd",
++      target_os = "netbsd",
++      target_os = "openbsd",
++      target_os = "macos",
++    ))]
+     self.window.set_visible_on_all_workspaces(visible)
+   }
+ 

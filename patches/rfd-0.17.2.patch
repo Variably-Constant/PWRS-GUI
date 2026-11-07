@@ -1,0 +1,276 @@
+diff --git a/src/backend/xdg_desktop_portal.rs b/src/backend/xdg_desktop_portal.rs
+index 1df6635..20684e3 100644
+--- a/src/backend/xdg_desktop_portal.rs
++++ b/src/backend/xdg_desktop_portal.rs
+@@ -91,6 +91,8 @@ impl FilePickerDialogImpl for FileDialog {
+             multiple: Some(false),
+             filters: self.filters.iter().map(Into::into).collect(),
+             current_folder: path_to_cstring(self.starting_directory.as_deref()),
++            cancel: self.cancel.clone(),
++            shown: self.shown.clone(),
+             ..Default::default()
+         })
+         .map(portal::uris_to_paths);
+@@ -101,6 +103,9 @@ impl FilePickerDialogImpl for FileDialog {
+             } else {
+                 Some(res.remove(0))
+             }
++        } else if let Some(failed) = &self.failed {
++            failed.store(true, std::sync::atomic::Ordering::Release);
++            None
+         } else {
+             warn!("Using zenity fallback");
+             match block_on(zenity::pick_file(&self)) {
+@@ -124,12 +129,17 @@ impl FilePickerDialogImpl for FileDialog {
+             multiple: Some(true),
+             filters: self.filters.iter().map(Into::into).collect(),
+             current_folder: path_to_cstring(self.starting_directory.as_deref()),
++            cancel: self.cancel.clone(),
++            shown: self.shown.clone(),
+             ..Default::default()
+         })
+         .map(portal::uris_to_paths);
+ 
+         if let Some(res) = res {
+             Some(res)
++        } else if let Some(failed) = &self.failed {
++            failed.store(true, std::sync::atomic::Ordering::Release);
++            None
+         } else {
+             warn!("Using zenity fallback");
+             match block_on(zenity::pick_files(&self)) {
+@@ -174,6 +184,8 @@ impl FolderPickerDialogImpl for FileDialog {
+             directory: Some(true),
+             filters: self.filters.iter().map(Into::into).collect(),
+             current_folder: path_to_cstring(self.starting_directory.as_deref()),
++            cancel: self.cancel.clone(),
++            shown: self.shown.clone(),
+             ..Default::default()
+         })
+         .map(portal::uris_to_paths);
+@@ -184,6 +196,9 @@ impl FolderPickerDialogImpl for FileDialog {
+             } else {
+                 Some(res.remove(0))
+             }
++        } else if let Some(failed) = &self.failed {
++            failed.store(true, std::sync::atomic::Ordering::Release);
++            None
+         } else {
+             warn!("Using zenity fallback");
+             match block_on(zenity::pick_folder(&self)) {
+@@ -208,12 +223,17 @@ impl FolderPickerDialogImpl for FileDialog {
+             directory: Some(true),
+             filters: self.filters.iter().map(Into::into).collect(),
+             current_folder: path_to_cstring(self.starting_directory.as_deref()),
++            cancel: self.cancel.clone(),
++            shown: self.shown.clone(),
+             ..Default::default()
+         })
+         .map(portal::uris_to_paths);
+ 
+         if let Some(res) = res {
+             Some(res)
++        } else if let Some(failed) = &self.failed {
++            failed.store(true, std::sync::atomic::Ordering::Release);
++            None
+         } else {
+             warn!("Using zenity fallback");
+             match block_on(zenity::pick_folders(&self)) {
+@@ -257,6 +277,8 @@ impl FileSaveDialogImpl for FileDialog {
+             filters: self.filters.iter().map(Into::into).collect(),
+             current_folder: path_to_cstring(self.starting_directory.as_deref()),
+             current_name: str_to_cstring(self.file_name.as_deref()),
++            cancel: self.cancel.clone(),
++            shown: self.shown.clone(),
+             ..Default::default()
+         })
+         .map(portal::uris_to_paths);
+@@ -267,6 +289,9 @@ impl FileSaveDialogImpl for FileDialog {
+             } else {
+                 Some(res.remove(0))
+             }
++        } else if let Some(failed) = &self.failed {
++            failed.store(true, std::sync::atomic::Ordering::Release);
++            None
+         } else {
+             warn!("Using zenity fallback");
+             match block_on(zenity::save_file(&self)) {
+diff --git a/src/backend/xdg_desktop_portal/portal/file_dialog.rs b/src/backend/xdg_desktop_portal/portal/file_dialog.rs
+index 6a1d0ee..574a559 100644
+--- a/src/backend/xdg_desktop_portal/portal/file_dialog.rs
++++ b/src/backend/xdg_desktop_portal/portal/file_dialog.rs
+@@ -41,6 +41,10 @@ pub struct OpenFileOptions {
+     #[allow(unused)]
+     pub current_filter: Option<FileFilter>,
+     pub current_folder: Option<FilePath>,
++    /// Set, it closes the request and its dialog.
++    pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
++    /// Set once the portal has taken the request, which shows its dialog.
++    pub shown: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+ }
+ 
+ fn append_filters(dict: &mut MessageIter, filters: Vec<FileFilter>) {
+@@ -143,6 +147,10 @@ pub struct SaveFileOptions {
+     pub current_name: Option<CString>,
+     pub current_folder: Option<FilePath>,
+     pub current_file: Option<FilePath>,
++    /// Set, it closes the request and its dialog.
++    pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
++    /// Set once the portal has taken the request, which shows its dialog.
++    pub shown: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+     pub filters: Vec<FileFilter>,
+     // TODO: Serialize this if needed
+     #[allow(unused)]
+diff --git a/src/backend/xdg_desktop_portal/portal/mod.rs b/src/backend/xdg_desktop_portal/portal/mod.rs
+index 5fc1361..87f504e 100644
+--- a/src/backend/xdg_desktop_portal/portal/mod.rs
++++ b/src/backend/xdg_desktop_portal/portal/mod.rs
+@@ -2,6 +2,7 @@ use std::{
+     ffi::{CStr, CString, OsStr},
+     os::unix::ffi::OsStrExt,
+     path::PathBuf,
++    sync::atomic::{AtomicBool, Ordering},
+ };
+ 
+ mod ffi;
+@@ -32,6 +33,8 @@ pub fn open_file(opts: OpenFileOptions) -> Option<Vec<CString>> {
+     let handle_path = generate_response_path(&mut conn, &opts.handle_token);
+     register_response_listener(&mut conn, &handle_path);
+ 
++    let cancel = opts.cancel.clone();
++    let shown = opts.shown.clone();
+     let reply = conn.send_and_block(&Message::open_file(opts));
+ 
+     if conn.err().is_err() {
+@@ -53,7 +56,7 @@ pub fn open_file(opts: OpenFileOptions) -> Option<Vec<CString>> {
+         register_response_listener(&mut conn, &got_handle_path);
+     }
+ 
+-    wait_for_response(&mut conn, &handle_path)
++    wait_for_response(&mut conn, &handle_path, cancel.as_deref(), shown.as_deref())
+ }
+ 
+ pub fn save_file(opts: SaveFileOptions) -> Option<Vec<CString>> {
+@@ -62,6 +65,8 @@ pub fn save_file(opts: SaveFileOptions) -> Option<Vec<CString>> {
+     let handle_path = generate_response_path(&mut conn, &opts.handle_token);
+     register_response_listener(&mut conn, &handle_path);
+ 
++    let cancel = opts.cancel.clone();
++    let shown = opts.shown.clone();
+     let reply = conn.send_and_block(&Message::save_file(opts));
+ 
+     if conn.err().is_err() {
+@@ -83,7 +88,7 @@ pub fn save_file(opts: SaveFileOptions) -> Option<Vec<CString>> {
+         register_response_listener(&mut conn, &got_handle_path);
+     }
+ 
+-    wait_for_response(&mut conn, &handle_path)
++    wait_for_response(&mut conn, &handle_path, cancel.as_deref(), shown.as_deref())
+ }
+ 
+ fn generate_response_path(conn: &mut Connection, handle_token: &HandleToken) -> CString {
+@@ -126,9 +131,29 @@ enum ResponseCode {
+     // Other = 2,
+ }
+ 
+-fn wait_for_response(conn: &mut Connection, handle_path: &CStr) -> Option<Vec<CString>> {
++/// How long a wait that can be canceled reads before it looks at its
++/// cancel flag again, in milliseconds.
++const CANCEL_CHECK_MS: i32 = 100;
++
++/// Waits for the request's Response, first setting `shown`, since the portal
++/// has taken the request and shows its dialog. With `cancel`, once it is
++/// set, tells the portal to close the request, which ends its dialog and
++/// sends no Response, and returns as a cancel does.
++fn wait_for_response(
++    conn: &mut Connection,
++    handle_path: &CStr,
++    cancel: Option<&AtomicBool>,
++    shown: Option<&AtomicBool>,
++) -> Option<Vec<CString>> {
++    if let Some(shown) = shown {
++        shown.store(true, Ordering::Release);
++    }
+     loop {
+-        conn.read_write(-1);
++        if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
++            close_request(conn, handle_path);
++            return Some(vec![]);
++        }
++        conn.read_write(if cancel.is_some() { CANCEL_CHECK_MS } else { -1 });
+         while let Some(signal) = conn.pop_message() {
+             if signal.is_signal(c"org.freedesktop.portal.Request", c"Response") {
+                 let Some(path) = signal.get_path() else {
+@@ -144,6 +169,24 @@ fn wait_for_response(conn: &mut Connection, handle_path: &CStr) -> Option<Vec<CS
+     }
+ }
+ 
++/// Calls org.freedesktop.portal.Request.Close on the request at
++/// `handle_path`, on the connection that made it.
++fn close_request(conn: &mut Connection, handle_path: &CStr) {
++    let Some(close) = Message::new_method_call(
++        c"org.freedesktop.portal.Desktop",
++        handle_path,
++        c"org.freedesktop.portal.Request",
++        c"Close",
++    ) else {
++        log::error!("Request.Close could not be made");
++        return;
++    };
++    let reply = conn.send_and_block(&close);
++    if conn.err().is_err() || reply.is_none() {
++        log::error!("Request.Close failed: {}", conn.err());
++    }
++}
++
+ fn parse_response(msg: &Message) -> Option<Vec<CString>> {
+     let mut iter = MessageIter::from_msg(msg);
+ 
+diff --git a/src/file_dialog.rs b/src/file_dialog.rs
+index 272fc24..05e8dff 100644
+--- a/src/file_dialog.rs
++++ b/src/file_dialog.rs
+@@ -25,6 +25,12 @@ pub struct FileDialog {
+     pub(crate) parent: Option<RawWindowHandle>,
+     pub(crate) parent_display: Option<RawDisplayHandle>,
+     pub(crate) can_create_directories: Option<bool>,
++    #[cfg(all(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"), not(feature = "gtk3")))]
++    pub(crate) cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
++    #[cfg(all(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"), not(feature = "gtk3")))]
++    pub(crate) failed: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
++    #[cfg(all(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"), not(feature = "gtk3")))]
++    pub(crate) shown: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+ }
+ 
+ // Oh god, I don't like sending RawWindowHandle between threads but here we go anyways...
+@@ -108,6 +114,30 @@ impl FileDialog {
+         self.can_create_directories.replace(can);
+         self
+     }
++
++    /// A flag that, once set while the dialog is open, closes it as a cancel
++    /// does. Supported in: Linux and the BSDs, through the XDG portal.
++    #[cfg(all(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"), not(feature = "gtk3")))]
++    pub fn set_cancel(mut self, cancel: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
++        self.cancel = Some(cancel);
++        self
++    }
++
++    /// A flag set when the dialog could not open, in place of falling back
++    /// to zenity. Supported in: Linux and the BSDs, through the XDG portal.
++    #[cfg(all(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"), not(feature = "gtk3")))]
++    pub fn set_failed(mut self, failed: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
++        self.failed = Some(failed);
++        self
++    }
++
++    /// A flag set once the portal has taken the request, which is when the
++    /// dialog shows. Supported in: Linux and the BSDs, through the XDG portal.
++    #[cfg(all(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"), not(feature = "gtk3")))]
++    pub fn set_shown(mut self, shown: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
++        self.shown = Some(shown);
++        self
++    }
+ }
+ 
+ #[cfg(not(target_arch = "wasm32"))]

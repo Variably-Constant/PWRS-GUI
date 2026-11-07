@@ -1,0 +1,121 @@
+canvas 492 1248
+layer cap round 4 0 at 22 22
+path open 1
+knot 22.0 22.0 22.0 22.0 22.0 22.0
+knot 82.0 22.0 82.0 22.0 82.0 22.0
+layer cap round 4 90 at 126 22
+path open 1
+knot 126.0 22.0 126.0 22.0 126.0 22.0
+knot 126.0 82.0 126.0 82.0 126.0 82.0
+layer cap round 4 30 at 230 22
+path open 1
+knot 230.0 22.0 230.0 22.0 230.0 22.0
+knot 282.0 52.0 282.0 52.0 282.0 52.0
+layer cap round 8 0 at 24 128
+path open 1
+knot 24.0 128.0 24.0 128.0 24.0 128.0
+knot 84.0 128.0 84.0 128.0 84.0 128.0
+layer cap round 8 90 at 132 128
+path open 1
+knot 132.0 128.0 132.0 128.0 132.0 128.0
+knot 132.0 188.0 132.0 188.0 132.0 188.0
+layer cap round 8 30 at 240 128
+path open 1
+knot 240.0 128.0 240.0 128.0 240.0 128.0
+knot 292.0 158.0 292.0 158.0 292.0 158.0
+layer cap round 16 0 at 28 240
+path open 1
+knot 28.0 240.0 28.0 240.0 28.0 240.0
+knot 88.0 240.0 88.0 240.0 88.0 240.0
+layer cap round 16 90 at 144 240
+path open 1
+knot 144.0 240.0 144.0 240.0 144.0 240.0
+knot 144.0 300.0 144.0 300.0 144.0 300.0
+layer cap round 16 30 at 260 240
+path open 1
+knot 260.0 240.0 260.0 240.0 260.0 240.0
+knot 312.0 270.0 312.0 270.0 312.0 270.0
+layer cap round 32 0 at 36 364
+path open 1
+knot 36.0 364.0 36.0 364.0 36.0 364.0
+knot 96.0 364.0 96.0 364.0 96.0 364.0
+layer cap round 32 90 at 168 364
+path open 1
+knot 168.0 364.0 168.0 364.0 168.0 364.0
+knot 168.0 424.0 168.0 424.0 168.0 424.0
+layer cap round 32 30 at 300 364
+path open 1
+knot 300.0 364.0 300.0 364.0 300.0 364.0
+knot 352.0 394.0 352.0 394.0 352.0 394.0
+layer cap round 64 0 at 52 512
+path open 1
+knot 52.0 512.0 52.0 512.0 52.0 512.0
+knot 112.0 512.0 112.0 512.0 112.0 512.0
+layer cap round 64 90 at 216 512
+path open 1
+knot 216.0 512.0 216.0 512.0 216.0 512.0
+knot 216.0 572.0 216.0 572.0 216.0 572.0
+layer cap round 64 30 at 380 512
+path open 1
+knot 380.0 512.0 380.0 512.0 380.0 512.0
+knot 432.0 542.0 432.0 542.0 432.0 542.0
+layer cap square 4 0 at 22 646
+path open 1
+knot 22.0 646.0 22.0 646.0 22.0 646.0
+knot 82.0 646.0 82.0 646.0 82.0 646.0
+layer cap square 4 90 at 126 646
+path open 1
+knot 126.0 646.0 126.0 646.0 126.0 646.0
+knot 126.0 706.0 126.0 706.0 126.0 706.0
+layer cap square 4 30 at 230 646
+path open 1
+knot 230.0 646.0 230.0 646.0 230.0 646.0
+knot 282.0 676.0 282.0 676.0 282.0 676.0
+layer cap square 8 0 at 24 752
+path open 1
+knot 24.0 752.0 24.0 752.0 24.0 752.0
+knot 84.0 752.0 84.0 752.0 84.0 752.0
+layer cap square 8 90 at 132 752
+path open 1
+knot 132.0 752.0 132.0 752.0 132.0 752.0
+knot 132.0 812.0 132.0 812.0 132.0 812.0
+layer cap square 8 30 at 240 752
+path open 1
+knot 240.0 752.0 240.0 752.0 240.0 752.0
+knot 292.0 782.0 292.0 782.0 292.0 782.0
+layer cap square 16 0 at 28 864
+path open 1
+knot 28.0 864.0 28.0 864.0 28.0 864.0
+knot 88.0 864.0 88.0 864.0 88.0 864.0
+layer cap square 16 90 at 144 864
+path open 1
+knot 144.0 864.0 144.0 864.0 144.0 864.0
+knot 144.0 924.0 144.0 924.0 144.0 924.0
+layer cap square 16 30 at 260 864
+path open 1
+knot 260.0 864.0 260.0 864.0 260.0 864.0
+knot 312.0 894.0 312.0 894.0 312.0 894.0
+layer cap square 32 0 at 36 988
+path open 1
+knot 36.0 988.0 36.0 988.0 36.0 988.0
+knot 96.0 988.0 96.0 988.0 96.0 988.0
+layer cap square 32 90 at 168 988
+path open 1
+knot 168.0 988.0 168.0 988.0 168.0 988.0
+knot 168.0 1048.0 168.0 1048.0 168.0 1048.0
+layer cap square 32 30 at 300 988
+path open 1
+knot 300.0 988.0 300.0 988.0 300.0 988.0
+knot 352.0 1018.0 352.0 1018.0 352.0 1018.0
+layer cap square 64 0 at 52 1136
+path open 1
+knot 52.0 1136.0 52.0 1136.0 52.0 1136.0
+knot 112.0 1136.0 112.0 1136.0 112.0 1136.0
+layer cap square 64 90 at 216 1136
+path open 1
+knot 216.0 1136.0 216.0 1136.0 216.0 1136.0
+knot 216.0 1196.0 216.0 1196.0 216.0 1196.0
+layer cap square 64 30 at 380 1136
+path open 1
+knot 380.0 1136.0 380.0 1136.0 380.0 1136.0
+knot 432.0 1166.0 432.0 1166.0 432.0 1166.0

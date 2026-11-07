@@ -1,0 +1,29 @@
+[package]
+name = "pwrs-gui-fetch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "PWRS-GUI's https loader, which both helpers link: whole bodies for pictures, byte ranges for media."
+publish = false
+
+# ureq over rustls on aws-lc-rs, as SecureFetch takes them, verifying
+# servers against the Mozilla roots webpki-root-certs includes and the
+# system's own.
+[dependencies]
+# The header reader an https clip's ranges are read with.
+pwrs-gui-proto = { path = "../pwrs-gui-proto" }
+ureq ={ version = "3.5.0", default-features = false, features = ["rustls-no-provider"] }
+rustls = "0.23.46"
+webpki-root-certs = "1.0.11"
+arc-swap.workspace = true
+
+# The current user's Root store on Windows, where rustls-native-certs's own
+# reader panics on a root whose uses or validity cannot be read.
+[target.'cfg(windows)'.dependencies]
+schannel = "0.1.30"
+
+# The files OpenSSL reads, or the Keychain's on macOS.
+[target.'cfg(not(windows))'.dependencies]
+rustls-native-certs = "0.8.5"

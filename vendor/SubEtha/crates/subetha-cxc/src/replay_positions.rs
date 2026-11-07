@@ -1,0 +1,225 @@
+//! `SubscriberPosition`: Aeron-inspired MMF-resident position
+//! counter for resumable cross-process subscribers.
+//!
+//! A subscriber that consumes from a ring needs a way to checkpoint
+//! "I have consumed up to position N" so that if the subscriber
+//! crashes / restarts, it can resume from N rather than from the
+//! ring's tail (which may have advanced past lost items).
+//! `SubscriberPosition` is the standalone primitive that holds N
+//! in an MMF file, surviving process restarts.
+//!
+//! # Why standalone
+//!
+//! The substrate's ring primitives (SpscRingCore, SharedRing,
+//! AdaptiveRing) maintain head/tail counters internally; those
+//! counters track ring slot positions, not subscriber positions.
+//! `SubscriberPosition` is the caller-managed counter that bridges
+//! "ring is at slot K" with "this subscriber has acknowledged up
+//! to absolute position P". Callers compute the relationship
+//! between K and P themselves (typically by walking the ring's
+//! head pointer at startup + remembering the offset).
+//!
+//! # MMF residency
+//!
+//! The position lives in a `SharedAtomicU64` file. Two processes
+//! that open the same path see the same position counter
+//! atomically. This matches the substrate's MMF-resident-control
+//! pattern (locale_tag, pin_generation, etc.).
+//!
+//! # Replay semantics
+//!
+//! After a restart, the subscriber:
+//! 1. Reopens the SubscriberPosition file by path.
+//! 2. Reads the persisted position via [`get`](SubscriberPosition::get).
+//! 3. Reopens the source ring and re-attaches.
+//! 4. Resumes consumption from the recorded position (caller's
+//!    responsibility to map absolute position to ring slot index).
+//!
+//! Wraparound: a regular ring's slot array is bounded, so if the
+//! producer outruns the subscriber's checkpoint by more than the ring's
+//! capacity, the overwritten items are lost. A replay that loses nothing
+//! needs a source ring large enough, or positions snapshotted often
+//! enough, that the checkpoint never lags the producer by more than one
+//! ring sweep.
+
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
+use crate::shared_atomic::{SharedAtomicError, SharedAtomicU64};
+
+/// MMF-backed monotonically-increasing consumer position counter.
+pub struct SubscriberPosition {
+    counter: Arc<SharedAtomicU64>,
+}
+
+/// The counter's error as the `io::Error` this type returns: an
+/// operating-system failure as it came, and a counter file of another
+/// shape as `InvalidData` carrying the
+/// [`Mismatch`](crate::layout::Mismatch).
+fn counter_error(e: SharedAtomicError) -> std::io::Error {
+    match e {
+        SharedAtomicError::IoError(e) => e,
+        SharedAtomicError::LayoutMismatch(m) => m.into(),
+    }
+}
+
+impl SubscriberPosition {
+    /// Create a new position counter at `path` initialized to
+    /// `initial`. A file of another shape at `path` is `InvalidData`.
+    pub fn create(
+        path: impl AsRef<Path>,
+        initial: u64,
+    ) -> Result<Self, std::io::Error> {
+        let counter = SharedAtomicU64::create(path, initial).map_err(counter_error)?;
+        Ok(Self { counter: Arc::new(counter) })
+    }
+
+    /// Open an existing position counter at `path` for read/write.
+    /// Used by a subscriber restart path. A file of another shape at
+    /// `path` is `InvalidData`.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, std::io::Error> {
+        let counter = SharedAtomicU64::open(path).map_err(counter_error)?;
+        Ok(Self { counter: Arc::new(counter) })
+    }
+
+    /// Current position (Acquire load).
+    pub fn get(&self) -> u64 { self.counter.load(Ordering::Acquire) }
+
+    /// Advance the position by `by`. Returns the new position.
+    /// Atomic; safe for one subscriber to call concurrently with
+    /// another holder reading via `get`.
+    pub fn advance(&self, by: u64) -> u64 {
+        let prior = self.counter.fetch_add(by, Ordering::AcqRel);
+        prior + by
+    }
+
+    /// Set the position to `new` unconditionally. Used by restart
+    /// paths that want to reset rather than advance.
+    pub fn set(&self, new: u64) {
+        self.counter.store(new, Ordering::Release);
+    }
+
+    /// Compare-and-set semantics. Returns `Ok(new)` if the previous
+    /// value matched `expected`; `Err(actual)` otherwise.
+    pub fn compare_and_set(
+        &self,
+        expected: u64,
+        new: u64,
+    ) -> Result<u64, u64> {
+        match self.counter.compare_exchange(
+            expected, new, Ordering::AcqRel, Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(new),
+            Err(actual) => Err(actual),
+        }
+    }
+
+    /// Clone the underlying `Arc<SharedAtomicU64>` so a second
+    /// in-process holder can read the same counter cheaply.
+    pub fn counter_handle(&self) -> Arc<SharedAtomicU64> {
+        self.counter.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A file for one test, removed when the test ends; declared before the
+    /// primitive that maps it so it drops after it.
+    fn tmp(name: &str) -> crate::test_paths::TmpFile {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the wall clock is after the epoch")
+            .as_nanos();
+        crate::test_paths::TmpFile::new(format!("subpos_{}_{nonce}_{name}.bin", std::process::id()))
+    }
+
+    #[test]
+    fn create_then_get_returns_initial() {
+        let path = tmp("init");
+        let pos = SubscriberPosition::create(&path, 42).expect("create");
+        assert_eq!(pos.get(), 42);
+    }
+
+    #[test]
+    fn advance_returns_new_position() {
+        let path = tmp("advance");
+        let pos = SubscriberPosition::create(&path, 0).expect("create");
+        assert_eq!(pos.advance(5), 5);
+        assert_eq!(pos.advance(7), 12);
+        assert_eq!(pos.get(), 12);
+    }
+
+    #[test]
+    fn set_overrides_unconditionally() {
+        let path = tmp("set");
+        let pos = SubscriberPosition::create(&path, 100).expect("create");
+        pos.set(9999);
+        assert_eq!(pos.get(), 9999);
+    }
+
+    #[test]
+    fn compare_and_set_succeeds_on_expected() {
+        let path = tmp("cas_ok");
+        let pos = SubscriberPosition::create(&path, 0).expect("create");
+        assert_eq!(pos.compare_and_set(0, 10), Ok(10));
+        assert_eq!(pos.get(), 10);
+    }
+
+    #[test]
+    fn compare_and_set_fails_on_mismatch() {
+        let path = tmp("cas_fail");
+        let pos = SubscriberPosition::create(&path, 5).expect("create");
+        assert_eq!(pos.compare_and_set(0, 999), Err(5));
+        assert_eq!(pos.get(), 5);
+    }
+
+    #[test]
+    fn open_after_create_sees_same_position() {
+        let path = tmp("reopen");
+        let a = SubscriberPosition::create(&path, 100).expect("create");
+        a.advance(50);
+        let b = SubscriberPosition::open(&path).expect("open");
+        assert_eq!(b.get(), 150);
+        b.advance(25);
+        assert_eq!(a.get(), 175);
+    }
+
+    #[test]
+    fn position_survives_drop_then_reopen() {
+        let path = tmp("survive_drop");
+        {
+            let a = SubscriberPosition::create(&path, 0).expect("create");
+            a.advance(42);
+            // a drops here; underlying MMF file persists.
+        }
+        let b = SubscriberPosition::open(&path).expect("reopen after drop");
+        assert_eq!(b.get(), 42);
+    }
+
+    /// A missing file is the operating system's `NotFound`, with its code.
+    #[test]
+    fn open_of_a_missing_file_is_not_found() {
+        let path = tmp("missing");
+        let e = SubscriberPosition::open(&path).err().expect("no file is there to open");
+        assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
+        assert!(e.raw_os_error().is_some(), "the operating system's code was dropped");
+    }
+
+    /// A counter of another width is `InvalidData` carrying the field that
+    /// differs.
+    #[test]
+    fn open_of_another_width_is_invalid_data_naming_the_width() {
+        let path = tmp("other_width");
+        let _narrow = crate::shared_atomic::SharedAtomicU32::create(&path, 0).expect("create");
+        let e = SubscriberPosition::open(&path).err().expect("a 4-byte atomic is not a position");
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            crate::layout::Mismatch::carried_by(&e),
+            Some(crate::layout::Mismatch::new("width", 4, 8)),
+            "{e}"
+        );
+    }
+}
