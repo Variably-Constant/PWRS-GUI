@@ -1,0 +1,2391 @@
+//! The adaptive ring through the C ABI: one handle per ring, byte payloads,
+//! producer and consumer ids from registration, a try and a waiting form of
+//! push and pop, and the file- and shared-memory-locale unlinks.
+//!
+//! Waiting parks on a cross-process waker beside the ring: a push wakes one
+//! parked consumer, a pop wakes one parked producer. In the file and
+//! shared-memory locales the wakers live beside the backings
+//! (`<prefix>.cwaker.bin` / `<prefix>.pwaker.bin`, `{name}_cwaker` /
+//! `{name}_pwaker`), so a process that attaches wakes and is woken across
+//! the boundary.
+//!
+//! Mode: strict attaches nothing and starts no thread; the ring still
+//! morphs on registration and on the pop path, which is the ring's own
+//! behavior and needs no pump. Managed attaches a shape sidecar that scans
+//! at the interval the caller sets and morphs from the default shape policy.
+//! There is nothing for a strict-mode caller to pump on a ring, so nothing
+//! to under-pump and nothing to count.
+
+use std::collections::HashMap;
+use std::ffi::{c_char, CStr};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use subetha_cxc::claim::Claim;
+use subetha_cxc::adaptive_ring::{
+    AdaptiveRing, AdaptiveRingSidecar, DefaultRingShapePolicy, RingItem, RingShape, UnlinkReport,
+    PLAIN_ITEM_BYTES,
+};
+use subetha_cxc::blocking_adaptive_ring::BlockingAdaptiveRing;
+use subetha_cxc::peer_directory::{CONSUMER_SLOT_CEILING, PRODUCER_SLOT_CEILING};
+use subetha_cxc::ring_holders::LastHolder;
+use subetha_cxc::cross_process_waker::{
+    waker_region_size, CrossProcessWaker, MAX_WAITERS_DEFAULT,
+};
+use subetha_cxc::frame_ring::{FrameClass, LayoutHint};
+use subetha_cxc::ordering::{OrderingMode, StampKind};
+use subetha_cxc::layout::Mismatch;
+use subetha_cxc::ring_contract::{OrderingContract, RingContract};
+use subetha_cxc::shm_file::{ContainerSid, ShmFile, ShmNamespace};
+
+use crate::batch::{run_pop_many, run_push_many};
+
+use crate::error::{
+    adaptive_code, blocking_code, fail, last_holder_code, ring_code, waker_code, SUBETHA_E_BUFFER_TOO_SMALL,
+    SUBETHA_E_INVALID_ARGUMENT, SUBETHA_E_INVALID_UTF8, SUBETHA_E_NOT_A_FRAME, SUBETHA_E_RING_IO,
+    SUBETHA_E_RING_LAYOUT_MISMATCH, SUBETHA_E_RING_PAYLOAD_TOO_LARGE,
+    SUBETHA_E_RING_WAKER_LAYOUT, SUBETHA_OK,
+};
+use crate::handle::{subetha_handle, Object};
+use crate::runtime::{
+    entry, issue, require_initialized, resolve_mode, with_ring, SUBETHA_MODE_MANAGED,
+};
+
+/// Bytes one slot holds. A pop buffer must be at least this large.
+pub const SUBETHA_RING_SLOT_BYTES: usize = 64;
+/// The largest payload every shape accepts. A push between this and
+/// `SUBETHA_RING_PLAIN_ITEM_BYTES` succeeds while the ring is in a shape
+/// built of single-producer cores (SPSC, MPSC, MPMC), and is refused in the
+/// Vyukov shape with `SUBETHA_E_RING_PAYLOAD_TOO_LARGE`.
+pub const SUBETHA_RING_PAYLOAD_MAX: usize = 56;
+/// The largest plain item a shape built of single-producer cores accepts:
+/// every byte of the slot but its last, which holds the item's kind.
+pub const SUBETHA_RING_PLAIN_ITEM_BYTES: usize = 63;
+const _: () = assert!(SUBETHA_RING_PLAIN_ITEM_BYTES == PLAIN_ITEM_BYTES);
+
+/// Ring shape: one producer, one consumer.
+pub const SUBETHA_RING_SHAPE_SPSC: u32 = 0;
+/// Ring shape: several producers, one consumer.
+pub const SUBETHA_RING_SHAPE_MPSC: u32 = 1;
+/// Ring shape: several producers, several consumers.
+pub const SUBETHA_RING_SHAPE_MPMC: u32 = 2;
+/// Ring shape: the Vyukov queue, global FIFO across producers.
+pub const SUBETHA_RING_SHAPE_VYUKOV: u32 = 3;
+
+/// Shared-memory names resolve per session (`Local\` on Windows).
+pub const SUBETHA_SHM_SESSION: u32 = 0;
+/// Shared-memory names resolve machine-wide (`Global\` on Windows).
+pub const SUBETHA_SHM_MACHINE: u32 = 1;
+/// Shared-memory names resolve in the named-object directory of the
+/// AppContainer that `shm_container_sid` names (Windows), reached from
+/// outside the container. A process inside the container reaches the same
+/// objects with `SUBETHA_SHM_SESSION`. The directory exists only while a
+/// process of the container runs. On other platforms the names are the
+/// same in every namespace.
+pub const SUBETHA_SHM_APPCONTAINER: u32 = 2;
+
+/// The shape sidecar's scan cadence when a managed-mode caller names
+/// none, in microseconds.
+///
+/// The cadence is the added round-trip latency of managed mode, so this
+/// is a latency budget rather than a tuned optimum: measured on Linux
+/// and FreeBSD from 250 to 10000 microseconds, a request/response round
+/// trip costs exactly one interval and a streaming caller costs nothing,
+/// with no knee anywhere in that range. A quarter of a millisecond is
+/// small against a network hop and against most process-to-process round
+/// trips, and costs a few percent of the scanning CPU that a ten-times
+/// shorter cadence would.
+pub const SUBETHA_SCAN_INTERVAL_DEFAULT_US: u64 = 250;
+const _: () = assert!(
+    SUBETHA_SCAN_INTERVAL_DEFAULT_US == subetha_cxc::adaptive_ring::SCAN_INTERVAL_DEFAULT_US,
+    "the C ABI's default scan interval is the Rust managed ring's default"
+);
+
+/// Wait without a deadline.
+pub const SUBETHA_WAIT_FOREVER: i64 = -1;
+
+/// The largest frame that rides inside a slot; a larger one spills to the
+/// ring's payload region, which exists from the first spill on.
+pub const SUBETHA_RING_FRAME_INLINE_BUDGET: usize = 51;
+/// Bytes per block of the payload region the ring creates on its first
+/// spilled frame. A frame larger than this is refused with
+/// `SUBETHA_E_RING_PAYLOAD_TOO_LARGE`.
+pub const SUBETHA_RING_FRAME_DEFAULT_BLOCK: usize = 8192;
+
+/// The frame rode inside the slot.
+pub const SUBETHA_FRAME_INLINE: u32 = 0;
+/// The frame's bytes live in the payload region; the slot carried the offset.
+pub const SUBETHA_FRAME_OFFSET: u32 = 1;
+
+/// `subetha_ring_recv_any` took a plain item, pushed with
+/// `subetha_ring_try_push` or a form of it.
+pub const SUBETHA_RING_ITEM_PLAIN: u32 = 0;
+/// `subetha_ring_recv_any` took a frame that rode inside the slot.
+pub const SUBETHA_RING_ITEM_FRAME_INLINE: u32 = 1;
+/// `subetha_ring_recv_any` took a frame whose bytes lived in the payload
+/// region.
+pub const SUBETHA_RING_ITEM_FRAME_OFFSET: u32 = 2;
+
+/// Inline when the frame fits the budget, else the region.
+pub const SUBETHA_LAYOUT_AUTO: u32 = 0;
+/// Inline only; a frame past the budget is refused.
+pub const SUBETHA_LAYOUT_FORCE_INLINE: u32 = 1;
+/// The region even for a frame that would fit inline.
+pub const SUBETHA_LAYOUT_FORCE_OFFSET: u32 = 2;
+
+/// No ordering stamps: the ring's payload is the whole slot and its
+/// ordering is per-producer FIFO.
+pub const SUBETHA_STAMPS_NONE: u32 = 0;
+/// Stamps from the host's default source: the TSC where it is invariant,
+/// the shared counter on x86 without one, the monotonic clock elsewhere.
+/// On an open, whatever the creator chose.
+pub const SUBETHA_STAMPS_DEFAULT: u32 = 1;
+/// Stamps from the invariant TSC.
+pub const SUBETHA_STAMPS_TSC: u32 = 2;
+/// Stamps from one shared counter: a total order at the price of one
+/// contended increment per push.
+pub const SUBETHA_STAMPS_SHARED_COUNTER: u32 = 3;
+/// Stamps from the system's monotonic clock, in nanoseconds.
+pub const SUBETHA_STAMPS_MONOTONIC: u32 = 4;
+
+/// Ordering mode: the partition pop, per-producer FIFO; stamps only feed
+/// the inversion counter.
+pub const SUBETHA_ORDERING_UNORDERED: u32 = 0;
+/// Ordering mode: a k-way merge by stamp over the ring heads, global FIFO
+/// within the stamp source's skew window, under a single drainer.
+pub const SUBETHA_ORDERING_MERGE_BY_STAMP: u32 = 1;
+/// Ordering mode: the merge plus the per-producer watermark gate, exact
+/// global FIFO at the cost of waiting on the slowest producer.
+pub const SUBETHA_ORDERING_MERGE_STRICT: u32 = 2;
+
+/// Contract ordering: no guarantee.
+pub const SUBETHA_CONTRACT_UNORDERED: u32 = 0;
+/// Contract ordering: each producer's items in push order.
+pub const SUBETHA_CONTRACT_FIFO_PER_PRODUCER: u32 = 1;
+/// Contract ordering: one global order across every producer; the
+/// per-producer-lane shape is then refused.
+pub const SUBETHA_CONTRACT_FIFO: u32 = 2;
+/// Contract ordering: an item lands at most `k_out_of_order` positions
+/// from its global arrival order.
+pub const SUBETHA_CONTRACT_K_OUT_OF_ORDER: u32 = 3;
+
+/// A declared contract for a ring: peer ceilings, an ordering envelope,
+/// a capacity ceiling. A zero everywhere is the unbounded contract, which
+/// is what a ring has when none is declared: registration then grows the
+/// ring and never fails.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Default)]
+pub struct subetha_ring_contract {
+    /// Producers that may be registered at once; zero is unbounded.
+    pub max_producers: u8,
+    /// Consumers that may be registered at once; zero is unbounded.
+    pub max_consumers: u8,
+    /// One of the `SUBETHA_CONTRACT_` constants.
+    pub ordering: u32,
+    /// The `k` of `SUBETHA_CONTRACT_K_OUT_OF_ORDER`; ignored otherwise.
+    pub k_out_of_order: u32,
+    /// A ceiling on the capacity; zero is none.
+    pub capacity_bound: u32,
+}
+
+/// Options every ring constructor takes. A C initializer that names the
+/// first three fields and leaves the rest zero asks for no stamps, no
+/// contract, the lazily created frame region, no security descriptor and
+/// no AppContainer.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy)]
+pub struct subetha_ring_options {
+    /// `SUBETHA_MODE_STRICT`, `SUBETHA_MODE_MANAGED`, or `SUBETHA_MODE_DEFAULT`.
+    pub mode: u32,
+    /// Waiter slots in each of the ring's two wakers; zero takes the
+    /// library's default of 32.
+    pub max_waiters: u32,
+    /// Managed mode only: how often the shape sidecar scans, in
+    /// microseconds. Zero takes `SUBETHA_SCAN_INTERVAL_DEFAULT_US`.
+    /// Ignored in strict mode.
+    ///
+    /// This value is the added round-trip latency of managed mode: a
+    /// request and its response each wait for a scan, so a caller doing
+    /// request/response pays one interval per round trip. Streaming
+    /// callers pay nothing. Measured on Linux and FreeBSD across 250 to
+    /// 10000 microseconds, the extra time per round trip equals the
+    /// interval at every point.
+    pub scan_interval_us: u64,
+    /// One of the `SUBETHA_STAMPS_` constants. A stamped ring carries an
+    /// ordering region beside its backings, pays 8 bytes of every slot
+    /// for the stamp, never takes the Vyukov shape, and refuses frames.
+    pub stamps: u32,
+    /// The ring's declared contract; all zero declares none.
+    pub contract: subetha_ring_contract,
+    /// Bytes per block of the adaptive ring's frame payload region, which
+    /// is created at construction when this and `frame_blocks` are both
+    /// non-zero; a frame up to this size then travels past the slot. Zero
+    /// leaves the region to be created at
+    /// `SUBETHA_RING_FRAME_DEFAULT_BLOCK` bytes on the first spilled
+    /// frame. Set with `frame_blocks` or not at all.
+    pub frame_block: u64,
+    /// Blocks in the frame payload region; see `frame_block`.
+    pub frame_blocks: u32,
+    /// Holder slots in the ring's holder table, which is the number of
+    /// handles that may hold the backings open at once. Zero takes no
+    /// hold at all, which is the behavior of a ring that names no
+    /// holder table: the backings outlive every handle. A file-backed or
+    /// shared-memory ring only; see `last_holder`.
+    pub max_holders: u32,
+    /// `SUBETHA_LAST_HOLDER_KEEP` or `SUBETHA_LAST_HOLDER_UNLINK`: what
+    /// becomes of the backings when the last holder releases. Unlinking
+    /// needs `max_holders`, and the library names no default for it, so
+    /// asking to unlink with `max_holders` zero is refused rather than
+    /// given a number nobody chose. A file-backed ring's backings are
+    /// files and a shared-memory ring's are names; an anonymous ring has
+    /// neither and refuses a hold.
+    pub last_holder: u32,
+    /// The security descriptor, as an SDDL string, for every shared-memory
+    /// region this object creates; null applies the platform's default,
+    /// which on Windows admits the creating account and administrators.
+    /// A region that must be mapped from another Windows session needs
+    /// one. Ignored where the object is not in shared memory and on
+    /// platforms without descriptors.
+    pub shm_sddl: *const c_char,
+    /// With `SUBETHA_SHM_APPCONTAINER`, the container's SID in its string
+    /// form, `S-1-15-2-...`, which names the directory the object's
+    /// regions and events are in; the descriptor in `shm_sddl` must then
+    /// admit that SID. Required with that namespace, and ignored with the
+    /// others.
+    pub shm_container_sid: *const c_char,
+}
+
+impl Default for subetha_ring_options {
+    fn default() -> Self {
+        Self {
+            mode: 0,
+            max_waiters: 0,
+            scan_interval_us: 0,
+            stamps: 0,
+            contract: subetha_ring_contract::default(),
+            frame_block: 0,
+            frame_blocks: 0,
+            max_holders: 0,
+            last_holder: 0,
+            shm_sddl: std::ptr::null(),
+            shm_container_sid: std::ptr::null(),
+        }
+    }
+}
+
+/// The security descriptor the options carry, or `None` when the field is
+/// null.
+///
+/// # Safety
+/// `options.shm_sddl` is null or a NUL-terminated UTF-8 string that
+/// outlives the returned reference.
+pub(crate) unsafe fn sddl_of<'a>(options: &subetha_ring_options) -> Result<Option<&'a str>, i32> {
+    if options.shm_sddl.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(unsafe { text(options.shm_sddl, "shm_sddl") }?))
+}
+
+/// The frame region geometry the options ask for: `None` for the lazily
+/// created default, `Some((block, blocks))` when both fields are set; one
+/// without the other is refused.
+pub(crate) fn frame_geometry(options: &subetha_ring_options) -> Result<Option<(usize, usize)>, i32> {
+    match (options.frame_block, options.frame_blocks) {
+        (0, 0) => Ok(None),
+        (block, blocks) if block != 0 && blocks != 0 => match usize::try_from(block) {
+            Ok(block) => Ok(Some((block, blocks as usize))),
+            Err(e) => Err(fail(SUBETHA_E_INVALID_ARGUMENT, format!("frame_block {block} does not fit this platform: {e}"))),
+        },
+        _ => Err(fail(SUBETHA_E_INVALID_ARGUMENT, "frame_block and frame_blocks are set together or not at all")),
+    }
+}
+
+/// A snapshot of a ring's state.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Default)]
+pub struct subetha_ring_stats {
+    /// One of the `SUBETHA_RING_SHAPE_` constants.
+    pub shape: u32,
+    /// The mode this handle was created in, strict or managed.
+    pub mode: u32,
+    /// Producers currently registered.
+    pub active_producers: u32,
+    /// Consumers currently registered.
+    pub active_consumers: u32,
+    /// The producer count the ring was sized for; registration grows past it.
+    pub max_producers: u32,
+    /// The consumer count the ring was sized for.
+    pub max_consumers: u32,
+    /// Slots per backing.
+    pub capacity: u64,
+    /// Items in the current shape's backing, read without a lock.
+    pub approx_len: u64,
+    /// Shape morphs the ring refused because the previous shape still held
+    /// a backlog.
+    pub morph_refusals: u64,
+    /// Ordering-mode flips the ring refused.
+    pub mode_refusals: u64,
+    /// Waits that found every waiter slot in use and returned
+    /// `SUBETHA_E_RING_WAKER_FULL` instead of parking.
+    pub waker_full: u64,
+    /// Morphs the managed-mode sidecar issued; zero in strict mode.
+    pub sidecar_morphs: u64,
+    /// Cross-producer inversions observed at pop since the ordering
+    /// region was created; zero on an unstamped ring.
+    pub inversions: u64,
+    /// One of the `SUBETHA_STAMPS_` constants, never the default: the
+    /// source the stamps actually come from, or none.
+    pub stamps: u32,
+    /// The live ordering mode, one of the `SUBETHA_ORDERING_` constants;
+    /// unordered on an unstamped ring.
+    pub ordering_mode: u32,
+}
+
+/// What an unlink found.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Default)]
+pub struct subetha_unlink_report {
+    /// Files removed.
+    pub removed: u64,
+    /// Files the prefix names that were not present.
+    pub missing: u64,
+    /// Files whose removal the OS refused; the first is named in the detail.
+    pub failed: u64,
+}
+
+pub(crate) struct RingObject {
+    pub(crate) ring: Arc<AdaptiveRing>,
+    /// The ring with its two wakers and its notify record: every push and
+    /// pop goes through it, an ordered receiver's included, so a waiter on
+    /// any surface wakes on any surface's push or pop.
+    pub(crate) blocking: Arc<BlockingAdaptiveRing>,
+    sidecar: Claim<Option<AdaptiveRingSidecar>>,
+    mode: u32,
+    /// Items taken from the ring for a consumer whose buffer had no room,
+    /// kept by consumer id until a call with room.
+    held: Claim<HashMap<u32, Held>>,
+}
+
+/// An item taken from the ring and not yet delivered.
+struct Held {
+    /// One of the `SUBETHA_RING_ITEM_` constants.
+    kind: u32,
+    bytes: Vec<u8>,
+}
+
+impl RingObject {
+    /// The ring as the sidecar observes it. An ordered receiver built on
+    /// this ring records into the same observations.
+    pub(crate) fn adaptive(&self) -> &(dyn subetha_sidecar::AdaptiveInstance + 'static) {
+        &*self.ring
+    }
+}
+
+/// What is left of `deadline`, for a wait that takes a timeout.
+fn remaining(deadline: Option<Instant>) -> Option<Duration> {
+    deadline.map(|d| d.saturating_duration_since(Instant::now()))
+}
+
+/// `last_holder`: the backings outlive the last handle that held them,
+/// which is what a ring with no holder table does.
+pub const SUBETHA_LAST_HOLDER_KEEP: u32 = 0;
+/// `last_holder`: the last handle to release removes every backing the
+/// ring's prefix names, including the holder table itself.
+pub const SUBETHA_LAST_HOLDER_UNLINK: u32 = 1;
+
+/// Where an object's backings live, which decides how the wakers the ABI
+/// keeps beside it are built.
+pub(crate) enum Locale<'a> {
+    Anon,
+    File(&'a Path),
+    Shm { name: &'a str, namespace: ShmNamespace, create: bool, sddl: Option<&'a str> },
+}
+
+pub(crate) fn waker_capacity(max_waiters: u32) -> usize {
+    if max_waiters == 0 {
+        MAX_WAITERS_DEFAULT
+    } else {
+        max_waiters as usize
+    }
+}
+
+/// The notifier set an object keeps beside its backings: in this process
+/// for an anonymous object, the record `<prefix>.notify.bin` beside a
+/// file, the region `{name}_notify` in shared memory.
+pub(crate) fn notifiers_for(locale: &Locale<'_>) -> Result<subetha_cxc::cross_process_notifier::NotifierSet, i32> {
+    use subetha_cxc::cross_process_notifier::NotifierSet;
+    match locale {
+        Locale::Anon => Ok(NotifierSet::anon()),
+        Locale::File(prefix) => NotifierSet::file(prefix).map_err(crate::error::notify_code),
+        Locale::Shm { name, namespace, sddl, .. } => NotifierSet::shm(name, *namespace, *sddl).map_err(crate::error::notify_code),
+    }
+}
+
+/// The consumer waker and the producer waker an object keeps beside its
+/// backings: anonymous, `<prefix>.cwaker.bin` and `.pwaker.bin`, or
+/// `{name}_cwaker` and `_pwaker` in shared memory.
+pub(crate) fn wakers_for(locale: &Locale<'_>, max_waiters: u32) -> Result<(CrossProcessWaker, CrossProcessWaker), i32> {
+    Ok((
+        waker_for(locale, max_waiters, ".cwaker.bin", "_cwaker")?,
+        waker_for(locale, max_waiters, ".pwaker.bin", "_pwaker")?,
+    ))
+}
+
+/// One waker beside an object's backings, named by `file_suffix` in the
+/// file locale and `shm_suffix` in shared memory.
+pub(crate) fn waker_for(
+    locale: &Locale<'_>,
+    max_waiters: u32,
+    file_suffix: &str,
+    shm_suffix: &str,
+) -> Result<CrossProcessWaker, i32> {
+    let capacity = waker_capacity(max_waiters);
+    match locale {
+        Locale::Anon => CrossProcessWaker::create_anon(capacity).map_err(waker_code),
+        Locale::File(prefix) => file_waker(prefix, file_suffix, capacity),
+        Locale::Shm { name, namespace, create, sddl } => {
+            shm_waker(name, shm_suffix, *namespace, capacity, *create, *sddl, false)
+        }
+    }
+}
+
+/// The adaptive ring's two wakers. In shared memory their names are kept
+/// with the ring's, whichever handle drops, until
+/// `subetha_ring_unlink_shm` or the last holder removes them, as a
+/// file-backed ring's waker files are. Every other object's shared-memory
+/// wakers go with the handle that created them.
+fn ring_wakers(locale: &Locale<'_>, max_waiters: u32) -> Result<(CrossProcessWaker, CrossProcessWaker), i32> {
+    let Locale::Shm { name, namespace, create, sddl } = locale else {
+        return wakers_for(locale, max_waiters);
+    };
+    let capacity = waker_capacity(max_waiters);
+    Ok((
+        shm_waker(name, "_cwaker", *namespace, capacity, *create, *sddl, true)?,
+        shm_waker(name, "_pwaker", *namespace, capacity, *create, *sddl, true)?,
+    ))
+}
+
+/// The named shared-memory region an object's backing lives in: created
+/// with `sddl` as its security descriptor by the object's creator, or
+/// opened, which finds the creator's region or fails and never makes one.
+/// A region shorter than `size` is the layout-mismatch code.
+pub(crate) fn shm_region(
+    name: &str,
+    size: usize,
+    namespace: ShmNamespace,
+    sddl: Option<&str>,
+    create: bool,
+) -> Result<ShmFile, i32> {
+    let region = if create {
+        ShmFile::create_named_secured(name, size, namespace, sddl)
+    } else {
+        ShmFile::open_named_secured(name, size, namespace, sddl)
+    };
+    region.map_err(|e| {
+        let code = match Mismatch::carried_by(&e) {
+            Some(_) => SUBETHA_E_RING_LAYOUT_MISMATCH,
+            None => SUBETHA_E_RING_IO,
+        };
+        fail(code, format!("shared-memory region {name}: {e}"))
+    })
+}
+
+fn file_waker(prefix: &Path, suffix: &str, capacity: usize) -> Result<CrossProcessWaker, i32> {
+    let mut p = prefix.as_os_str().to_owned();
+    p.push(suffix);
+    CrossProcessWaker::create(PathBuf::from(p), capacity).map_err(waker_code)
+}
+
+/// A waker in the region `{name}{suffix}`, created or opened. With
+/// `keep_name` a created region's name outlives this handle, for an
+/// object whose names go together rather than with the handle that made
+/// them. A region shorter than the waker needs is the waker-layout code.
+fn shm_waker(
+    name: &str,
+    suffix: &str,
+    namespace: ShmNamespace,
+    capacity: usize,
+    create: bool,
+    sddl: Option<&str>,
+    keep_name: bool,
+) -> Result<CrossProcessWaker, i32> {
+    let region_name = format!("{name}{suffix}");
+    let size = waker_region_size(capacity);
+    let mut region = if create {
+        ShmFile::create_named_secured(&region_name, size, namespace, sddl)
+    } else {
+        ShmFile::open_named_secured(&region_name, size, namespace, sddl)
+    }
+    .map_err(|e| {
+        let code = match Mismatch::carried_by(&e) {
+            Some(_) => SUBETHA_E_RING_WAKER_LAYOUT,
+            None => SUBETHA_E_RING_IO,
+        };
+        fail(code, format!("waker region {region_name}: {e}"))
+    })?;
+    if keep_name {
+        region.keep_name();
+    }
+    if create {
+        CrossProcessWaker::create_from_shm(region, capacity).map_err(waker_code)
+    } else {
+        CrossProcessWaker::open_from_shm(region, capacity).map_err(waker_code)
+    }
+}
+
+/// The stamp kind a `SUBETHA_STAMPS_` constant names; `None` for the
+/// default, which the ring resolves itself.
+pub(crate) fn stamp_kind(stamps: u32) -> Result<Option<StampKind>, i32> {
+    match stamps {
+        SUBETHA_STAMPS_DEFAULT => Ok(None),
+        SUBETHA_STAMPS_TSC => Ok(Some(StampKind::Tsc)),
+        SUBETHA_STAMPS_SHARED_COUNTER => Ok(Some(StampKind::SharedCounter)),
+        SUBETHA_STAMPS_MONOTONIC => Ok(Some(StampKind::Monotonic)),
+        other => Err(fail(SUBETHA_E_INVALID_ARGUMENT, format!("stamps {other} is not a stamp source"))),
+    }
+}
+
+fn stamps_constant(kind: StampKind) -> u32 {
+    match kind {
+        StampKind::Tsc => SUBETHA_STAMPS_TSC,
+        StampKind::SharedCounter => SUBETHA_STAMPS_SHARED_COUNTER,
+        StampKind::Monotonic => SUBETHA_STAMPS_MONOTONIC,
+    }
+}
+
+pub(crate) fn ordering_constant(mode: OrderingMode) -> u32 {
+    match mode {
+        OrderingMode::Unordered => SUBETHA_ORDERING_UNORDERED,
+        OrderingMode::MergeByStamp => SUBETHA_ORDERING_MERGE_BY_STAMP,
+        OrderingMode::MergeStrict => SUBETHA_ORDERING_MERGE_STRICT,
+    }
+}
+
+pub(crate) fn ordering_mode(mode: u32) -> Result<OrderingMode, i32> {
+    match mode {
+        SUBETHA_ORDERING_UNORDERED => Ok(OrderingMode::Unordered),
+        SUBETHA_ORDERING_MERGE_BY_STAMP => Ok(OrderingMode::MergeByStamp),
+        SUBETHA_ORDERING_MERGE_STRICT => Ok(OrderingMode::MergeStrict),
+        other => Err(fail(SUBETHA_E_INVALID_ARGUMENT, format!("ordering mode {other} is not a mode"))),
+    }
+}
+
+/// The contract a `subetha_ring_contract` declares; `None` when every
+/// field is zero.
+fn contract_from(c: &subetha_ring_contract) -> Result<Option<RingContract>, i32> {
+    let ordering = match c.ordering {
+        SUBETHA_CONTRACT_UNORDERED => OrderingContract::Unordered,
+        SUBETHA_CONTRACT_FIFO_PER_PRODUCER => OrderingContract::FifoPerProducer,
+        SUBETHA_CONTRACT_FIFO => OrderingContract::Fifo,
+        SUBETHA_CONTRACT_K_OUT_OF_ORDER => OrderingContract::KOutOfOrder(c.k_out_of_order),
+        other => return Err(fail(SUBETHA_E_INVALID_ARGUMENT, format!("contract ordering {other} is not an ordering"))),
+    };
+    if c.max_producers == 0 && c.max_consumers == 0 && ordering == OrderingContract::Unordered && c.capacity_bound == 0 {
+        return Ok(None);
+    }
+    Ok(Some(RingContract {
+        max_concurrent_push: c.max_producers,
+        max_concurrent_pop: c.max_consumers,
+        ordering,
+        capacity_bound: if c.capacity_bound == 0 { None } else { Some(c.capacity_bound) },
+    }))
+}
+
+/// Apply the stamps, the contract and the frame region geometry the
+/// options ask for to a ring a constructor just built or opened.
+pub(crate) fn shape_ring(ring: AdaptiveRing, options: &subetha_ring_options) -> Result<AdaptiveRing, i32> {
+    let ring = if options.stamps == SUBETHA_STAMPS_NONE {
+        ring
+    } else {
+        match stamp_kind(options.stamps)? {
+            None => ring.with_ordering_stamps().map_err(ring_code)?,
+            Some(kind) => ring.with_ordering_stamps_kind(kind).map_err(ring_code)?,
+        }
+    };
+    let ring = match contract_from(&options.contract)? {
+        Some(contract) => ring.with_contract(contract),
+        None => ring,
+    };
+    Ok(match frame_geometry(options)? {
+        Some((block, blocks)) => ring.with_frames(block, blocks),
+        None => ring,
+    })
+}
+
+/// Take a hold on the ring's backings when the options ask for one.
+///
+/// The two fields are read together because either alone names an
+/// incomplete request: a count with nothing to do at the end, or an end
+/// state with no table to record holders in.
+fn hold_ring(
+    ring: AdaptiveRing,
+    locale: &Locale<'_>,
+    options: &subetha_ring_options,
+) -> Result<AdaptiveRing, i32> {
+    let on_last = match options.last_holder {
+        SUBETHA_LAST_HOLDER_KEEP => LastHolder::Keep,
+        SUBETHA_LAST_HOLDER_UNLINK => LastHolder::Unlink,
+        other => {
+            return Err(fail(
+                SUBETHA_E_INVALID_ARGUMENT,
+                format!("last_holder {other} names no last-holder disposition"),
+            ))
+        }
+    };
+    if options.max_holders == 0 {
+        if on_last == LastHolder::Unlink {
+            return Err(fail(
+                SUBETHA_E_INVALID_ARGUMENT,
+                "unlinking on the last holder needs max_holders; the library names no default",
+            ));
+        }
+        return Ok(ring);
+    }
+    // The wakers and the notifier record are this layer's, kept beside
+    // the ring's backings and invisible to it. Handed over so the last
+    // holder takes the whole prefix rather than the ring's share of it.
+    let also_remove: &[&str] = match locale {
+        Locale::File(_) => &[".cwaker.bin", ".pwaker.bin", ".notify.bin"],
+        Locale::Shm { .. } => &["_cwaker", "_pwaker", "_notify"],
+        Locale::Anon => {
+            return Err(fail(
+                SUBETHA_E_INVALID_ARGUMENT,
+                "max_holders needs a file-backed or shared-memory ring; an anonymous ring has no backings a holder can remove",
+            ))
+        }
+    };
+    ring.with_last_holder(options.max_holders as usize, on_last, also_remove)
+        .map_err(last_holder_code)
+}
+
+impl RingObject {
+    fn build(ring: AdaptiveRing, locale: Locale<'_>, options: subetha_ring_options) -> Result<Self, i32> {
+        let mode = resolve_mode(options.mode)?;
+        let ring = shape_ring(ring, &options)?;
+        let ring = hold_ring(ring, &locale, &options)?;
+        let (consumer_waker, producer_waker) = ring_wakers(&locale, options.max_waiters)?;
+        let notifiers = notifiers_for(&locale)?;
+        let ring = Arc::new(ring);
+        let blocking = Arc::new(BlockingAdaptiveRing::from_parts(Arc::clone(&ring), consumer_waker, producer_waker, notifiers));
+        let sidecar = if mode == SUBETHA_MODE_MANAGED {
+            let scan = if options.scan_interval_us == 0 {
+                SUBETHA_SCAN_INTERVAL_DEFAULT_US
+            } else {
+                options.scan_interval_us
+            };
+            Some(AdaptiveRingSidecar::spawn(
+                Arc::clone(&ring),
+                DefaultRingShapePolicy::default(),
+                Duration::from_micros(scan),
+            ))
+        } else {
+            None
+        };
+        Ok(Self {
+            ring,
+            blocking,
+            sidecar: Claim::new(sidecar),
+            mode,
+            held: Claim::new(HashMap::new()),
+        })
+    }
+
+    /// An anonymous ring for the handle table's own tests.
+    #[cfg(test)]
+    pub(crate) fn anon_for_tests() -> Self {
+        let ring = AdaptiveRing::create_anon(1, 1, 64).expect("an anonymous ring");
+        Self::build(
+            ring,
+            Locale::Anon,
+            subetha_ring_options { mode: crate::runtime::SUBETHA_MODE_STRICT, max_waiters: 0, scan_interval_us: 0, ..Default::default() },
+        )
+        .expect("an anonymous ring object")
+    }
+
+    /// Wake every parked waiter so a destroy can proceed; each returns
+    /// `SUBETHA_E_DESTROYED`.
+    pub(crate) fn interrupt(&self) {
+        self.blocking.close();
+    }
+
+    fn try_push(&self, producer_id: usize, payload: &[u8]) -> i32 {
+        match self.blocking.try_send(producer_id, payload) {
+            Ok(()) => SUBETHA_OK,
+            Err(e) => ring_code(e),
+        }
+    }
+
+    fn try_pop(&self, consumer_id: usize, out: &mut [u8]) -> Result<usize, i32> {
+        self.blocking.try_recv(consumer_id, out).map_err(ring_code)
+    }
+
+    fn pop_wait(&self, consumer_id: usize, out: &mut [u8], deadline: Option<Instant>) -> Result<usize, i32> {
+        self.blocking.recv_blocking(consumer_id, out, remaining(deadline)).map_err(blocking_code)
+    }
+
+    fn push_wait(&self, producer_id: usize, payload: &[u8], deadline: Option<Instant>) -> i32 {
+        match self.blocking.send_blocking(producer_id, payload, remaining(deadline)) {
+            Ok(()) => SUBETHA_OK,
+            Err(e) => blocking_code(e),
+        }
+    }
+
+    fn send_frame(&self, producer_id: usize, payload: &[u8], hint: LayoutHint) -> Result<u32, i32> {
+        self.blocking.send_frame_as(producer_id, payload, hint).map(frame_constant).map_err(ring_code)
+    }
+
+    /// Take the next frame for `consumer_id` into `out`. An item held from
+    /// an earlier call that had no room comes first: a held frame is
+    /// delivered, a held plain item stays held and the call returns
+    /// `SUBETHA_E_NOT_A_FRAME`. A frame larger than `out` is kept for this
+    /// consumer and reported as `SUBETHA_E_BUFFER_TOO_SMALL` with its size
+    /// in `Err`'s companion, so nothing is lost.
+    fn recv_frame(&self, consumer_id: u32, out: &mut [u8]) -> Result<usize, (i32, usize)> {
+        let item = self
+            .held_or(consumer_id, true, |bytes| {
+                self.blocking
+                    .recv_frame(consumer_id as usize, bytes)
+                    .map(|class| item_constant(RingItem::Frame(class)))
+                    .map_err(ring_code)
+            })
+            .map_err(|code| (code, 0))?;
+        self.deliver(consumer_id, item, out)
+    }
+
+    fn recv_frame_wait(&self, consumer_id: u32, out: &mut [u8], deadline: Option<Instant>) -> Result<usize, (i32, usize)> {
+        let item = self
+            .held_or(consumer_id, true, |bytes| {
+                self.blocking
+                    .recv_frame_blocking(consumer_id as usize, bytes, remaining(deadline))
+                    .map(|class| item_constant(RingItem::Frame(class)))
+                    .map_err(blocking_code)
+            })
+            .map_err(|code| (code, 0))?;
+        self.deliver(consumer_id, item, out)
+    }
+
+    /// The next item for `consumer_id`, a plain item or a frame, with its
+    /// kind. An item held from an earlier call that had no room comes first.
+    fn recv_any(&self, consumer_id: u32) -> Result<Held, i32> {
+        self.held_or(consumer_id, false, |bytes| {
+            self.blocking.recv_any(consumer_id as usize, bytes).map(item_constant).map_err(ring_code)
+        })
+    }
+
+    fn recv_any_wait(&self, consumer_id: u32, deadline: Option<Instant>) -> Result<Held, i32> {
+        self.held_or(consumer_id, false, |bytes| {
+            self.blocking
+                .recv_any_blocking(consumer_id as usize, bytes, remaining(deadline))
+                .map(item_constant)
+                .map_err(blocking_code)
+        })
+    }
+
+    /// The item held for `consumer_id`, else the one `take` brings off the
+    /// ring into its bytes, returning its kind. With `frames_only`, a held
+    /// plain item stays held and the call returns `SUBETHA_E_NOT_A_FRAME`.
+    /// `take` runs with the held map released, so a wait in it holds up no
+    /// other consumer.
+    fn held_or(
+        &self,
+        consumer_id: u32,
+        frames_only: bool,
+        take: impl FnOnce(&mut Vec<u8>) -> Result<u32, i32>,
+    ) -> Result<Held, i32> {
+        let mut held = self.held.claim();
+        if let Some(item) = held.remove(&consumer_id) {
+            if frames_only && item.kind == SUBETHA_RING_ITEM_PLAIN {
+                held.insert(consumer_id, item);
+                return Err(fail(
+                    SUBETHA_E_NOT_A_FRAME,
+                    format!("consumer {consumer_id} holds a plain item from a call that had no room; subetha_ring_recv_any takes it"),
+                ));
+            }
+            return Ok(item);
+        }
+        drop(held);
+        let mut bytes = Vec::new();
+        let kind = take(&mut bytes)?;
+        Ok(Held { kind, bytes })
+    }
+
+    /// Copy `item` into `out`, or keep it for `consumer_id` when `out` has
+    /// no room for it.
+    fn deliver(&self, consumer_id: u32, item: Held, out: &mut [u8]) -> Result<usize, (i32, usize)> {
+        let needed = item.bytes.len();
+        if needed > out.len() {
+            let what = if item.kind == SUBETHA_RING_ITEM_PLAIN { "plain item" } else { "frame" };
+            self.held.claim().insert(consumer_id, item);
+            return Err((
+                fail(
+                    SUBETHA_E_BUFFER_TOO_SMALL,
+                    format!("the {what} is {needed} bytes; it is held for consumer {consumer_id} until a call with room"),
+                ),
+                needed,
+            ));
+        }
+        out[..needed].copy_from_slice(&item.bytes);
+        Ok(needed)
+    }
+
+    fn send_frame_wait(&self, producer_id: usize, payload: &[u8], hint: LayoutHint, deadline: Option<Instant>) -> Result<u32, i32> {
+        self.blocking
+            .send_frame_blocking(producer_id, payload, hint, remaining(deadline))
+            .map(frame_constant)
+            .map_err(blocking_code)
+    }
+
+    fn stats(&self) -> subetha_ring_stats {
+        let shape = match self.ring.current_shape() {
+            RingShape::Spsc => SUBETHA_RING_SHAPE_SPSC,
+            RingShape::Mpsc => SUBETHA_RING_SHAPE_MPSC,
+            RingShape::Mpmc => SUBETHA_RING_SHAPE_MPMC,
+            RingShape::Vyukov => SUBETHA_RING_SHAPE_VYUKOV,
+        };
+        let sidecar_morphs = self.sidecar.claim().as_ref().map_or(0, |s| s.morphs_triggered());
+        let stamps = self
+            .ring
+            .ordering_region()
+            .map_or(SUBETHA_STAMPS_NONE, |region| stamps_constant(region.stamp_kind()));
+        let ordering_mode = self
+            .ring
+            .ordering_mode()
+            .map_or(SUBETHA_ORDERING_UNORDERED, ordering_constant);
+        subetha_ring_stats {
+            shape,
+            mode: self.mode,
+            active_producers: self.ring.active_producers() as u32,
+            active_consumers: self.ring.active_consumers() as u32,
+            max_producers: self.ring.max_producers() as u32,
+            max_consumers: self.ring.max_consumers() as u32,
+            capacity: self.ring.sub_ring_capacity() as u64,
+            approx_len: self.ring.approx_len() as u64,
+            morph_refusals: self.ring.morph_refusals(),
+            mode_refusals: self.ring.mode_refusals(),
+            waker_full: self.blocking.waiters_full(),
+            sidecar_morphs,
+            inversions: self.ring.inversions(),
+            stamps,
+            ordering_mode,
+        }
+    }
+
+    fn try_pop_stamped(&self, consumer_id: usize, out: &mut [u8]) -> Result<(usize, u64), i32> {
+        self.blocking.try_recv_with_stamp(consumer_id, out).map_err(ring_code)
+    }
+
+    fn pop_wait_stamped(&self, consumer_id: usize, out: &mut [u8], deadline: Option<Instant>) -> Result<(usize, u64), i32> {
+        self.blocking
+            .recv_blocking_with_stamp(consumer_id, out, remaining(deadline))
+            .map_err(blocking_code)
+    }
+}
+
+/// The `SUBETHA_FRAME_` constant naming where a frame's bytes went.
+fn frame_constant(class: FrameClass) -> u32 {
+    match class {
+        FrameClass::Inline => SUBETHA_FRAME_INLINE,
+        FrameClass::Offset => SUBETHA_FRAME_OFFSET,
+    }
+}
+
+fn item_constant(item: RingItem) -> u32 {
+    match item {
+        RingItem::Plain => SUBETHA_RING_ITEM_PLAIN,
+        RingItem::Frame(FrameClass::Inline) => SUBETHA_RING_ITEM_FRAME_INLINE,
+        RingItem::Frame(FrameClass::Offset) => SUBETHA_RING_ITEM_FRAME_OFFSET,
+    }
+}
+
+impl Drop for RingObject {
+    fn drop(&mut self) {
+        // The sidecar's own Drop joins its thread and reports a panic on
+        // stderr; taking it here makes that order explicit before the ring
+        // it scans goes away.
+        drop(self.sidecar.claim().take());
+    }
+}
+
+/// Read a NUL-terminated UTF-8 argument. An argument named `dir` or
+/// ending in `path` is recorded, so the call's failure names it.
+///
+/// # Safety
+/// `s` is null or a NUL-terminated string.
+pub(crate) unsafe fn text<'a>(s: *const c_char, what: &str) -> Result<&'a str, i32> {
+    if s.is_null() {
+        return Err(fail(SUBETHA_E_INVALID_ARGUMENT, format!("{what} is null")));
+    }
+    // SAFETY: the caller guarantees a NUL-terminated string.
+    let c = unsafe { CStr::from_ptr(s) };
+    let s = c.to_str().map_err(|e| fail(SUBETHA_E_INVALID_UTF8, format!("{what} is not UTF-8: {e}")))?;
+    if what == "dir" || what.ends_with("path") {
+        crate::error::opened(s);
+    }
+    Ok(s)
+}
+
+/// A ring capacity: a power of two of at least 2.
+pub(crate) fn checked_capacity(capacity: u32) -> Result<usize, i32> {
+    if capacity < 2 || !capacity.is_power_of_two() {
+        return Err(fail(SUBETHA_E_INVALID_ARGUMENT, format!("capacity {capacity} is not a power of two of at least 2")));
+    }
+    Ok(capacity as usize)
+}
+
+fn counts(max_producers: u32, max_consumers: u32, capacity: u32) -> Result<(usize, usize, usize), i32> {
+    if max_producers == 0 || max_consumers == 0 {
+        return Err(fail(SUBETHA_E_INVALID_ARGUMENT, "max_producers and max_consumers must be at least 1"));
+    }
+    Ok((max_producers as usize, max_consumers as usize, checked_capacity(capacity)?))
+}
+
+/// The byte slice a `data, len` pair names; `len` zero with a null `data`
+/// is the empty slice.
+///
+/// # Safety
+/// `data` is null or points to `len` readable bytes.
+pub(crate) unsafe fn bytes<'a>(data: *const u8, len: usize) -> Result<&'a [u8], i32> {
+    if data.is_null() {
+        if len != 0 {
+            return Err(fail(SUBETHA_E_INVALID_ARGUMENT, "data is null with a non-zero len"));
+        }
+        return Ok(&[]);
+    }
+    // SAFETY: the caller guarantees `len` readable bytes at `data`.
+    Ok(unsafe { std::slice::from_raw_parts(data, len) })
+}
+
+/// The writable slice an `out, cap` pair names, which must hold at least
+/// `at_least` bytes; `out_len` must not be null.
+///
+/// # Safety
+/// `out` is null or points to `cap` writable bytes.
+pub(crate) unsafe fn out_buffer<'a>(out: *mut u8, cap: usize, out_len: *mut usize, at_least: usize) -> Result<&'a mut [u8], i32> {
+    if out.is_null() || out_len.is_null() {
+        return Err(fail(SUBETHA_E_INVALID_ARGUMENT, "out or out_len is null"));
+    }
+    if cap < at_least {
+        return Err(fail(SUBETHA_E_BUFFER_TOO_SMALL, format!("{at_least} bytes needed, {cap} given")));
+    }
+    // SAFETY: the caller guarantees `cap` writable bytes at `out`.
+    Ok(unsafe { std::slice::from_raw_parts_mut(out, cap) })
+}
+
+/// Copy `source` into an `out, cap` pair, reporting the byte count through
+/// `len` whether or not it fitted. A caller who passes a null buffer, or one
+/// too small, is told the size it needs and nothing is copied.
+///
+/// Distinct from [`out_buffer`]: that one refuses before naming a size, which
+/// suits a caller holding a buffer it sized from the item. This one suits a
+/// caller who cannot know the size until the call produces it, and so asks
+/// twice.
+///
+/// # Safety
+/// `out` is null or points to `cap` writable bytes; `len` is null or a valid
+/// pointer.
+pub(crate) unsafe fn copy_out(
+    source: &[u8],
+    out: *mut u8,
+    cap: usize,
+    len: *mut usize,
+) -> Result<(), i32> {
+    if len.is_null() {
+        return Err(fail(SUBETHA_E_INVALID_ARGUMENT, "a length pointer is null"));
+    }
+    // Checked non-null; the caller guarantees it is writable.
+    unsafe { *len = source.len() };
+    if out.is_null() || cap < source.len() {
+        return Err(SUBETHA_E_BUFFER_TOO_SMALL);
+    }
+    // The caller guarantees `cap` writable bytes, and cap >= len here.
+    unsafe { std::ptr::copy_nonoverlapping(source.as_ptr(), out, source.len()) };
+    Ok(())
+}
+
+/// Write what an unlink found into the caller's report and turn a refusal
+/// into `SUBETHA_E_RING_IO` naming the first one.
+///
+/// # Safety
+/// `report` is null or a valid pointer.
+pub(crate) unsafe fn finish_unlink(found: UnlinkReport, report: *mut subetha_unlink_report) -> i32 {
+    if !report.is_null() {
+        // SAFETY: checked non-null; the caller guarantees it is writable.
+        unsafe {
+            *report = subetha_unlink_report {
+                removed: found.removed as u64,
+                missing: found.missing as u64,
+                failed: found.failed as u64,
+            }
+        };
+    }
+    if found.failed > 0 {
+        let first = found
+            .first_failure
+            .as_ref()
+            .map(|(p, k, t)| format!("{}: {k:?}: {t}", p.display()))
+            .unwrap_or_else(|| "a removal was refused".to_owned());
+        return fail(SUBETHA_E_RING_IO, format!("{} removal(s) refused; first: {first}", found.failed));
+    }
+    SUBETHA_OK
+}
+
+/// `<base><suffix>` as a path.
+pub(crate) fn with_suffix(base: &Path, suffix: &str) -> PathBuf {
+    let mut p = base.as_os_str().to_owned();
+    p.push(suffix);
+    PathBuf::from(p)
+}
+
+/// The shared-memory namespace a `SUBETHA_SHM_` constant names, with the
+/// container's SID read from `options` for `SUBETHA_SHM_APPCONTAINER`.
+///
+/// # Safety
+/// `options.shm_container_sid` is null or a NUL-terminated UTF-8 string.
+pub(crate) unsafe fn namespace(ns: u32, options: &subetha_ring_options) -> Result<ShmNamespace, i32> {
+    match ns {
+        SUBETHA_SHM_SESSION => Ok(ShmNamespace::Session),
+        SUBETHA_SHM_MACHINE => Ok(ShmNamespace::Machine),
+        SUBETHA_SHM_APPCONTAINER => {
+            if options.shm_container_sid.is_null() {
+                return Err(fail(SUBETHA_E_INVALID_ARGUMENT, "SUBETHA_SHM_APPCONTAINER needs shm_container_sid"));
+            }
+            let sid = unsafe { text(options.shm_container_sid, "shm_container_sid") }?;
+            sid.parse::<ContainerSid>()
+                .map(ShmNamespace::AppContainer)
+                .map_err(|e| fail(SUBETHA_E_INVALID_ARGUMENT, format!("shm_container_sid: {e}")))
+        }
+        other => Err(fail(SUBETHA_E_INVALID_ARGUMENT, format!("namespace {other} is not a namespace"))),
+    }
+}
+
+/// Whether `ns` is one of the `SUBETHA_SHM_` constants, for a call that
+/// needs no more than that: an unlink by name, where Windows releases the
+/// name with the last handle and Unix names a region the same in every
+/// namespace.
+pub(crate) fn namespace_known(ns: u32) -> Result<(), i32> {
+    match ns {
+        SUBETHA_SHM_SESSION | SUBETHA_SHM_MACHINE | SUBETHA_SHM_APPCONTAINER => Ok(()),
+        other => Err(fail(SUBETHA_E_INVALID_ARGUMENT, format!("namespace {other} is not a namespace"))),
+    }
+}
+
+/// The options a constructor was handed, once `options` and `out` are
+/// known to be non-null.
+///
+/// # Safety
+/// `options` and `out` are null or valid pointers.
+pub(crate) unsafe fn read_options(options: *const subetha_ring_options, out: *mut subetha_handle) -> Result<subetha_ring_options, i32> {
+    if options.is_null() {
+        return Err(fail(SUBETHA_E_INVALID_ARGUMENT, "options is null"));
+    }
+    if out.is_null() {
+        return Err(fail(SUBETHA_E_INVALID_ARGUMENT, "out is null"));
+    }
+    // SAFETY: checked non-null; the caller guarantees it points at options.
+    Ok(unsafe { *options })
+}
+
+/// The deadline a `timeout_ms` names: none for `SUBETHA_WAIT_FOREVER`.
+pub(crate) fn deadline_from(timeout_ms: i64) -> Result<Option<Instant>, i32> {
+    if timeout_ms == SUBETHA_WAIT_FOREVER {
+        Ok(None)
+    } else if timeout_ms < 0 {
+        Err(fail(SUBETHA_E_INVALID_ARGUMENT, format!("timeout_ms {timeout_ms} is negative and not SUBETHA_WAIT_FOREVER")))
+    } else {
+        Ok(Some(Instant::now() + Duration::from_millis(timeout_ms as u64)))
+    }
+}
+
+/// Create a ring in anonymous memory, reachable from this process only.
+/// `capacity` is slots per backing and must be a power of two of at least 2.
+///
+/// # Safety
+/// `options` and `out` are valid pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn subetha_ring_create_anon(
+    max_producers: u32,
+    max_consumers: u32,
+    capacity: u32,
+    options: *const subetha_ring_options,
+    out: *mut subetha_handle,
+) -> i32 {
+    entry(|| {
+        if let Err(code) = require_initialized() {
+            return code;
+        }
+        let options = match unsafe { read_options(options, out) } {
+            Ok(o) => o,
+            Err(code) => return code,
+        };
+        let (mp, mc, cap) = match counts(max_producers, max_consumers, capacity) {
+            Ok(c) => c,
+            Err(code) => return code,
+        };
+        let ring = match AdaptiveRing::create_anon(mp, mc, cap) {
+            Ok(r) => r,
+            Err(e) => return ring_code(e),
+        };
+        match RingObject::build(ring, Locale::Anon, options) {
+            Ok(object) => unsafe { issue(Object::Ring(object), out) },
+            Err(code) => code,
+        }
+    })
+}
+
+/// Create a file-backed ring under `path_prefix`, or attach to one that
+/// exists there with the same sizing. The backings are named
+/// `<path_prefix>.spsc.bin`, `.mpsc.<i>.bin`, `.mpmc.<i>.bin`,
+/// `.vyukov.bin`, `.peers.bin`, plus `.cwaker.bin` and `.pwaker.bin` for
+/// the waiters; a frame region and an ordering region may appear beside
+/// them later.
+///
+/// # Safety
+/// `path_prefix` is a NUL-terminated UTF-8 string; `options` and `out` are
+/// valid pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn subetha_ring_create(
+    path_prefix: *const c_char,
+    max_producers: u32,
+    max_consumers: u32,
+    capacity: u32,
+    options: *const subetha_ring_options,
+    out: *mut subetha_handle,
+) -> i32 {
+    entry(|| {
+        if let Err(code) = require_initialized() {
+            return code;
+        }
+        let options = match unsafe { read_options(options, out) } {
+            Ok(o) => o,
+            Err(code) => return code,
+        };
+        let prefix = match unsafe { text(path_prefix, "path_prefix") } {
+            Ok(p) => Path::new(p),
+            Err(code) => return code,
+        };
+        let (mp, mc, cap) = match counts(max_producers, max_consumers, capacity) {
+            Ok(c) => c,
+            Err(code) => return code,
+        };
+        let ring = match AdaptiveRing::create(prefix, mp, mc, cap) {
+            Ok(r) => r,
+            Err(e) => return ring_code(e),
+        };
+        match RingObject::build(ring, Locale::File(prefix), options) {
+            Ok(object) => unsafe { issue(Object::Ring(object), out) },
+            Err(code) => code,
+        }
+    })
+}
+
+/// Attach to a file-backed ring another process created under
+/// `path_prefix`. Fails with `SUBETHA_E_RING_LAYOUT_MISMATCH` when a backing
+/// is absent or was created with another capacity.
+///
+/// # Safety
+/// `path_prefix` is a NUL-terminated UTF-8 string; `options` and `out` are
+/// valid pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn subetha_ring_open(
+    path_prefix: *const c_char,
+    max_producers: u32,
+    max_consumers: u32,
+    expected_capacity: u32,
+    options: *const subetha_ring_options,
+    out: *mut subetha_handle,
+) -> i32 {
+    entry(|| {
+        if let Err(code) = require_initialized() {
+            return code;
+        }
+        let options = match unsafe { read_options(options, out) } {
+            Ok(o) => o,
+            Err(code) => return code,
+        };
+        let prefix = match unsafe { text(path_prefix, "path_prefix") } {
+            Ok(p) => Path::new(p),
+            Err(code) => return code,
+        };
+        let (mp, mc, cap) = match counts(max_producers, max_consumers, expected_capacity) {
+            Ok(c) => c,
+            Err(code) => return code,
+        };
+        let ring = match AdaptiveRing::open(prefix, mp, mc, cap) {
+            Ok(r) => r,
+            Err(e) => return ring_code(e),
+        };
+        match RingObject::build(ring, Locale::File(prefix), options) {
+            Ok(object) => unsafe { issue(Object::Ring(object), out) },
+            Err(code) => code,
+        }
+    })
+}
+
+/// Create a ring in named shared memory under `name`, in the namespace
+/// `SUBETHA_SHM_SESSION`, `SUBETHA_SHM_MACHINE` or
+/// `SUBETHA_SHM_APPCONTAINER` with `shm_container_sid`. The regions are named
+/// `{name}_spsc`, `{name}_mpsc_<i>`, `{name}_mpmc_<i>`, `{name}_vyukov`,
+/// `{name}_peers`, plus `{name}_cwaker`, `{name}_pwaker` and the notifier
+/// record `{name}_notify`.
+///
+/// The names outlive every handle, as a file-backed ring's files do,
+/// including the ones made later by whichever handle needed them: a
+/// per-producer backing a peer grew, the payload region of the first
+/// oversized frame. `subetha_ring_unlink_shm` removes them, as does the
+/// last holder of a ring created with `max_holders`. On Windows a name goes
+/// with the last handle to its region whatever the ring does.
+///
+/// # Safety
+/// `name` is a NUL-terminated UTF-8 string; `options` and `out` are valid
+/// pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn subetha_ring_create_shm(
+    name: *const c_char,
+    max_producers: u32,
+    max_consumers: u32,
+    capacity: u32,
+    shm_namespace: u32,
+    options: *const subetha_ring_options,
+    out: *mut subetha_handle,
+) -> i32 {
+    entry(|| {
+        if let Err(code) = require_initialized() {
+            return code;
+        }
+        let options = match unsafe { read_options(options, out) } {
+            Ok(o) => o,
+            Err(code) => return code,
+        };
+        let name = match unsafe { text(name, "name") } {
+            Ok(n) => n,
+            Err(code) => return code,
+        };
+        let ns = match unsafe { namespace(shm_namespace, &options) } {
+            Ok(ns) => ns,
+            Err(code) => return code,
+        };
+        let (mp, mc, cap) = match counts(max_producers, max_consumers, capacity) {
+            Ok(c) => c,
+            Err(code) => return code,
+        };
+        let sddl = match unsafe { sddl_of(&options) } {
+            Ok(s) => s,
+            Err(code) => return code,
+        };
+        let ring = match AdaptiveRing::create_shmfs_secured(name, mp, mc, cap, ns, sddl) {
+            Ok(r) => r,
+            Err(e) => return ring_code(e),
+        };
+        match RingObject::build(ring, Locale::Shm { name, namespace: ns, create: true, sddl }, options) {
+            Ok(object) => unsafe { issue(Object::Ring(object), out) },
+            Err(code) => code,
+        }
+    })
+}
+
+/// Attach to a ring another process created in named shared memory. The
+/// attach makes nothing: a ring that is not there, including one created
+/// under another namespace, fails with `SUBETHA_E_RING_IO`, and one created
+/// with another capacity with `SUBETHA_E_LAYOUT_MISMATCH`.
+///
+/// # Safety
+/// `name` is a NUL-terminated UTF-8 string; `options` and `out` are valid
+/// pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn subetha_ring_open_shm(
+    name: *const c_char,
+    max_producers: u32,
+    max_consumers: u32,
+    expected_capacity: u32,
+    shm_namespace: u32,
+    options: *const subetha_ring_options,
+    out: *mut subetha_handle,
+) -> i32 {
+    entry(|| {
+        if let Err(code) = require_initialized() {
+            return code;
+        }
+        let options = match unsafe { read_options(options, out) } {
+            Ok(o) => o,
+            Err(code) => return code,
+        };
+        let name = match unsafe { text(name, "name") } {
+            Ok(n) => n,
+            Err(code) => return code,
+        };
+        let ns = match unsafe { namespace(shm_namespace, &options) } {
+            Ok(ns) => ns,
+            Err(code) => return code,
+        };
+        let (mp, mc, cap) = match counts(max_producers, max_consumers, expected_capacity) {
+            Ok(c) => c,
+            Err(code) => return code,
+        };
+        let sddl = match unsafe { sddl_of(&options) } {
+            Ok(s) => s,
+            Err(code) => return code,
+        };
+        let ring = match AdaptiveRing::open_shmfs_secured(name, mp, mc, cap, ns, sddl) {
+            Ok(r) => r,
+            Err(e) => return ring_code(e),
+        };
+        match RingObject::build(ring, Locale::Shm { name, namespace: ns, create: false, sddl }, options) {
+            Ok(object) => unsafe { issue(Object::Ring(object), out) },
+            Err(code) => code,
+        }
+    })
+}
+
+/// Register as a producer and receive the id every push takes. Past the
+/// creation hint the ring grows a backing for the new producer.
+///
+/// # Safety
+/// `out` is a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn subetha_ring_register_producer(handle: subetha_handle, out: *mut u32) -> i32 {
+    with_ring(handle, |r| {
+        if out.is_null() {
+            return fail(SUBETHA_E_INVALID_ARGUMENT, "out is null");
+        }
+        match r.ring.register_producer() {
+            Ok(id) => {
+                // SAFETY: checked non-null; the caller guarantees it is writable.
+                unsafe { *out = id as u32 };
+                SUBETHA_OK
+            }
+            Err(e) => adaptive_code(e),
+        }
+    })
+}
+
+/// Register as a consumer and receive the id every pop takes.
+///
+/// # Safety
+/// `out` is a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn subetha_ring_register_consumer(handle: subetha_handle, out: *mut u32) -> i32 {
+    with_ring(handle, |r| {
+        if out.is_null() {
+            return fail(SUBETHA_E_INVALID_ARGUMENT, "out is null");
+        }
+        match r.ring.register_consumer() {
+            Ok(id) => {
+                // SAFETY: checked non-null; the caller guarantees it is writable.
+                unsafe { *out = id as u32 };
+                SUBETHA_OK
+            }
+            Err(e) => adaptive_code(e),
+        }
+    })
+}
+
+/// Give a producer id back. The ring re-morphs to the live peer counts.
+/// An id no ring can issue is `SUBETHA_E_INVALID_ARGUMENT`.
+#[unsafe(no_mangle)]
+pub extern "C" fn subetha_ring_unregister_producer(handle: subetha_handle, producer_id: u32) -> i32 {
+    with_ring(handle, |r| {
+        if producer_id as usize >= PRODUCER_SLOT_CEILING {
+            return fail(SUBETHA_E_INVALID_ARGUMENT, format!("producer {producer_id} is out of range"));
+        }
+        r.ring.unregister_producer(producer_id as usize);
+        SUBETHA_OK
+    })
+}
+
+/// Give a consumer id back. The ring re-morphs to the live peer counts,
+/// and the rings the consumer owned pass to the consumers that remain,
+/// which wake if they are waiting. An id no ring can issue is
+/// `SUBETHA_E_INVALID_ARGUMENT`.
+#[unsafe(no_mangle)]
+pub extern "C" fn subetha_ring_unregister_consumer(handle: subetha_handle, consumer_id: u32) -> i32 {
+    with_ring(handle, |r| {
+        if consumer_id as usize >= CONSUMER_SLOT_CEILING {
+            return fail(SUBETHA_E_INVALID_ARGUMENT, format!("consumer {consumer_id} is out of range"));
+        }
+        r.ring.unregister_consumer(consumer_id as usize);
+        SUBETHA_OK
+    })
+}
+
+/// Push `len` bytes from `data` without waiting. `SUBETHA_E_RING_FULL` when
+/// there is no room; `SUBETHA_E_RING_PAYLOAD_TOO_LARGE` above
+/// `SUBETHA_RING_PLAIN_ITEM_BYTES`, or above `SUBETHA_RING_PAYLOAD_MAX` in
+/// the Vyukov shape or on a ring built with stamps.
+///
+/// # Safety
+/// `data` points to `len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn subetha_ring_try_push(
+    handle: subetha_handle,
+    producer_id: u32,
+    data: *const u8,
+    len: usize,
+) -> i32 {
+    with_ring(handle, |r| {
+        if data.is_null() && len != 0 {
+            return fail(SUBETHA_E_INVALID_ARGUMENT, "data is null with a non-zero len");
+        }
+        if len > SUBETHA_RING_PLAIN_ITEM_BYTES {
+            return fail(
+                SUBETHA_E_RING_PAYLOAD_TOO_LARGE,
+                format!("{len} bytes exceed the {SUBETHA_RING_PLAIN_ITEM_BYTES}-byte plain item"),
+            );
+        }
+        // SAFETY: the caller guarantees `len` readable bytes at `data`.
+        let payload: &[u8] = if len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(data, len) } };
+        r.try_push(producer_id as usize, payload)
+    })
+}
+
+/// Pop one item into `out` without waiting. The ring carries fixed slots:
+/// a push zero-fills the slot past its payload and a pop yields the whole
+/// slot, so `out_len` is the slot's size and the payload's own length does
+/// not survive the round trip; a caller that needs it carries it inside
+/// the payload. `cap` must be at least `SUBETHA_RING_SLOT_BYTES`.
+/// `SUBETHA_E_RING_EMPTY` when there is nothing to take.
+///
+/// # Safety
+/// `out` points to `cap` writable bytes; `out_len` is a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn subetha_ring_try_pop(
+    handle: subetha_handle,
+    consumer_id: u32,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    with_ring(handle, |r| {
+        if out.is_null() || out_len.is_null() {
+            return fail(SUBETHA_E_INVALID_ARGUMENT, "out or out_len is null");
+        }
+        if cap < SUBETHA_RING_SLOT_BYTES {
+            return fail(SUBETHA_E_BUFFER_TOO_SMALL, format!("{SUBETHA_RING_SLOT_BYTES} bytes needed, {cap} given"));
+        }
+        // SAFETY: the caller guarantees `cap` writable bytes at `out`.
+        let buf = unsafe { std::slice::from_raw_parts_mut(out, cap) };
+        match r.try_pop(consumer_id as usize, buf) {
+            Ok(n) => {
+                // SAFETY: checked non-null; the caller guarantees it is writable.
+                unsafe { *out_len = n };
+                SUBETHA_OK
+            }
+            Err(code) => code,
+        }
+    })
+}
+
+/// Push `count` payloads of `len` bytes each, the first at `items` and
+/// each next one `stride` bytes on, under one handle lookup and one panic
+/// guard. `out_done` receives how many landed: a full ring stops the run
+/// early, and the caller comes back with the rest. The code is
+/// `SUBETHA_OK` when at least one landed, and the refusal's own when the
+/// first push was the one that failed.
+///
+/// # Safety
+/// `items` addresses `count * stride` readable bytes; `out_done` is a
+/// valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn subetha_ring_try_push_many(
+    handle: subetha_handle,
+    producer_id: u32,
+    items: *const u8,
+    stride: usize,
+    len: usize,
+    count: usize,
+    out_done: *mut usize,
+) -> i32 {
+    with_ring(handle, |r| {
+        if len > SUBETHA_RING_PLAIN_ITEM_BYTES {
+            return fail(
+                SUBETHA_E_RING_PAYLOAD_TOO_LARGE,
+                format!("{len} bytes exceed the {SUBETHA_RING_PLAIN_ITEM_BYTES}-byte plain item"),
+            );
+        }
+        // SAFETY: the caller guarantees the array and the count word.
+        unsafe { run_push_many(items, stride, len, count, out_done, |payload| r.try_push(producer_id as usize, payload)) }
+    })
+}
+
+/// Pop up to `count` slots, the first written at `out` and each next one
+/// `stride` bytes on, under one handle lookup and one panic guard;
+/// `stride` is at least `SUBETHA_RING_SLOT_BYTES`. `out_done` receives how
+/// many were taken: an empty ring stops the run early. The code is
+/// `SUBETHA_OK` when at least one was taken, and `SUBETHA_E_RING_EMPTY`
+/// when none was.
+///
+/// # Safety
+/// `out` addresses `count * stride` writable bytes; `out_done` is a valid
+/// pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn subetha_ring_try_pop_many(
+    handle: subetha_handle,
+    consumer_id: u32,
+    out: *mut u8,
+    stride: usize,
+    count: usize,
+    out_done: *mut usize,
+) -> i32 {
+    with_ring(handle, |r| {
+        // SAFETY: the caller guarantees the array and the count word.
+        unsafe {
+            run_pop_many(out, stride, SUBETHA_RING_SLOT_BYTES, count, out_done, |buf| {
+                match r.try_pop(consumer_id as usize, buf) {
+                    Ok(_) => SUBETHA_OK,
+                    Err(code) => code,
+                }
+            })
+        }
+    })
+}
+
+/// Push, parking until there is room or `timeout_ms` elapses
+/// (`SUBETHA_E_TIMEOUT`). `SUBETHA_WAIT_FOREVER` waits without a deadline.
+/// `SUBETHA_E_RING_WAKER_FULL` means every waiter slot was in use and
+/// nothing was pushed; `SUBETHA_E_DESTROYED` means the ring was destroyed
+/// while this call waited.
+///
+/// # Safety
+/// `data` points to `len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn subetha_ring_push_wait(
+    handle: subetha_handle,
+    producer_id: u32,
+    data: *const u8,
+    len: usize,
+    timeout_ms: i64,
+) -> i32 {
+    with_ring(handle, |r| {
+        if data.is_null() && len != 0 {
+            return fail(SUBETHA_E_INVALID_ARGUMENT, "data is null with a non-zero len");
+        }
+        if len > SUBETHA_RING_PLAIN_ITEM_BYTES {
+            return fail(
+                SUBETHA_E_RING_PAYLOAD_TOO_LARGE,
+                format!("{len} bytes exceed the {SUBETHA_RING_PLAIN_ITEM_BYTES}-byte plain item"),
+            );
+        }
+        let deadline = match deadline_from(timeout_ms) {
+            Ok(d) => d,
+            Err(code) => return code,
+        };
+        // SAFETY: the caller guarantees `len` readable bytes at `data`.
+        let payload: &[u8] = if len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(data, len) } };
+        r.push_wait(producer_id as usize, payload, deadline)
+    })
+}
+
+/// Pop, parking until an item arrives or `timeout_ms` elapses
+/// (`SUBETHA_E_TIMEOUT`); the slot semantics are `subetha_ring_try_pop`'s.
+/// `SUBETHA_WAIT_FOREVER` waits without a deadline.
+/// `SUBETHA_E_RING_WAKER_FULL` means every waiter slot was in use and
+/// nothing was taken; `SUBETHA_E_DESTROYED` means the ring was destroyed
+/// while this call waited.
+///
+/// # Safety
+/// `out` points to `cap` writable bytes; `out_len` is a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn subetha_ring_pop_wait(
+    handle: subetha_handle,
+    consumer_id: u32,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+    timeout_ms: i64,
+) -> i32 {
+    with_ring(handle, |r| {
+        if out.is_null() || out_len.is_null() {
+            return fail(SUBETHA_E_INVALID_ARGUMENT, "out or out_len is null");
+        }
+        if cap < SUBETHA_RING_SLOT_BYTES {
+            return fail(SUBETHA_E_BUFFER_TOO_SMALL, format!("{SUBETHA_RING_SLOT_BYTES} bytes needed, {cap} given"));
+        }
+        let deadline = match deadline_from(timeout_ms) {
+            Ok(d) => d,
+            Err(code) => return code,
+        };
+        // SAFETY: the caller guarantees `cap` writable bytes at `out`.
+        let buf = unsafe { std::slice::from_raw_parts_mut(out, cap) };
+        match r.pop_wait(consumer_id as usize, buf, deadline) {
+            Ok(n) => {
+                // SAFETY: checked non-null; the caller guarantees it is writable.
+                unsafe { *out_len = n };
+                SUBETHA_OK
+            }
+            Err(code) => code,
+        }
+    })
+}
+
+/// Pop on a stamped ring, also yielding the item's stamp into `out_stamp`,
+/// so a consumer can check the order it paid for instead of trusting it.
+/// Otherwise `subetha_ring_try_pop`. `SUBETHA_E_RING_NOT_STAMPED` on a ring
+/// built without stamps; under a merge mode `SUBETHA_E_RING_NOT_DRAINER`
+/// while another consumer holds the drainer lease.
+///
+/// # Safety
+/// `out` points to `cap` writable bytes; `out_len` and `out_stamp` are
+/// valid pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn subetha_ring_try_pop_stamped(
+    handle: subetha_handle,
+    consumer_id: u32,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+    out_stamp: *mut u64,
+) -> i32 {
+    with_ring(handle, |r| {
+        if out_stamp.is_null() {
+            return fail(SUBETHA_E_INVALID_ARGUMENT, "out_stamp is null");
+        }
+        let buf = match unsafe { out_buffer(out, cap, out_len, SUBETHA_RING_SLOT_BYTES) } {
+            Ok(b) => b,
+            Err(code) => return code,
+        };
+        match r.try_pop_stamped(consumer_id as usize, buf) {
+            Ok((n, stamp)) => {
+                // SAFETY: checked non-null; the caller guarantees they are writable.
+                unsafe {
+                    *out_len = n;
+                    *out_stamp = stamp;
+                }
+                SUBETHA_OK
+            }
+            Err(code) => code,
+        }
+    })
+}
+
+/// `subetha_ring_try_pop_stamped`, parking until an item arrives or
+/// `timeout_ms` elapses; the waiting contract is `subetha_ring_pop_wait`'s.
+///
+/// # Safety
+/// `out` points to `cap` writable bytes; `out_len` and `out_stamp` are
+/// valid pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn subetha_ring_pop_wait_stamped(
+    handle: subetha_handle,
+    consumer_id: u32,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+    out_stamp: *mut u64,
+    timeout_ms: i64,
+) -> i32 {
+    with_ring(handle, |r| {
+        if out_stamp.is_null() {
+            return fail(SUBETHA_E_INVALID_ARGUMENT, "out_stamp is null");
+        }
+        let buf = match unsafe { out_buffer(out, cap, out_len, SUBETHA_RING_SLOT_BYTES) } {
+            Ok(b) => b,
+            Err(code) => return code,
+        };
+        let deadline = match deadline_from(timeout_ms) {
+            Ok(d) => d,
+            Err(code) => return code,
+        };
+        match r.pop_wait_stamped(consumer_id as usize, buf, deadline) {
+            Ok((n, stamp)) => {
+                // SAFETY: checked non-null; the caller guarantees they are writable.
+                unsafe {
+                    *out_len = n;
+                    *out_stamp = stamp;
+                }
+                SUBETHA_OK
+            }
+            Err(code) => code,
+        }
+    })
+}
+
+/// Set the ordering mode of a stamped ring, one of the `SUBETHA_ORDERING_`
+/// constants. The mode lives in the ring's ordering region, so every
+/// process attached reads the same value; a flip takes effect on the next
+/// pop with no drain. `SUBETHA_E_RING_NOT_STAMPED` on a ring built without
+/// stamps.
+#[unsafe(no_mangle)]
+pub extern "C" fn subetha_ring_set_ordering_mode(handle: subetha_handle, mode: u32) -> i32 {
+    with_ring(handle, |r| {
+        let mode = match ordering_mode(mode) {
+            Ok(m) => m,
+            Err(code) => return code,
+        };
+        match r.ring.set_ordering_mode(mode) {
+            Ok(()) => SUBETHA_OK,
+            Err(e) => ring_code(e),
+        }
+    })
+}
+
+/// Under `SUBETHA_ORDERING_MERGE_STRICT` an idle producer refreshes its
+/// watermark now and then so the merge does not wait on it; a producer
+/// that pushes steadily needs no refresh. `SUBETHA_E_RING_NOT_STAMPED` on
+/// a ring built without stamps.
+#[unsafe(no_mangle)]
+pub extern "C" fn subetha_ring_refresh_watermark(handle: subetha_handle, producer_id: u32) -> i32 {
+    with_ring(handle, |r| match r.ring.refresh_watermark(producer_id as usize) {
+        Ok(()) => SUBETHA_OK,
+        Err(e) => ring_code(e),
+    })
+}
+
+/// Wake every thread parked in a wait on this ring; each re-checks the ring
+/// and parks again unless it finds what it waited for. For a caller that
+/// changed something a waiter would want to see.
+#[unsafe(no_mangle)]
+pub extern "C" fn subetha_ring_wake_all(handle: subetha_handle) -> i32 {
+    with_ring(handle, |r| {
+        r.blocking.consumer_waker().wake_all();
+        r.blocking.producer_waker().wake_all();
+        SUBETHA_OK
+    })
+}
+
+/// A snapshot of the ring's state into `out`.
+///
+/// # Safety
+/// `out` is a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn subetha_ring_read_stats(handle: subetha_handle, out: *mut subetha_ring_stats) -> i32 {
+    with_ring(handle, |r| {
+        if out.is_null() {
+            return fail(SUBETHA_E_INVALID_ARGUMENT, "out is null");
+        }
+        let stats = r.stats();
+        // SAFETY: checked non-null; the caller guarantees it is writable.
+        unsafe { *out = stats };
+        SUBETHA_OK
+    })
+}
+
+/// Remove every file a file-backed ring under `path_prefix` names,
+/// including the two waker files, so no later process attaches to it. Live
+/// handles keep their mappings until destroyed; on Windows a mapped file
+/// cannot be removed and that refusal is counted. `max_producers` is the
+/// creation hint, the floor for how many per-producer backings are
+/// looked for. The counts land in `report` when it is not null. Returns
+/// `SUBETHA_E_RING_IO` when any removal was refused, with the first refusal
+/// named in the detail; a missing file is not a refusal.
+///
+/// # Safety
+/// `path_prefix` is a NUL-terminated UTF-8 string; `report` is null or a
+/// valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn subetha_ring_unlink(
+    path_prefix: *const c_char,
+    max_producers: u32,
+    report: *mut subetha_unlink_report,
+) -> i32 {
+    entry(|| {
+        if let Err(code) = require_initialized() {
+            return code;
+        }
+        let prefix = match unsafe { text(path_prefix, "path_prefix") } {
+            Ok(p) => Path::new(p),
+            Err(code) => return code,
+        };
+        let mut found = AdaptiveRing::unlink(prefix, max_producers as usize);
+        for suffix in [".cwaker.bin", ".pwaker.bin"] {
+            found.remove(with_suffix(prefix, suffix));
+        }
+        for path in subetha_cxc::cross_process_notifier::NotifyRecordHandle::file_paths_under(prefix) {
+            found.remove(path);
+        }
+        unsafe { finish_unlink(found, report) }
+    })
+}
+
+/// Attach a pollable notifier to the ring `ring` names for this process
+/// to watch: every push through the ABI in any process on the ring
+/// signals it. The new handle is of kind `SUBETHA_KIND_NOTIFIER`;
+/// `subetha_notifier_native` hands out its file descriptor or event
+/// `HANDLE`, `subetha_notifier_drain` clears it, and destroying the handle
+/// detaches it. Beside a file-backed ring the notifier is
+/// `<prefix>.notify.<index>` on Unix; the record every process reads is
+/// `<prefix>.notify.bin`, removed by `subetha_ring_unlink`.
+///
+/// # Safety
+/// `out` is a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn subetha_ring_notifier(ring: subetha_handle, out: *mut subetha_handle) -> i32 {
+    with_ring(ring, |r| {
+        if out.is_null() {
+            return fail(SUBETHA_E_INVALID_ARGUMENT, "out is null");
+        }
+        match r.blocking.notifiers().attach() {
+            Ok(notifier) => unsafe { issue(Object::Notifier(crate::notifier::NotifierObject::new(notifier)), out) },
+            Err(e) => crate::error::notify_code(e),
+        }
+    })
+}
+
+fn hint_from(hint: u32) -> Result<LayoutHint, i32> {
+    match hint {
+        SUBETHA_LAYOUT_AUTO => Ok(LayoutHint::Auto),
+        SUBETHA_LAYOUT_FORCE_INLINE => Ok(LayoutHint::ForceInline),
+        SUBETHA_LAYOUT_FORCE_OFFSET => Ok(LayoutHint::ForceOffset),
+        other => Err(fail(SUBETHA_E_INVALID_ARGUMENT, format!("layout hint {other} is not a hint"))),
+    }
+}
+
+/// Send a frame of any length up to the payload region's block size.
+/// Up to `SUBETHA_RING_FRAME_INLINE_BUDGET` bytes ride inside the slot; a
+/// larger frame lands in the payload region, created on the first spill,
+/// and the slot carries its offset. `layout_hint` is one of the
+/// `SUBETHA_LAYOUT_` constants; the path taken lands in `out_class` when it
+/// is not null. Frames and ordering stamps both claim the slot head, so a
+/// ring built with stamps refuses this with `SUBETHA_E_RING_LAYOUT_MISMATCH`.
+/// Every shape carries frames the same way.
+///
+/// # Safety
+/// `data` points to `len` readable bytes; `out_class` is null or a valid
+/// pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn subetha_ring_send_frame(
+    handle: subetha_handle,
+    producer_id: u32,
+    data: *const u8,
+    len: usize,
+    layout_hint: u32,
+    out_class: *mut u32,
+) -> i32 {
+    with_ring(handle, |r| {
+        let payload = match unsafe { bytes(data, len) } {
+            Ok(p) => p,
+            Err(code) => return code,
+        };
+        let hint = match hint_from(layout_hint) {
+            Ok(h) => h,
+            Err(code) => return code,
+        };
+        match r.send_frame(producer_id as usize, payload, hint) {
+            Ok(class) => {
+                if !out_class.is_null() {
+                    // SAFETY: checked non-null; the caller guarantees it is writable.
+                    unsafe { *out_class = class };
+                }
+                SUBETHA_OK
+            }
+            Err(code) => code,
+        }
+    })
+}
+
+/// `subetha_ring_send_frame`, parking until there is room or `timeout_ms`
+/// elapses; the waiting contract is `subetha_ring_push_wait`'s.
+///
+/// # Safety
+/// `data` points to `len` readable bytes; `out_class` is null or a valid
+/// pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn subetha_ring_send_frame_wait(
+    handle: subetha_handle,
+    producer_id: u32,
+    data: *const u8,
+    len: usize,
+    layout_hint: u32,
+    timeout_ms: i64,
+    out_class: *mut u32,
+) -> i32 {
+    with_ring(handle, |r| {
+        let payload = match unsafe { bytes(data, len) } {
+            Ok(p) => p,
+            Err(code) => return code,
+        };
+        let hint = match hint_from(layout_hint) {
+            Ok(h) => h,
+            Err(code) => return code,
+        };
+        let deadline = match deadline_from(timeout_ms) {
+            Ok(d) => d,
+            Err(code) => return code,
+        };
+        match r.send_frame_wait(producer_id as usize, payload, hint, deadline) {
+            Ok(class) => {
+                if !out_class.is_null() {
+                    // SAFETY: checked non-null; the caller guarantees it is writable.
+                    unsafe { *out_class = class };
+                }
+                SUBETHA_OK
+            }
+            Err(code) => code,
+        }
+    })
+}
+
+/// Receive one frame into `out`, its length into `out_len`; a frame
+/// carries its own length, unlike a slot. A frame larger than `cap` is not
+/// lost: it is kept for this consumer id, the call returns
+/// `SUBETHA_E_BUFFER_TOO_SMALL` with the size needed in `out_len`, and the
+/// next call for the same consumer with room yields it. A plain item next
+/// for this consumer, on the ring or held by `subetha_ring_recv_any`, stays
+/// where it is and the call returns `SUBETHA_E_NOT_A_FRAME`; a frame that
+/// fails its checks is taken off and refused with `SUBETHA_E_RING_IO`. Not
+/// available on a ring built with ordering stamps. `SUBETHA_E_RING_EMPTY`
+/// when there is nothing to take.
+///
+/// # Safety
+/// `out` points to `cap` writable bytes; `out_len` is a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn subetha_ring_recv_frame(
+    handle: subetha_handle,
+    consumer_id: u32,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    with_ring(handle, |r| {
+        let buf = match unsafe { out_buffer(out, cap, out_len, 0) } {
+            Ok(b) => b,
+            Err(code) => return code,
+        };
+        match r.recv_frame(consumer_id, buf) {
+            Ok(n) => {
+                // SAFETY: checked non-null; the caller guarantees it is writable.
+                unsafe { *out_len = n };
+                SUBETHA_OK
+            }
+            Err((code, needed)) => {
+                // SAFETY: as above.
+                unsafe { *out_len = needed };
+                code
+            }
+        }
+    })
+}
+
+/// `subetha_ring_recv_frame`, parking until a frame arrives or `timeout_ms`
+/// elapses; the waiting contract is `subetha_ring_pop_wait`'s.
+///
+/// # Safety
+/// `out` points to `cap` writable bytes; `out_len` is a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn subetha_ring_recv_frame_wait(
+    handle: subetha_handle,
+    consumer_id: u32,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+    timeout_ms: i64,
+) -> i32 {
+    with_ring(handle, |r| {
+        let buf = match unsafe { out_buffer(out, cap, out_len, 0) } {
+            Ok(b) => b,
+            Err(code) => return code,
+        };
+        let deadline = match deadline_from(timeout_ms) {
+            Ok(d) => d,
+            Err(code) => return code,
+        };
+        match r.recv_frame_wait(consumer_id, buf, deadline) {
+            Ok(n) => {
+                // SAFETY: checked non-null; the caller guarantees it is writable.
+                unsafe { *out_len = n };
+                SUBETHA_OK
+            }
+            Err((code, needed)) => {
+                // SAFETY: as above.
+                unsafe { *out_len = needed };
+                code
+            }
+        }
+    })
+}
+
+/// Receive the next item, a plain item or a frame, into `out`: its length
+/// into `out_len` and its kind, one of the `SUBETHA_RING_ITEM_` constants,
+/// into `out_kind`. A plain item's bytes are its slot's payload,
+/// `SUBETHA_RING_PLAIN_ITEM_BYTES` of them in a shape built of
+/// single-producer cores and `SUBETHA_RING_PAYLOAD_MAX` in the Vyukov shape;
+/// a frame's are the bytes it was sent with. An item larger than `cap` is
+/// kept for this consumer id as `subetha_ring_recv_frame` keeps a frame:
+/// the call returns `SUBETHA_E_BUFFER_TOO_SMALL` with the size needed in
+/// `out_len` and the kind in `out_kind`, and the next receive for the same
+/// consumer with room yields it; `subetha_ring_recv_frame` refuses a held
+/// plain item with `SUBETHA_E_NOT_A_FRAME` and keeps it. A frame that fails
+/// its checks is taken off and refused with `SUBETHA_E_RING_IO`. Not
+/// available on a ring built with ordering stamps. `SUBETHA_E_RING_EMPTY`
+/// when there is nothing to take.
+///
+/// # Safety
+/// `out` points to `cap` writable bytes; `out_len` and `out_kind` are valid
+/// pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn subetha_ring_recv_any(
+    handle: subetha_handle,
+    consumer_id: u32,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+    out_kind: *mut u32,
+) -> i32 {
+    with_ring(handle, |r| {
+        let buf = match unsafe { any_buffers(out, cap, out_len, out_kind) } {
+            Ok(b) => b,
+            Err(code) => return code,
+        };
+        let taken = r.recv_any(consumer_id);
+        // SAFETY: `any_buffers` checked both pointers non-null.
+        unsafe { hand_over_any(r, consumer_id, taken, buf, out_len, out_kind) }
+    })
+}
+
+/// `subetha_ring_recv_any`, parking until an item arrives or `timeout_ms`
+/// elapses; the waiting contract is `subetha_ring_pop_wait`'s.
+///
+/// # Safety
+/// `out` points to `cap` writable bytes; `out_len` and `out_kind` are valid
+/// pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn subetha_ring_recv_any_wait(
+    handle: subetha_handle,
+    consumer_id: u32,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+    out_kind: *mut u32,
+    timeout_ms: i64,
+) -> i32 {
+    with_ring(handle, |r| {
+        let buf = match unsafe { any_buffers(out, cap, out_len, out_kind) } {
+            Ok(b) => b,
+            Err(code) => return code,
+        };
+        let deadline = match deadline_from(timeout_ms) {
+            Ok(d) => d,
+            Err(code) => return code,
+        };
+        let taken = r.recv_any_wait(consumer_id, deadline);
+        // SAFETY: `any_buffers` checked both pointers non-null.
+        unsafe { hand_over_any(r, consumer_id, taken, buf, out_len, out_kind) }
+    })
+}
+
+/// The output buffer of `subetha_ring_recv_any` and its waiting form, with
+/// `out_len` and `out_kind` checked non-null.
+///
+/// # Safety
+/// `out` points to `cap` writable bytes.
+unsafe fn any_buffers<'a>(out: *mut u8, cap: usize, out_len: *mut usize, out_kind: *mut u32) -> Result<&'a mut [u8], i32> {
+    if out_kind.is_null() {
+        return Err(fail(SUBETHA_E_INVALID_ARGUMENT, "out_kind is null"));
+    }
+    // SAFETY: the caller guarantees `cap` writable bytes at `out`.
+    unsafe { out_buffer(out, cap, out_len, 0) }
+}
+
+/// Give `taken` to the caller of `subetha_ring_recv_any` or its waiting
+/// form. An item's kind lands in `out_kind` whether it is delivered or held
+/// for a call with room; a refusal that took nothing leaves `out_kind`
+/// alone.
+///
+/// # Safety
+/// `out_len` and `out_kind` are valid pointers.
+unsafe fn hand_over_any(
+    r: &RingObject,
+    consumer_id: u32,
+    taken: Result<Held, i32>,
+    out: &mut [u8],
+    out_len: *mut usize,
+    out_kind: *mut u32,
+) -> i32 {
+    let item = match taken {
+        Ok(item) => item,
+        Err(code) => {
+            // SAFETY: the caller guarantees it is writable.
+            unsafe { *out_len = 0 };
+            return code;
+        }
+    };
+    // SAFETY: as above.
+    unsafe { *out_kind = item.kind };
+    match r.deliver(consumer_id, item, out) {
+        Ok(n) => {
+            // SAFETY: as above.
+            unsafe { *out_len = n };
+            SUBETHA_OK
+        }
+        Err((code, needed)) => {
+            // SAFETY: as above.
+            unsafe { *out_len = needed };
+            code
+        }
+    }
+}
+
+/// Remove every name a shared-memory ring under `name` holds, so no later
+/// process attaches to it: the ring's regions, its two wakers, its
+/// notifier record, and on Unix the notifier FIFOs a consumer that died
+/// without detaching left behind. Handles still open keep their mappings
+/// until destroyed. The ring's peer directory names how many per-producer
+/// backings it has; with the directory gone, none are looked for. The
+/// counts land in `report` when it is not null. Returns
+/// `SUBETHA_E_RING_IO` when any removal was refused, with the first refusal
+/// named in the detail; a missing name is not a refusal.
+///
+/// On Windows a section's name goes with the last handle to it, so there
+/// is nothing to remove by name: this reports zero and succeeds.
+///
+/// # Safety
+/// `name` is a NUL-terminated UTF-8 string; `report` is null or a valid
+/// pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn subetha_ring_unlink_shm(
+    name: *const c_char,
+    shm_namespace: u32,
+    report: *mut subetha_unlink_report,
+) -> i32 {
+    entry(|| {
+        if let Err(code) = require_initialized() {
+            return code;
+        }
+        let name = match unsafe { text(name, "name") } {
+            Ok(n) => n,
+            Err(code) => return code,
+        };
+        if let Err(code) = namespace_known(shm_namespace) {
+            return code;
+        }
+        // Unix names a region the same in every namespace and Windows
+        // removes nothing by name, so any of the three resolves here.
+        let ns = ShmNamespace::Session;
+        let mut found = AdaptiveRing::unlink_shmfs_in(name, ns, 0);
+        found.remove_shm(&format!("{name}_cwaker"), ns);
+        found.remove_shm(&format!("{name}_pwaker"), ns);
+        for path in subetha_cxc::cross_process_notifier::NotifyRecordHandle::shm_fifo_paths_under(name, ns) {
+            found.remove(path);
+        }
+        found.remove_shm(&format!("{name}_notify"), ns);
+        if cfg!(windows) {
+            crate::error::set_detail("shared-memory names are released with the last handle; nothing to remove by name");
+        }
+        unsafe { finish_unlink(found, report) }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::{SUBETHA_E_DESTROYED, SUBETHA_E_TIMEOUT};
+    use subetha_cxc::ordering::STAMPED_PAYLOAD_BYTES;
+    use subetha_cxc::shared_ring::PAYLOAD_BYTES;
+    use subetha_cxc::spsc_ring::SPSC_PAYLOAD_BYTES;
+
+    #[test]
+    fn the_exported_sizes_are_the_rings_own() {
+        assert_eq!(SUBETHA_RING_SLOT_BYTES, SPSC_PAYLOAD_BYTES);
+        assert_eq!(SUBETHA_RING_PAYLOAD_MAX, PAYLOAD_BYTES);
+        assert_eq!(SUBETHA_RING_PAYLOAD_MAX, STAMPED_PAYLOAD_BYTES);
+        assert_eq!(SUBETHA_RING_FRAME_INLINE_BUDGET, AdaptiveRing::FRAME_INLINE_BUDGET);
+        assert_eq!(SUBETHA_RING_FRAME_DEFAULT_BLOCK, AdaptiveRing::FRAME_DEFAULT_BLOCK_SIZE);
+        assert_eq!(SUBETHA_FRAME_INLINE, FrameClass::Inline as u32);
+        assert_eq!(SUBETHA_FRAME_OFFSET, FrameClass::Offset as u32);
+    }
+
+    #[test]
+    fn a_frame_past_the_slot_round_trips_and_a_short_buffer_holds_it() {
+        let object = RingObject::anon_for_tests();
+        let cid = object.ring.register_consumer().unwrap() as u32;
+        let pid = object.ring.register_producer().unwrap();
+        let big: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        assert_eq!(object.send_frame(pid, &big, LayoutHint::Auto).unwrap(), SUBETHA_FRAME_OFFSET);
+        assert_eq!(object.send_frame(pid, b"small", LayoutHint::Auto).unwrap(), SUBETHA_FRAME_INLINE);
+
+        let mut short = [0u8; 16];
+        let (code, needed) = object.recv_frame(cid, &mut short).unwrap_err();
+        assert_eq!(code, SUBETHA_E_BUFFER_TOO_SMALL);
+        assert_eq!(needed, big.len());
+        let mut room = vec![0u8; 4096];
+        assert_eq!(object.recv_frame(cid, &mut room).unwrap(), big.len(), "the held frame comes first");
+        assert_eq!(&room[..big.len()], &big[..]);
+        assert_eq!(object.recv_frame(cid, &mut room).unwrap(), 5);
+        assert_eq!(&room[..5], b"small");
+        assert_eq!(object.recv_frame(cid, &mut room).unwrap_err().0, crate::error::SUBETHA_E_RING_EMPTY);
+    }
+
+    #[test]
+    fn recv_any_names_each_kind_and_recv_frame_leaves_a_plain_item_where_it_is() {
+        let object = RingObject::anon_for_tests();
+        let cid = object.ring.register_consumer().unwrap() as u32;
+        let pid = object.ring.register_producer().unwrap();
+        let big: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        assert_eq!(object.try_push(pid, &[7u8; SUBETHA_RING_PLAIN_ITEM_BYTES]), SUBETHA_OK);
+        assert_eq!(
+            object.try_push(pid, &[7u8; SUBETHA_RING_PLAIN_ITEM_BYTES + 1]),
+            SUBETHA_E_RING_PAYLOAD_TOO_LARGE,
+            "the slot's last byte holds the kind"
+        );
+        assert_eq!(object.send_frame(pid, b"small", LayoutHint::Auto).unwrap(), SUBETHA_FRAME_INLINE);
+        assert_eq!(object.send_frame(pid, &big, LayoutHint::Auto).unwrap(), SUBETHA_FRAME_OFFSET);
+
+        let mut room = vec![0u8; 4096];
+        let mut short = [0u8; 16];
+        assert_eq!(object.recv_frame(cid, &mut room).unwrap_err(), (SUBETHA_E_NOT_A_FRAME, 0), "on the ring");
+
+        let plain = object.recv_any(cid).unwrap();
+        assert_eq!(plain.kind, SUBETHA_RING_ITEM_PLAIN);
+        let (code, needed) = object.deliver(cid, plain, &mut short).unwrap_err();
+        assert_eq!((code, needed), (SUBETHA_E_BUFFER_TOO_SMALL, SUBETHA_RING_PLAIN_ITEM_BYTES));
+        assert_eq!(object.recv_frame(cid, &mut room).unwrap_err(), (SUBETHA_E_NOT_A_FRAME, 0), "held");
+        let plain = object.recv_any(cid).unwrap();
+        assert_eq!(plain.kind, SUBETHA_RING_ITEM_PLAIN, "the held item keeps its kind");
+        assert_eq!(object.deliver(cid, plain, &mut room).unwrap(), SUBETHA_RING_PLAIN_ITEM_BYTES);
+        assert_eq!(&room[..SUBETHA_RING_PLAIN_ITEM_BYTES], &[7u8; SUBETHA_RING_PLAIN_ITEM_BYTES][..]);
+
+        let inline = object.recv_any(cid).unwrap();
+        assert_eq!(inline.kind, SUBETHA_RING_ITEM_FRAME_INLINE);
+        assert_eq!(inline.bytes, b"small");
+
+        let offset = object.recv_any(cid).unwrap();
+        assert_eq!(offset.kind, SUBETHA_RING_ITEM_FRAME_OFFSET);
+        assert_eq!(object.deliver(cid, offset, &mut short).unwrap_err(), (SUBETHA_E_BUFFER_TOO_SMALL, big.len()));
+        assert_eq!(object.recv_frame(cid, &mut room).unwrap(), big.len(), "a frame held by recv_any is still a frame");
+        assert_eq!(&room[..big.len()], &big[..]);
+        assert_eq!(object.recv_any(cid).map(|item| item.kind).unwrap_err(), crate::error::SUBETHA_E_RING_EMPTY);
+    }
+
+    #[test]
+    fn a_notifier_is_signaled_by_a_push_and_quiet_after_a_drain() {
+        let object = RingObject::anon_for_tests();
+        let pid = object.ring.register_producer().unwrap();
+        let notifier = object.blocking.notifiers().attach().unwrap();
+        assert!(!notifier.wait(20), "nothing pushed yet");
+        assert_eq!(object.try_push(pid, b"x"), SUBETHA_OK);
+        assert!(notifier.wait(1000), "the push signaled the notifier");
+        notifier.drain();
+        assert!(!notifier.is_signaled());
+        drop(notifier);
+        assert_eq!(object.blocking.notifiers().attached(), 0);
+        assert_eq!(object.try_push(pid, b"y"), SUBETHA_OK, "a push with nothing attached is a push");
+    }
+
+    #[test]
+    fn a_push_wakes_a_parked_pop_and_a_timeout_is_reported() {
+        let object = RingObject::anon_for_tests();
+        let cid = object.ring.register_consumer().unwrap();
+        let pid = object.ring.register_producer().unwrap();
+        let mut buf = [0u8; SUBETHA_RING_SLOT_BYTES];
+        let deadline = Some(Instant::now() + Duration::from_millis(30));
+        assert_eq!(object.pop_wait(cid, &mut buf, deadline).unwrap_err(), SUBETHA_E_TIMEOUT);
+
+        let object = Arc::new(object);
+        let consumer = {
+            let object = Arc::clone(&object);
+            std::thread::spawn(move || {
+                let mut buf = [0u8; SUBETHA_RING_SLOT_BYTES];
+                let n = object.pop_wait(cid, &mut buf, None).unwrap();
+                buf[..n].to_vec()
+            })
+        };
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(object.try_push(pid, b"hello"), SUBETHA_OK);
+        let got = consumer.join().unwrap();
+        assert_eq!(got.len(), SUBETHA_RING_SLOT_BYTES, "a pop yields the whole slot");
+        assert_eq!(&got[..5], b"hello");
+        assert!(got[5..].iter().all(|b| *b == 0), "the slot past the payload is zero");
+    }
+
+    #[test]
+    fn a_destroy_interrupt_releases_a_waiter_with_its_own_code() {
+        let object = Arc::new(RingObject::anon_for_tests());
+        let cid = object.ring.register_consumer().unwrap();
+        let waiter = {
+            let object = Arc::clone(&object);
+            std::thread::spawn(move || {
+                let mut buf = [0u8; SUBETHA_RING_SLOT_BYTES];
+                object.pop_wait(cid, &mut buf, None)
+            })
+        };
+        std::thread::sleep(Duration::from_millis(20));
+        object.interrupt();
+        assert_eq!(waiter.join().unwrap().unwrap_err(), SUBETHA_E_DESTROYED);
+    }
+
+    /// Managed mode takes the default cadence when the caller names
+    /// none, and strict mode ignores the field entirely.
+    ///
+    /// Zero is "use the default" rather than a refusal: the cadence is
+    /// the added round-trip latency of managed mode, and a caller who
+    /// has no opinion about that number is better served by a measured
+    /// one than by an error.
+    #[test]
+    fn managed_mode_takes_a_default_interval_and_strict_needs_none() {
+        let ring = AdaptiveRing::create_anon(1, 1, 64).unwrap();
+        let defaulted = RingObject::build(
+            ring,
+            Locale::Anon,
+            subetha_ring_options { mode: SUBETHA_MODE_MANAGED, max_waiters: 0, scan_interval_us: 0, ..Default::default() },
+        )
+        .expect("zero takes the default rather than being refused");
+        assert_eq!(defaulted.stats().mode, SUBETHA_MODE_MANAGED);
+        assert!(
+            defaulted.sidecar.claim().is_some(),
+            "a defaulted cadence still attaches the sidecar"
+        );
+        drop(defaulted);
+        let ring = AdaptiveRing::create_anon(1, 1, 64).unwrap();
+        let managed = RingObject::build(
+            ring,
+            Locale::Anon,
+            subetha_ring_options { mode: SUBETHA_MODE_MANAGED, max_waiters: 0, scan_interval_us: 1_000, ..Default::default() },
+        )
+        .unwrap();
+        assert_eq!(managed.stats().mode, SUBETHA_MODE_MANAGED);
+        assert!(managed.sidecar.claim().is_some(), "managed mode attaches the sidecar");
+        drop(managed);
+        let strict = RingObject::anon_for_tests();
+        assert!(strict.sidecar.claim().is_none(), "strict mode starts nothing");
+    }
+
+    /// The Python and PowerShell rings push through a waiting ring of their
+    /// own over the same files, so a C pop parked on the file ring wakes on
+    /// their push rather than at its timeout.
+    #[test]
+    fn a_waiting_pop_wakes_on_a_push_through_another_handle_on_the_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "subetha-ffi-ring-wake-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the wall clock is after the epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("make the test's folder");
+        let prefix = dir.join("ring");
+        {
+            let object = Arc::new(
+                RingObject::build(
+                    AdaptiveRing::create(&prefix, 1, 1, 8).expect("make the ring"),
+                    Locale::File(&prefix),
+                    subetha_ring_options { mode: crate::runtime::SUBETHA_MODE_STRICT, ..Default::default() },
+                )
+                .expect("the C ring object"),
+            );
+            let other = BlockingAdaptiveRing::beside_files(
+                Arc::new(AdaptiveRing::open(&prefix, 1, 1, 8).expect("attach to the ring")),
+                &prefix,
+                MAX_WAITERS_DEFAULT,
+            )
+            .expect("another handle's wakers");
+            let waiting = Arc::clone(&object);
+            let waiter = std::thread::spawn(move || {
+                let mut out = [0u8; SUBETHA_RING_SLOT_BYTES];
+                let began = Instant::now();
+                let taken = waiting.pop_wait(0, &mut out, Some(Instant::now() + Duration::from_secs(20)));
+                (taken, out, began.elapsed())
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            other.try_send(0, b"from python").expect("send through the other handle");
+            let (taken, out, waited) = waiter.join().expect("the waiting thread");
+            assert!(taken.is_ok(), "the pop took the item: {taken:?}");
+            assert_eq!(&out[..11], b"from python");
+            assert!(waited < Duration::from_secs(10), "woken by the push, not by the timeout: {waited:?}");
+        }
+        std::fs::remove_dir_all(&dir).expect("remove the test's folder");
+    }
+}

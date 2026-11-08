@@ -1,0 +1,307 @@
+# Builds the module's native library for the four platforms no owned machine covers, and runs
+# the Rust unit tests and the Pester suites on each, on a runner of that platform: Windows on
+# Arm64, Linux on Arm64, macOS on Apple silicon and macOS on Intel. Windows x64, Linux x64 and
+# FreeBSD x64 are built and tested on owned machines, and the seven module folders are joined
+# with `cargo pwrs merge` from this run's artifacts and theirs.
+#
+# The Linux library is linked by cargo-zigbuild against glibc 2.35, so it loads on any
+# distribution with glibc 2.35 or later. A runner has no GPU: the suites run on the software
+# adapter the system has, WARP on Windows and Mesa's lavapipe on Linux, and on a runner with
+# none they skip the cases that need one, saying so.
+#
+# It runs on every branch but main, which only takes the release commit, and on dispatch.
+
+name: ci
+
+on:
+  push:
+    branches-ignore: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_PWRS_VERSION: '0.8.0'
+  # cargo-zigbuild's commit that drops the -O1 zig 0.16 warns about (#486)
+  CARGO_ZIGBUILD_REV: 'd9f7fd32fbac13cc26d23847835f7f23a5ed3a25'
+  PESTER_VERSION: '6.2.0'
+  RUST_VERSION: '1.99.0'
+  RUST_BACKTRACE: '1'
+  # Zig for the Linux arm64 job, and the SHA-256 of its aarch64 Linux tarball as Zig's
+  # download index (ziglang.org/download/index.json) gives it
+  ZIG_VERSION: '0.16.0'
+  ZIG_SHA256: 'ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17'
+
+jobs:
+  windows-arm64:
+    name: Windows arm64 (pwsh and Windows PowerShell 5.1)
+    runs-on: windows-11-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Cache the PWRS toolchain
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.pwrs
+          key: pwrs-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ env.CARGO_PWRS_VERSION }}
+
+      # cargo install keeps the version named when it is installed and replaces any other, such
+      # as one a restored cache holds
+      - name: Install cargo-pwrs
+        shell: pwsh
+        run: |
+          cargo install cargo-pwrs --version $env:CARGO_PWRS_VERSION --locked
+          if ($LASTEXITCODE -ne 0) { throw 'cargo install cargo-pwrs failed' }
+
+      # cargo pwrs test imports the Pester PWRS_PESTER_PATH names, in pwsh and in Windows
+      # PowerShell alike
+      - name: Pester ${{ env.PESTER_VERSION }}
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'pester'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Save-Module -Name Pester -RequiredVersion $env:PESTER_VERSION -Path $dir -Force
+          Add-Content -Path $env:GITHUB_ENV -Value "PWRS_PESTER_PATH=$(Join-Path $dir "Pester/$env:PESTER_VERSION/Pester.psd1")"
+
+      - name: The hosts and the adapters
+        shell: pwsh
+        run: |
+          "pwsh $($PSVersionTable.PSVersion) on $([System.Runtime.InteropServices.RuntimeInformation]::FrameworkDescription), $([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture)"
+          powershell -NoProfile -Command '"Windows PowerShell " + $PSVersionTable.PSVersion'
+          rustc --version
+
+      - name: Lint, with and without the module feature
+        shell: pwsh
+        run: |
+          cargo clippy -p wgpu-pwsh --no-deps --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw 'clippy failed' }
+          cargo clippy -p wgpu-pwsh --no-deps --all-targets --no-default-features -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw 'clippy without the module feature failed' }
+
+      # The module compiles Direct3D 12 shaders with the dxcompiler.dll it ships, which the unit
+      # tests, run outside PowerShell, cannot reach: a first build fetches it, and the tests find
+      # it on the PATH, where wgpu's Direct3D 12 backend looks for one
+      - name: Build win-arm64 and run the suites in pwsh and Windows PowerShell 5.1
+        shell: pwsh
+        run: |
+          cargo pwrs build --release
+          if ($LASTEXITCODE -ne 0) { throw 'cargo pwrs build failed' }
+          $dxc = Join-Path $env:RUNNER_TEMP 'dxc'
+          New-Item -ItemType Directory -Force $dxc | Out-Null
+          Copy-Item target/pwrs/Wgpu/runtimes/win-arm64/native/dxcompiler.dll $dxc
+          $env:PATH = "$dxc;$env:PATH"
+          cargo pwrs test --release
+          if ($LASTEXITCODE -ne 0) { throw 'cargo pwrs test failed' }
+          Import-Module ./target/pwrs/Wgpu/Wgpu.psd1
+          Get-WgpuAdapter | Format-Table Name, Backend, DeviceType, Driver, ShaderModel | Out-String -Width 200
+          New-Item -ItemType Directory -Force staging/win-arm64 | Out-Null
+          Copy-Item -Recurse target/pwrs/Wgpu staging/win-arm64/
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: module-win-arm64
+          path: staging
+
+  linux-arm64:
+    name: Linux arm64 (glibc 2.35)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Mesa's lavapipe is the software Vulkan adapter the suites run on; pwsh comes from its
+      # release tarball where the image has none
+      - name: Mesa's software Vulkan, and pwsh
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers libvulkan1
+          if ! command -v pwsh >/dev/null; then
+            curl -sSfL -o "$RUNNER_TEMP/pwsh.tar.gz" https://github.com/PowerShell/PowerShell/releases/download/v7.6.6/powershell-7.6.6-linux-arm64.tar.gz
+            sudo mkdir -p /opt/microsoft/powershell/7
+            sudo tar xzf "$RUNNER_TEMP/pwsh.tar.gz" -C /opt/microsoft/powershell/7
+            sudo chmod +x /opt/microsoft/powershell/7/pwsh
+            sudo ln -sf /opt/microsoft/powershell/7/pwsh /usr/local/bin/pwsh
+          fi
+          pwsh -NoProfile -Command '"pwsh " + $PSVersionTable.PSVersion'
+
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Cache the PWRS toolchain
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.pwrs
+          key: pwrs-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ env.CARGO_PWRS_VERSION }}
+
+      # cargo pwrs builds a triple with a glibc version through cargo-zigbuild, which links
+      # against that glibc's symbols with zig. Zig comes from its release tarball, checked
+      # against ZIG_SHA256 and kept in the cache, so ziglang.org serves it once per cache entry
+      - name: Cache Zig
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/zig
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ env.ZIG_VERSION }}-${{ env.ZIG_SHA256 }}
+
+      - name: Zig ${{ env.ZIG_VERSION }}
+        shell: bash
+        run: |
+          if [ ! -x "$HOME/zig/zig" ]; then
+            tarball="zig-aarch64-linux-$ZIG_VERSION.tar.xz"
+            curl -sSfL -o "$RUNNER_TEMP/$tarball" "https://ziglang.org/download/$ZIG_VERSION/$tarball"
+            echo "$ZIG_SHA256  $RUNNER_TEMP/$tarball" | sha256sum -c -
+            mkdir -p "$HOME/zig"
+            tar -xJf "$RUNNER_TEMP/$tarball" -C "$HOME/zig" --strip-components=1
+          fi
+          echo "$HOME/zig" >> "$GITHUB_PATH"
+          "$HOME/zig/zig" version
+
+      # cargo install keeps the version named when it is installed and replaces any other, such
+      # as one a restored cache holds; --force replaces a cargo-zigbuild from crates.io with the
+      # one built from the commit CARGO_ZIGBUILD_REV names
+      - name: Install cargo-pwrs and cargo-zigbuild
+        shell: pwsh
+        run: |
+          cargo install cargo-pwrs --version $env:CARGO_PWRS_VERSION --locked
+          if ($LASTEXITCODE -ne 0) { throw 'cargo install cargo-pwrs failed' }
+          cargo install --git https://github.com/rust-cross/cargo-zigbuild --rev $env:CARGO_ZIGBUILD_REV --locked --force cargo-zigbuild
+          if ($LASTEXITCODE -ne 0) { throw 'cargo install cargo-zigbuild failed' }
+          cargo-zigbuild --version
+
+      - name: Pester ${{ env.PESTER_VERSION }}
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'pester'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Save-Module -Name Pester -RequiredVersion $env:PESTER_VERSION -Path $dir -Force
+          Add-Content -Path $env:GITHUB_ENV -Value "PWRS_PESTER_PATH=$(Join-Path $dir "Pester/$env:PESTER_VERSION/Pester.psd1")"
+
+      # Code under cfg(unix) is linted only on a Unix host
+      - name: Lint, with and without the module feature
+        shell: pwsh
+        run: |
+          cargo clippy -p wgpu-pwsh --no-deps --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw 'clippy failed' }
+          cargo clippy -p wgpu-pwsh --no-deps --all-targets --no-default-features -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw 'clippy without the module feature failed' }
+
+      - name: Build linux-arm64 for glibc 2.35 and run the suites
+        shell: pwsh
+        run: |
+          "pwsh $($PSVersionTable.PSVersion) on $([System.Runtime.InteropServices.RuntimeInformation]::FrameworkDescription), $([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture)"
+          cargo pwrs test --release --target aarch64-unknown-linux-gnu.2.35
+          if ($LASTEXITCODE -ne 0) { throw 'cargo pwrs test failed' }
+          Import-Module ./target/pwrs/Wgpu/Wgpu.psd1
+          Get-WgpuAdapter | Format-Table Name, Backend, DeviceType, Driver | Out-String -Width 200
+          New-Item -ItemType Directory -Force staging/linux-arm64 | Out-Null
+          Copy-Item -Recurse target/pwrs/Wgpu staging/linux-arm64/
+
+      # The library may need no glibc symbol newer than 2.35
+      - name: Check the glibc version the library needs
+        shell: bash
+        run: |
+          for lib in staging/linux-arm64/Wgpu/runtimes/*/native/*.so; do
+            newest=$(objdump -T "$lib" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -1)
+            echo "$lib needs glibc $newest"
+            if [ "$(printf '%s\n2.35\n' "$newest" | sort -V | tail -1)" != "2.35" ]; then
+              echo "$lib needs a glibc newer than 2.35"
+              exit 1
+            fi
+          done
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: module-linux-arm64
+          path: staging
+
+  macos:
+    name: macOS ${{ matrix.rid }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: osx-arm64
+            runner: macos-latest
+          - rid: osx-x64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Cache the PWRS toolchain
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.pwrs
+          key: pwrs-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ env.CARGO_PWRS_VERSION }}
+
+      # cargo install keeps the version named when it is installed and replaces any other, such
+      # as one a restored cache holds
+      - name: Install cargo-pwrs
+        shell: pwsh
+        run: |
+          cargo install cargo-pwrs --version $env:CARGO_PWRS_VERSION --locked
+          if ($LASTEXITCODE -ne 0) { throw 'cargo install cargo-pwrs failed' }
+
+      - name: Pester ${{ env.PESTER_VERSION }}
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'pester'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Save-Module -Name Pester -RequiredVersion $env:PESTER_VERSION -Path $dir -Force
+          Add-Content -Path $env:GITHUB_ENV -Value "PWRS_PESTER_PATH=$(Join-Path $dir "Pester/$env:PESTER_VERSION/Pester.psd1")"
+
+      # rav1d, which reads AVIF, assembles its x86-64 code with nasm; an Arm64 build needs none
+      - name: nasm
+        if: matrix.rid == 'osx-x64'
+        run: brew install nasm
+
+      - name: Lint, with and without the module feature
+        shell: pwsh
+        run: |
+          cargo clippy -p wgpu-pwsh --no-deps --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw 'clippy failed' }
+          cargo clippy -p wgpu-pwsh --no-deps --all-targets --no-default-features -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw 'clippy without the module feature failed' }
+
+      # .cargo/config.toml builds the Apple silicon library for the apple-a14 core, the M1's,
+      # so it runs on every Mac that has Apple silicon
+      - name: Build ${{ matrix.rid }} and run the suites
+        shell: pwsh
+        run: |
+          "pwsh $($PSVersionTable.PSVersion) on $([System.Runtime.InteropServices.RuntimeInformation]::FrameworkDescription), $([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture)"
+          cargo pwrs test --release
+          if ($LASTEXITCODE -ne 0) { throw 'cargo pwrs test failed' }
+          Import-Module ./target/pwrs/Wgpu/Wgpu.psd1
+          Get-WgpuAdapter | Format-Table Name, Backend, DeviceType, Driver | Out-String -Width 200
+          New-Item -ItemType Directory -Force staging/${{ matrix.rid }} | Out-Null
+          Copy-Item -Recurse target/pwrs/Wgpu staging/${{ matrix.rid }}/
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: module-${{ matrix.rid }}
+          path: staging

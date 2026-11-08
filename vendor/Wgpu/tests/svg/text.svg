@@ -1,0 +1,4 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="180" height="50" viewBox="0 0 180 50">
+  <text x="4" y="20" font-family="Noto Sans" font-size="16" fill="#202020">Wgpu draws SVG text</text>
+  <text x="4" y="42" font-family="No Such Family" font-size="16" fill="#3366cc">SVG text</text>
+</svg>

@@ -1,0 +1,63 @@
+[package]
+name = "subetha-py"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Python bindings for SubEtha, bound to the Rust directly rather than through the C ABI."
+# This crate ships as a wheel rather than to crates.io, so a workspace
+# publish never picks it up.
+publish = false
+
+[lib]
+# The compiled extension sits inside the `subetha` package rather than
+# being it, so the package can carry an __init__.py, type stubs and the
+# py.typed marker beside it.
+name = "_subetha"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+subetha-cxc = { workspace = true }
+# The Marshal contract, which the typed front door takes its payloads
+# through.
+subetha-core = { workspace = true }
+# The process's sidecar: registration, InstanceStats and the Policy a
+# Python callable stands behind.
+subetha-sidecar = { workspace = true }
+# The value types that ride beside a pointer: the word-sized blooms and
+# the two clocks.
+subetha-pointers = { workspace = true }
+
+# The stable ABI is a feature here rather than fixed, because a
+# free-threaded interpreter has a stable ABI of its own, abi3t, from 3.15
+# on, and none before: a wheel for a free-threaded 3.14 is built with
+# neither ABI feature and serves that one version.
+pyo3 = { version = "0.30.1", default-features = false, features = ["macros"] }
+
+# Only the network bridges need a runtime, and only their features pull
+# it in. A wheel built without them links no async machinery at all.
+tokio = { workspace = true, optional = true }
+
+[features]
+# Linking against the interpreter is correct when building a wheel and
+# wrong when building the rlib for a test binary, which supplies its own
+# interpreter symbols. maturin turns it on; `cargo test` leaves it off.
+default = ["abi3"]
+extension-module = ["pyo3/extension-module"]
+# One wheel for every interpreter with the lock from 3.11 up. Leave it
+# out to build for a free-threaded interpreter.
+abi3 = ["pyo3/abi3-py311"]
+# One wheel for every free-threaded interpreter from 3.15 up, built with
+# `abi3` off. A free-threaded interpreter before 3.15 has no stable ABI,
+# so its wheel is built with neither feature and serves the one version
+# it was built against.
+abi3t = ["pyo3/abi3t-py315"]
+# The bridge that carries a ring's items over a TCP connection. Off by
+# default: it pulls tokio, and a process sharing memory with another on
+# the same host needs none of it.
+tcp-bridge = ["subetha-cxc/tcp-bridge", "dep:tokio"]
+# The same over QUIC, which also brings the TLS stack and a certificate
+# generator with it.
+quic-bridge = ["subetha-cxc/quic-bridge", "dep:tokio"]

@@ -1,0 +1,28 @@
+[package]
+name = "pwrs-gui-standin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "A stand-in for a module that draws through PWRS-GUI's session: it takes the session through Get-GuiNativeEntry and opens its windows with it. Built for PWRS-GUI's tests."
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pwrs.workspace = true
+pwrs-gui-client = { path = "../pwrs-gui-client", default-features = false }
+
+# The test bus's tray host and notification server, on the session bus
+# where tray icons and notifications go over D-Bus: zbus, the version the
+# egui helper's own client takes, and arc-swap for what the bus has heard.
+[target.'cfg(all(unix, not(target_vendor = "apple")))'.dependencies]
+zbus = { version = "5.19.0", default-features = false, features = ["async-io", "blocking-api"] }
+arc-swap.workspace = true
+
+# The workspace's own crates take the workspace LICENSE.
+[package.metadata.pwrs.license-files]
+"pwrs-gui-client@0.1.0" = "../../LICENSE"
+"pwrs-gui-proto@0.1.0" = "../../LICENSE"

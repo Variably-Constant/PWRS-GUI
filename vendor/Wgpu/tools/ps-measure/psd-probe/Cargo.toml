@@ -1,0 +1,17 @@
+[package]
+name = "psd-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+flate2 = "1.1.10"
+
+# The module's psd-merge feature, which src/psd.rs reads: on, so the probe's
+# read mode merges the layers where a document's composite is not the merge.
+[features]
+default = ["psd-merge"]
+psd-merge = []
+
+[profile.release]
+debug = false
