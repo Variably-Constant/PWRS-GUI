@@ -1,0 +1,780 @@
+//! `SharedFenceClock` - Hybrid Logical Clock (HLC) lifted to
+//! cross-process MMF.
+//!
+//! Each participating process registers an HLC slot in a shared
+//! table and publishes its `(physical_us, logical)` HLC there on
+//! every meaningful event. Any reader can walk the table to compute
+//! `global_fence = max(all slots)` - the timestamp at which all
+//! process events are causally observable. That fence is exactly
+//! what distributed snapshot isolation needs.
+//!
+//! # Why HLC instead of vector clocks
+//!
+//! Vector clocks give exact causal ordering but cost O(N) per event
+//! (each event has to update N-dim coordinate). HLC gives total
+//! order that respects causality with two u64 fields per process,
+//! bounded difference from physical clock skew, and O(1) per event.
+//! For cross-process snapshots over modest N (say <256 processes),
+//! HLC's tradeoff dominates VC.
+//!
+//! # HLC update rules (Kulkarni et al.)
+//!
+//! - `tick`:
+//!   - `wall = now()`, `new_phys = max(prev_phys, wall)`
+//!   - `new_log = if new_phys == prev_phys { prev_log + 1 } else { 0 }`
+//! - `merge(remote)`:
+//!   - `new_phys = max(prev_phys, remote_phys, wall)`
+//!   - `new_log = max(prev_log, remote_log) + 1` when both equal new_phys
+//!   - `= prev_log + 1` when only prev equals new_phys
+//!   - `= remote_log + 1` when only remote equals new_phys
+//!   - `= 0` when wall strictly dominates
+//!
+//! A step from a logical counter already at `u64::MAX` is refused:
+//! `checked_tick` and `checked_merge` answer `None` and leave the slot as
+//! it was, and `tick` and `merge` panic.
+//!
+//! # Layout
+//!
+//! A single MMF file: `<base>.bin` with `HlcHeader` (64B) +
+//! `HlcSlot[capacity]` (64B each, one cache line so cross-process
+//! writes don't false-share).
+//!
+//! # Race tolerance
+//!
+//! Per-slot writes are: `physical.store(Release)` then
+//! `logical.store(Release)`. A reader may observe a fresh physical
+//! with stale logical (or vice versa). That's HLC-safe because:
+//! - physical is monotonically non-decreasing
+//! - logical only increases at a given physical
+//! - the only invariant is total order, which lexicographic
+//!   `(physical, logical)` preserves even with one-field skew
+//!
+//! For strict torn-write protection, wrap with SeqLock; we omit it
+//! here because HLC's coarse-granularity guarantees absorb the
+//! single-cycle window.
+
+use std::fs::File;
+use std::path::Path;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+use memmap2::{MmapMut, MmapOptions};
+
+pub const FENCE_CLOCK_MAGIC: u64 = 0x4150_5546_434C_4B30;
+
+/// HLC value: `(physical_us, logical)`. Total order is lexicographic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hlc {
+    pub physical_us: u64,
+    pub logical: u64,
+}
+
+impl PartialOrd for Hlc {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Hlc {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match self.physical_us.cmp(&other.physical_us) {
+            std::cmp::Ordering::Equal => self.logical.cmp(&other.logical),
+            other => other,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum FenceClockError {
+    Full,
+    LayoutMismatch(crate::layout::Mismatch),
+    InvalidSlot,
+    /// The operating system refused to open, size or map the file; the
+    /// error carries its code and message.
+    IoError(std::io::Error),
+}
+
+impl std::fmt::Display for FenceClockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Full => write!(f, "every clock slot is taken"),
+            Self::LayoutMismatch(m) => write!(f, "a clock of another shape: {m}"),
+            Self::InvalidSlot => write!(f, "the slot index names no registered participant"),
+            Self::IoError(e) => write!(f, "io: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for FenceClockError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::IoError(e) => Some(e),
+            Self::Full | Self::LayoutMismatch(_) | Self::InvalidSlot => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for FenceClockError {
+    fn from(e: std::io::Error) -> Self { Self::IoError(e) }
+}
+
+pub const EMPTY_PID: u32 = 0;
+
+#[repr(C, align(64))]
+pub struct HlcHeader {
+    pub magic: u64,
+    pub capacity: u64,
+    pub global_fence_physical: AtomicU64,
+    pub global_fence_logical: AtomicU64,
+    pub last_fence_epoch: AtomicU64,
+    /// Shared cross-process cached wall clock. Each process publishes its
+    /// own 250 us-fresh local cache here via `fetch_max`, so every process
+    /// mapping this MMF reads the freshest timestamp across all of them -
+    /// reconciling the per-process cache *phase* on a single host (where
+    /// the hardware clock is shared, so there is no real skew, only phase).
+    /// Monotonic by construction. Occupies 8 of the former 16 pad bytes, so
+    /// the header size and magic are unchanged.
+    pub cached_us: AtomicU64,
+    _pad: [u8; 8],
+}
+
+#[repr(C, align(64))]
+pub struct HlcSlot {
+    pub pid: AtomicU32,
+    _pad1: [u8; 4],
+    pub physical_us: AtomicU64,
+    pub logical: AtomicU64,
+    pub last_updated_us: AtomicU64,
+    _pad2: [u8; 32],
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<HlcHeader>() == 64);
+    assert!(std::mem::size_of::<HlcSlot>() == 64);
+};
+
+pub const fn fence_clock_file_size(capacity: usize) -> usize {
+    std::mem::size_of::<HlcHeader>() + capacity * std::mem::size_of::<HlcSlot>()
+}
+
+pub struct SharedFenceClock {
+    _file: File,
+    mmap: MmapMut,
+    capacity: usize,
+    header_sidecar: subetha_core::HandshakeHeader,
+    ring_sidecar: Box<subetha_core::ObservationRing>,
+}
+
+unsafe impl Send for SharedFenceClock {}
+unsafe impl Sync for SharedFenceClock {}
+
+impl subetha_sidecar::AdaptiveInstance for SharedFenceClock {
+    fn header(&self) -> &subetha_core::HandshakeHeader { &self.header_sidecar }
+    fn ring(&self) -> &subetha_core::ObservationRing { &self.ring_sidecar }
+    fn make_policy(&self) -> Box<dyn subetha_sidecar::Policy> {
+        Box::new(subetha_sidecar::NoMigrationPolicy)
+    }
+}
+
+
+impl SharedFenceClock {
+    /// Obtain the clock table at `path`, initializing an empty one if
+    /// the path does not yet exist and attaching to it if it does.
+    /// Attaching leaves the registered slots and the global fence in
+    /// place; a region built with a different capacity is a
+    /// `LayoutMismatch`. [`reset`](Self::reset) reinitializes.
+    pub fn create(path: impl AsRef<Path>, capacity: usize) -> Result<Self, FenceClockError> {
+        assert!(capacity >= 1);
+        // Start the background clock updater so `now_us` (a cached read) is
+        // populated before the first tick.
+        crate::cached_clock::start();
+        let total = fence_clock_file_size(capacity);
+        let (file, mmap) = crate::mmf_attach::create_or_attach(
+            path.as_ref(),
+            total,
+            |ptr| unsafe { Self::init_region(ptr, capacity) },
+            |ptr| unsafe { (*(ptr as *const HlcHeader)).magic },
+            FENCE_CLOCK_MAGIC,
+        )
+        .map_err(|e| crate::mmf_attach::attach_error(e, FenceClockError::LayoutMismatch))?;
+        Self::from_region(file, mmap, capacity)
+    }
+
+    /// Truncate the clock table at `path` and initialize an empty one,
+    /// unregistering every slot a live peer holds. For a caller that
+    /// knows it owns the path.
+    pub fn reset(path: impl AsRef<Path>, capacity: usize) -> Result<Self, FenceClockError> {
+        assert!(capacity >= 1);
+        crate::cached_clock::start();
+        let total = fence_clock_file_size(capacity);
+        let (file, mmap) = crate::mmf_attach::reset(path.as_ref(), total, |ptr| unsafe {
+            Self::init_region(ptr, capacity)
+        })?;
+        Self::from_region(file, mmap, capacity)
+    }
+
+    /// Lay out an empty clock table: the zeroed region is already the
+    /// empty slot array (`EMPTY_PID` and zero timestamps) and a zero
+    /// global fence, so only the capacity and then the magic are
+    /// written, magic last, because attachers spin on it.
+    ///
+    /// # Safety
+    /// `ptr` addresses at least `fence_clock_file_size(capacity)`
+    /// writable zeroed bytes.
+    unsafe fn init_region(ptr: *mut u8, capacity: usize) {
+        let hdr = ptr as *mut HlcHeader;
+        unsafe {
+            (*hdr).capacity = capacity as u64;
+            std::ptr::write_volatile(&raw mut (*hdr).magic, FENCE_CLOCK_MAGIC);
+        }
+    }
+
+    /// Wrap an initialized region, refusing one built with a different
+    /// capacity.
+    fn from_region(
+        file: File,
+        mmap: MmapMut,
+        capacity: usize,
+    ) -> Result<Self, FenceClockError> {
+        let hdr = unsafe { &*(mmap.as_ptr() as *const HlcHeader) };
+        crate::layout::Mismatch::first(&[
+            ("magic", hdr.magic, FENCE_CLOCK_MAGIC),
+            ("capacity", hdr.capacity, capacity as u64),
+        ])
+        .map_err(FenceClockError::LayoutMismatch)?;
+        Ok(Self {
+            _file: file, mmap, capacity,
+            header_sidecar: subetha_core::HandshakeHeader::new(),
+            ring_sidecar: Box::new(subetha_core::ObservationRing::new()),
+        })
+    }
+
+    pub fn open(path: impl AsRef<Path>, expected_capacity: usize) -> Result<Self, FenceClockError> {
+        crate::cached_clock::start();
+        let file = crate::region_file::open_existing(path.as_ref())?;
+        let total = fence_clock_file_size(expected_capacity);
+        let len = file.metadata()?.len();
+        if len < total as u64 {
+            return Err(FenceClockError::LayoutMismatch(crate::layout::Mismatch::new(
+                "length",
+                len,
+                total as u64,
+            )));
+        }
+        let mmap = unsafe { MmapOptions::new().len(total).map_mut(&file)? };
+        Self::from_region(file, mmap, expected_capacity)
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> usize { self.capacity }
+
+    /// Current shared cross-process cached wall clock (microseconds). This
+    /// is the freshest cache any process on the host has published to the
+    /// MMF; it advances when any process ticks. One atomic load.
+    #[inline]
+    pub fn shared_clock_us(&self) -> u64 {
+        self.header().cached_us.load(Ordering::Acquire)
+    }
+
+    fn header(&self) -> &HlcHeader {
+        unsafe { &*(self.mmap.as_ptr() as *const HlcHeader) }
+    }
+
+    /// Cross-process cached wall clock. Reads this process's 250 us-fresh
+    /// local cache and the MMF-shared value; if the local cache is fresher
+    /// (this process advanced its phase first), it publishes it with
+    /// `fetch_max` and returns it, otherwise it returns the shared value.
+    /// The result is therefore the freshest across every process on the
+    /// host, monotonic, and contended only ~once per refresh interval per
+    /// process (the load is the common case; the write is rare). Cross-host
+    /// skew is reconciled separately by [`merge`](Self::merge).
+    #[inline]
+    fn shared_now_us(&self) -> u64 {
+        let local = crate::cached_clock::now_us();
+        let cached = &self.header().cached_us;
+        let shared = cached.load(Ordering::Acquire);
+        if local > shared {
+            cached.fetch_max(local, Ordering::AcqRel);
+            local
+        } else {
+            shared
+        }
+    }
+
+    fn slot(&self, idx: usize) -> &HlcSlot {
+        assert!(idx < self.capacity, "slot {idx} is past the {} the clock holds", self.capacity);
+        let base = unsafe {
+            self.mmap.as_ptr().add(std::mem::size_of::<HlcHeader>())
+        };
+        unsafe {
+            &*(base.add(idx * std::mem::size_of::<HlcSlot>()) as *const HlcSlot)
+        }
+    }
+
+    /// Register the calling process. CAS-claims the first empty slot;
+    /// returns slot index.
+    pub fn register(&self, pid: u32) -> Result<usize, FenceClockError> {
+        assert!(pid != EMPTY_PID, "pid must be != EMPTY_PID");
+        for i in 0..self.capacity {
+            let slot = self.slot(i);
+            if slot.pid.compare_exchange(
+                EMPTY_PID, pid, Ordering::AcqRel, Ordering::Acquire,
+            ).is_ok() {
+                slot.physical_us.store(0, Ordering::Release);
+                slot.logical.store(0, Ordering::Release);
+                slot.last_updated_us.store(self.shared_now_us(), Ordering::Release);
+                return Ok(i);
+            }
+        }
+        Err(FenceClockError::Full)
+    }
+
+    /// Release a slot so another process can claim it.
+    ///
+    /// # Panics
+    /// If `idx` is not below the capacity, as every call that takes a
+    /// slot does.
+    pub fn unregister(&self, idx: usize) {
+        let slot = self.slot(idx);
+        slot.physical_us.store(0, Ordering::Release);
+        slot.logical.store(0, Ordering::Release);
+        slot.pid.store(EMPTY_PID, Ordering::Release);
+    }
+
+    /// Local internal-event HLC tick. Advances this slot's HLC per
+    /// the standard rules.
+    ///
+    /// # Panics
+    ///
+    /// When the slot's logical counter is already `u64::MAX` and the
+    /// shared clock has not moved past its physical part, since no
+    /// reading orders after it. [`checked_tick`](Self::checked_tick)
+    /// answers `None` instead. Also when `idx` is not below the capacity.
+    pub fn tick(&self, idx: usize) -> Hlc {
+        self.checked_tick(idx)
+            .expect("the slot's logical counter is at u64::MAX, so no reading orders after it")
+    }
+
+    /// [`tick`](Self::tick), or `None` with the slot left as it was when
+    /// the slot's logical counter is already `u64::MAX` and the shared
+    /// clock has not moved past its physical part. Panics, as `tick`
+    /// does, when `idx` is not below the capacity.
+    pub fn checked_tick(&self, idx: usize) -> Option<Hlc> {
+        let slot = self.slot(idx);
+        let wall = self.shared_now_us();
+        let prev_phys = slot.physical_us.load(Ordering::Acquire);
+        let prev_log = slot.logical.load(Ordering::Acquire);
+        let new_phys = prev_phys.max(wall);
+        let new_log = if new_phys == prev_phys { prev_log.checked_add(1)? } else { 0 };
+        slot.physical_us.store(new_phys, Ordering::Release);
+        slot.logical.store(new_log, Ordering::Release);
+        slot.last_updated_us.store(wall, Ordering::Release);
+        self.ring_sidecar
+            .push_op(crate::sidecar_ops::fence_clock::OP_TICK, 0);
+        Some(Hlc { physical_us: new_phys, logical: new_log })
+    }
+
+    /// Merge a remote HLC (e.g., received in a message) into this
+    /// slot. Returns the new local HLC.
+    ///
+    /// # Panics
+    ///
+    /// When the logical counter the merge steps is already `u64::MAX`,
+    /// which a remote clock can carry, since no reading orders after it.
+    /// [`checked_merge`](Self::checked_merge) answers `None` instead. Also
+    /// when `idx` is not below the capacity.
+    pub fn merge(&self, idx: usize, remote: Hlc) -> Hlc {
+        self.checked_merge(idx, remote)
+            .expect("the logical counter is at u64::MAX, so no reading orders after the merged one")
+    }
+
+    /// [`merge`](Self::merge), or `None` with the slot left as it was when
+    /// the logical counter it steps is already `u64::MAX`. Panics, as
+    /// `merge` does, when `idx` is not below the capacity.
+    pub fn checked_merge(&self, idx: usize, remote: Hlc) -> Option<Hlc> {
+        let slot = self.slot(idx);
+        let wall = self.shared_now_us();
+        let prev_phys = slot.physical_us.load(Ordering::Acquire);
+        let prev_log = slot.logical.load(Ordering::Acquire);
+        let new_phys = prev_phys.max(remote.physical_us).max(wall);
+        let new_log = if new_phys == prev_phys && new_phys == remote.physical_us {
+            prev_log.max(remote.logical).checked_add(1)?
+        } else if new_phys == prev_phys {
+            prev_log.checked_add(1)?
+        } else if new_phys == remote.physical_us {
+            remote.logical.checked_add(1)?
+        } else {
+            0
+        };
+        slot.physical_us.store(new_phys, Ordering::Release);
+        slot.logical.store(new_log, Ordering::Release);
+        slot.last_updated_us.store(wall, Ordering::Release);
+        self.ring_sidecar
+            .push_op(crate::sidecar_ops::fence_clock::OP_MERGE, 0);
+        Some(Hlc { physical_us: new_phys, logical: new_log })
+    }
+
+    /// Read this slot's current HLC.
+    ///
+    /// # Panics
+    /// If `idx` is not below the capacity.
+    pub fn get_local(&self, idx: usize) -> Hlc {
+        let slot = self.slot(idx);
+        let h = Hlc {
+            physical_us: slot.physical_us.load(Ordering::Acquire),
+            logical: slot.logical.load(Ordering::Acquire),
+        };
+        self.ring_sidecar
+            .push_op(crate::sidecar_ops::fence_clock::OP_GET_LOCAL, 0);
+        h
+    }
+
+    /// Walk all slots and compute `max(slot.hlc)` across all non-vacant
+    /// slots. This is the global fence: the timestamp at which all
+    /// peers' events are observable.
+    pub fn compute_global_fence(&self) -> Hlc {
+        let mut max = Hlc { physical_us: 0, logical: 0 };
+        for i in 0..self.capacity {
+            let slot = self.slot(i);
+            if slot.pid.load(Ordering::Acquire) == EMPTY_PID { continue; }
+            let h = Hlc {
+                physical_us: slot.physical_us.load(Ordering::Acquire),
+                logical: slot.logical.load(Ordering::Acquire),
+            };
+            if h > max { max = h; }
+        }
+        self.ring_sidecar
+            .push_op(crate::sidecar_ops::fence_clock::OP_COMPUTE_FENCE, 0);
+        max
+    }
+
+    /// Publish the computed global fence to the header so other
+    /// processes can read it via `read_global_fence` at O(1).
+    pub fn publish_global_fence(&self) -> Hlc {
+        let fence = self.compute_global_fence();
+        let hdr = self.header();
+        hdr.global_fence_physical.store(fence.physical_us, Ordering::Release);
+        hdr.global_fence_logical.store(fence.logical, Ordering::Release);
+        hdr.last_fence_epoch.fetch_add(1, Ordering::Release);
+        fence
+    }
+
+    /// Read the most-recently-published global fence (O(1); set by a
+    /// publisher process / coordinator).
+    pub fn read_global_fence(&self) -> Hlc {
+        let hdr = self.header();
+        Hlc {
+            physical_us: hdr.global_fence_physical.load(Ordering::Acquire),
+            logical: hdr.global_fence_logical.load(Ordering::Acquire),
+        }
+    }
+
+    /// Snapshot a specific slot, `None` when it is vacant.
+    ///
+    /// # Panics
+    /// If `idx` is not below the capacity: `None` means a vacant slot, not
+    /// one that does not exist.
+    pub fn slot_snapshot(&self, idx: usize) -> Option<HlcSlotSnapshot> {
+        let slot = self.slot(idx);
+        let pid = slot.pid.load(Ordering::Acquire);
+        if pid == EMPTY_PID { return None; }
+        Some(HlcSlotSnapshot {
+            pid,
+            hlc: Hlc {
+                physical_us: slot.physical_us.load(Ordering::Acquire),
+                logical: slot.logical.load(Ordering::Acquire),
+            },
+            last_updated_us: slot.last_updated_us.load(Ordering::Acquire),
+        })
+    }
+
+    /// Total fence-publish epochs (counter bumped by `publish_global_fence`).
+    pub fn fence_epoch(&self) -> u64 {
+        self.header().last_fence_epoch.load(Ordering::Acquire)
+    }
+
+    pub fn flush(&self) -> Result<(), FenceClockError> {
+        self.mmap.flush()?;
+        Ok(())
+    }
+
+    /// Non-blocking flush: schedules a writeback via the OS.
+    /// Note: Windows is only partially async (sync to page cache,
+    /// not to disk).
+    pub fn flush_async(&self) -> Result<(), FenceClockError> {
+        self.mmap.flush_async()?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HlcSlotSnapshot {
+    pub pid: u32,
+    pub hlc: Hlc,
+    pub last_updated_us: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::thread;
+
+    /// A file for one test, removed when the test ends; declared before the
+    /// primitive that maps it so it drops after it.
+    fn tmp(name: &str) -> crate::test_paths::TmpFile {
+        crate::test_paths::TmpFile::new(format!("subetha-fenceclock-{name}-{}.bin", std::process::id()))
+    }
+
+    /// A slot past the capacity is refused by unregister as by every other
+    /// call, rather than ignored.
+    #[test]
+    #[should_panic(expected = "slot 4 is past the 4 the clock holds")]
+    fn unregister_refuses_a_slot_past_the_capacity() {
+        let p = tmp("unregister-past");
+        let c = SharedFenceClock::create(&p, 4).unwrap();
+        c.unregister(4);
+    }
+
+    #[test]
+    fn create_initial_state_is_empty() {
+        let p = tmp("init");
+        let c = SharedFenceClock::create(&p, 4).unwrap();
+        assert_eq!(c.capacity(), 4);
+        assert_eq!(c.compute_global_fence(), Hlc { physical_us: 0, logical: 0 });
+        for i in 0..4 { assert!(c.slot_snapshot(i).is_none()); }
+    }
+
+    /// A second create attaches with the registered slots in place;
+    /// reset is what unregisters them.
+    #[test]
+    fn second_create_attaches_and_keeps_registrations() {
+        let p = tmp("attach");
+        let c = SharedFenceClock::create(&p, 4).unwrap();
+        let s0 = c.register(1001).unwrap();
+
+        let c2 = SharedFenceClock::create(&p, 4).unwrap();
+        assert_eq!(
+            c2.slot_snapshot(s0).map(|s| s.pid),
+            Some(1001),
+            "attach dropped a registered slot",
+        );
+        assert!(matches!(
+            SharedFenceClock::create(&p, 2),
+            Err(FenceClockError::LayoutMismatch(crate::layout::Mismatch { field: "capacity", found: 4, wanted: 2 })),
+        ));
+
+        // Windows refuses to truncate a mapped file, so every handle goes
+        // before the reset.
+        drop(c);
+        drop(c2);
+        let fresh = SharedFenceClock::reset(&p, 4).unwrap();
+        assert!(fresh.slot_snapshot(s0).is_none(), "reset left a slot registered");
+        drop(fresh);
+    }
+
+    #[test]
+    fn register_returns_distinct_slot_indices() {
+        let p = tmp("reg");
+        let c = SharedFenceClock::create(&p, 4).unwrap();
+        let s0 = c.register(1001).unwrap();
+        let s1 = c.register(1002).unwrap();
+        assert_ne!(s0, s1);
+    }
+
+    #[test]
+    fn register_fails_when_table_is_full() {
+        let p = tmp("full");
+        let c = SharedFenceClock::create(&p, 2).unwrap();
+        c.register(1).unwrap();
+        c.register(2).unwrap();
+        assert!(matches!(c.register(3).err(), Some(FenceClockError::Full)));
+    }
+
+    #[test]
+    fn tick_advances_physical_and_resets_logical() {
+        let p = tmp("tick");
+        let c = SharedFenceClock::create(&p, 2).unwrap();
+        let idx = c.register(1).unwrap();
+        let h1 = c.tick(idx);
+        thread::sleep(std::time::Duration::from_millis(2));
+        let h2 = c.tick(idx);
+        assert!(h2 > h1, "second tick should be strictly greater");
+    }
+
+    #[test]
+    fn tick_increments_logical_when_physical_unchanged() {
+        let p = tmp("logical");
+        let c = SharedFenceClock::create(&p, 2).unwrap();
+        let idx = c.register(1).unwrap();
+        // Force physical to a very high value so subsequent ticks
+        // within the same microsecond keep the same physical and bump
+        // logical.
+        let slot = c.slot(idx);
+        slot.physical_us.store(u64::MAX / 2, Ordering::Release);
+        slot.logical.store(0, Ordering::Release);
+        let h0 = c.tick(idx);
+        let h1 = c.tick(idx);
+        assert_eq!(h0.physical_us, h1.physical_us);
+        assert_eq!(h1.logical, h0.logical + 1);
+    }
+
+    #[test]
+    fn merge_picks_max_physical_and_increments_logical() {
+        let p = tmp("merge");
+        let c = SharedFenceClock::create(&p, 2).unwrap();
+        let idx = c.register(1).unwrap();
+        // Set local to a known value.
+        let slot = c.slot(idx);
+        slot.physical_us.store(1000, Ordering::Release);
+        slot.logical.store(5, Ordering::Release);
+        // Merge a remote with higher physical.
+        let remote = Hlc { physical_us: 2000, logical: 3 };
+        // Note: now_us() will likely dominate both (it's wall time).
+        // To test the merge logic isolated from wall, the remote
+        // physical must exceed both prev and now_us().
+        let remote_far_future = Hlc { physical_us: u64::MAX / 2, logical: 7 };
+        let merged = c.merge(idx, remote_far_future);
+        assert_eq!(merged.physical_us, u64::MAX / 2);
+        assert_eq!(merged.logical, 8);
+        // (the older merge is not observable here; the local
+        // dropped <- u64::MAX/2 / 8 was the test signal.)
+        let _remote = remote;
+    }
+
+    #[test]
+    fn steps_from_the_logical_ceiling_answer_none_and_leave_the_slot() {
+        let p = tmp("ceiling");
+        let c = SharedFenceClock::create(&p, 2).unwrap();
+        let idx = c.register(1).unwrap();
+        // A physical part past the shared clock keeps every step on the
+        // logical counter.
+        let future = u64::MAX / 2;
+        assert_eq!(c.checked_merge(idx, Hlc { physical_us: future, logical: u64::MAX }), None);
+        assert_eq!(c.get_local(idx), Hlc { physical_us: 0, logical: 0 });
+
+        let top = c.merge(idx, Hlc { physical_us: future, logical: u64::MAX - 1 });
+        assert_eq!(top, Hlc { physical_us: future, logical: u64::MAX });
+        assert_eq!(c.checked_tick(idx), None);
+        assert_eq!(c.checked_merge(idx, Hlc { physical_us: future, logical: 0 }), None);
+        assert_eq!(c.get_local(idx), top);
+    }
+
+    #[test]
+    #[should_panic(expected = "u64::MAX")]
+    fn tick_panics_from_the_logical_ceiling() {
+        let p = tmp("ceiling-panic");
+        let c = SharedFenceClock::create(&p, 2).unwrap();
+        let idx = c.register(1).unwrap();
+        c.slot(idx).physical_us.store(u64::MAX / 2, Ordering::Release);
+        c.slot(idx).logical.store(u64::MAX, Ordering::Release);
+        c.tick(idx);
+    }
+
+    #[test]
+    fn compute_global_fence_returns_max_of_all_slots() {
+        let p = tmp("global");
+        let c = SharedFenceClock::create(&p, 4).unwrap();
+        let a = c.register(10).unwrap();
+        let b = c.register(20).unwrap();
+        let d = c.register(30).unwrap();
+        // Manually set each slot to a known HLC.
+        c.slot(a).physical_us.store(100, Ordering::Release);
+        c.slot(a).logical.store(5, Ordering::Release);
+        c.slot(b).physical_us.store(200, Ordering::Release);
+        c.slot(b).logical.store(0, Ordering::Release);
+        c.slot(d).physical_us.store(150, Ordering::Release);
+        c.slot(d).logical.store(9, Ordering::Release);
+        let fence = c.compute_global_fence();
+        assert_eq!(fence, Hlc { physical_us: 200, logical: 0 });
+    }
+
+    #[test]
+    fn publish_and_read_global_fence_round_trip() {
+        let p = tmp("publish");
+        let c = SharedFenceClock::create(&p, 2).unwrap();
+        let idx = c.register(1).unwrap();
+        c.slot(idx).physical_us.store(7777, Ordering::Release);
+        c.slot(idx).logical.store(3, Ordering::Release);
+        let published = c.publish_global_fence();
+        let read = c.read_global_fence();
+        assert_eq!(read, published);
+        assert_eq!(read, Hlc { physical_us: 7777, logical: 3 });
+        assert_eq!(c.fence_epoch(), 1);
+    }
+
+    #[test]
+    fn cross_handle_fence_visible() {
+        let p = tmp("cross-handle");
+        let owner = SharedFenceClock::create(&p, 4).unwrap();
+        let observer = SharedFenceClock::open(&p, 4).unwrap();
+        let idx = owner.register(42).unwrap();
+        owner.slot(idx).physical_us.store(5555, Ordering::Release);
+        owner.slot(idx).logical.store(1, Ordering::Release);
+        let owner_fence = owner.publish_global_fence();
+        let observer_fence = observer.read_global_fence();
+        assert_eq!(owner_fence, observer_fence);
+        // Observer can also recompute directly.
+        assert_eq!(observer.compute_global_fence(), Hlc { physical_us: 5555, logical: 1 });
+    }
+
+    #[test]
+    fn concurrent_ticks_remain_monotonic() {
+        let p = tmp("monotonic");
+        let c = Arc::new(SharedFenceClock::create(&p, 8).unwrap());
+        let mut handles = vec![];
+        for t in 0..4 {
+            let c = c.clone();
+            handles.push(thread::spawn(move || {
+                let idx = c.register(1000 + t as u32).unwrap();
+                let mut prev = Hlc { physical_us: 0, logical: 0 };
+                for _ in 0..50 {
+                    let cur = c.tick(idx);
+                    assert!(cur > prev, "tick must produce strictly greater HLC");
+                    prev = cur;
+                }
+            }));
+        }
+        for h in handles { h.join().unwrap(); }
+        let fence = c.compute_global_fence();
+        assert!(fence.physical_us > 0);
+    }
+
+    #[test]
+    fn unregister_clears_slot() {
+        let p = tmp("unreg");
+        let c = SharedFenceClock::create(&p, 4).unwrap();
+        let idx = c.register(999).unwrap();
+        c.tick(idx);
+        assert!(c.slot_snapshot(idx).is_some());
+        c.unregister(idx);
+        assert!(c.slot_snapshot(idx).is_none());
+        // Slot can be re-claimed.
+        let idx2 = c.register(1000).unwrap();
+        assert_eq!(idx, idx2);
+    }
+
+    #[test]
+    fn disk_persistence_fence_survives_reopen() {
+        let p = tmp("disk");
+        {
+            let c = SharedFenceClock::create(&p, 4).unwrap();
+            let idx = c.register(100).unwrap();
+            c.slot(idx).physical_us.store(1234, Ordering::Release);
+            c.slot(idx).logical.store(7, Ordering::Release);
+            c.publish_global_fence();
+            c.flush().unwrap();
+        }
+        let c2 = SharedFenceClock::open(&p, 4).unwrap();
+        assert_eq!(c2.read_global_fence(), Hlc { physical_us: 1234, logical: 7 });
+    }
+
+    #[test]
+    fn hlc_ord_is_lexicographic() {
+        let a = Hlc { physical_us: 100, logical: 5 };
+        let b = Hlc { physical_us: 100, logical: 6 };
+        let c = Hlc { physical_us: 101, logical: 0 };
+        assert!(a < b);
+        assert!(b < c);
+        assert!(a < c);
+        assert_eq!(a.max(c), c);
+    }
+}

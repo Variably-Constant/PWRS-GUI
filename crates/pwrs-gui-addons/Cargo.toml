@@ -1,0 +1,12 @@
+[package]
+name = "pwrs-gui-addons"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Builds PWRS-GUI's add-on modules: the WebKitGTK add-on for Linux and FreeBSD, from the distribution's own packages, with the corresponding source of every package whose license requires it; and the Mesa add-on for Windows, llvmpipe built from source with the license texts of the code in it."
+publish = false
+
+[dependencies]
+serde_json.workspace = true

@@ -1,0 +1,12 @@
+# Every checkout and every archive gets the bytes the repository stores, on
+# every platform, so a module built anywhere embeds the same page runtime and
+# the tests read the same files.
+* text=auto eol=lf
+
+# A patch is always text, kept with the LF line endings it was made against.
+patches/*.patch text eol=lf
+
+*.png binary
+*.ico binary
+*.icns binary
+*.ttf binary

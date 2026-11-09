@@ -1,0 +1,536 @@
+//! `SharedCountMinSketch` - cross-process probabilistic frequency
+//! estimator.
+//!
+//! `d` hash functions, `w` cells per row. `insert(item)` does `d`
+//! atomic `fetch_add(1)` ops; `estimate_count(item)` reads `d`
+//! cells and returns the minimum (the tightest unbiased upper
+//! bound on true count).
+//!
+//! # Safety properties
+//!
+//! - Pure `fetch_add` writes - no underflow possible.
+//! - No spin loops, no CAS retries, no RAII guards.
+//! - Bounded memory at create time (`d * w` cells of u64).
+//! - Hash collisions overcount, never undercount. Estimate is a
+//!   guaranteed upper bound on true count.
+//!
+//! # Error bound
+//!
+//! With probability `1 - delta`, estimate <= true + `epsilon * N`
+//! where N is total inserts. Sizing: `w >= e/epsilon`,
+//! `d >= ln(1/delta)`. Standard config (epsilon=0.001, delta=0.001):
+//! w=2718, d=7, mem ~152 KB.
+//!
+//! # Hash family
+//!
+//! `d` independent hash positions derived from one FNV-1a + fmix64
+//! hash, then `pos[i] = (h + i * h2) % w` using two-hash
+//! double-hashing (Kirsch-Mitzenmacher). Same technique as
+//! [`SharedBloomFilter`](crate::SharedBloomFilter).
+
+use std::fs::File;
+use std::mem::size_of;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use memmap2::{MmapMut, MmapOptions};
+
+pub const CMS_MAGIC: u64 = 0x4150_434D_5330_3031;
+
+#[repr(C, align(64))]
+pub struct CMSHeader {
+    pub magic: u64,
+    pub d: u32,
+    pub w: u32,
+    pub total_inserts: AtomicU64,
+    _pad: [u8; 40],
+}
+
+const _: () = {
+    assert!(size_of::<CMSHeader>() == 64);
+};
+
+#[derive(Debug)]
+pub enum CMSError {
+    InvalidConfig,
+    LayoutMismatch(crate::layout::Mismatch),
+    /// The operating system refused to open, size or map the file; the
+    /// error carries its code and message.
+    IoError(std::io::Error),
+}
+
+impl std::fmt::Display for CMSError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidConfig => write!(f, "the sketch needs a depth and a width of at least 1"),
+            Self::LayoutMismatch(m) => write!(f, "a sketch of another shape: {m}"),
+            Self::IoError(e) => write!(f, "io: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for CMSError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::IoError(e) => Some(e),
+            Self::InvalidConfig | Self::LayoutMismatch(_) => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for CMSError {
+    fn from(e: std::io::Error) -> Self { Self::IoError(e) }
+}
+
+pub fn cms_file_size(d: u32, w: u32) -> usize {
+    size_of::<CMSHeader>() + (d as usize) * (w as usize) * size_of::<AtomicU64>()
+}
+
+const FNV_OFFSET_BASIS_1: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_OFFSET_BASIS_2: u64 = 0x8422_2325_cbf2_9ce4;
+const FNV_PRIME: u64 = 0x100_0000_01b3;
+
+#[inline]
+fn fnv1a(bytes: &[u8], basis: u64) -> u64 {
+    let mut h = basis;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
+}
+
+#[inline]
+fn fmix64(mut h: u64) -> u64 {
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    h ^= h >> 33;
+    h
+}
+
+pub struct SharedCountMinSketch {
+    _file: File,
+    mmap: MmapMut,
+    d: u32,
+    w: u32,
+    header_sidecar: subetha_core::HandshakeHeader,
+    ring_sidecar: Box<subetha_core::ObservationRing>,
+}
+
+unsafe impl Send for SharedCountMinSketch {}
+unsafe impl Sync for SharedCountMinSketch {}
+
+impl subetha_sidecar::AdaptiveInstance for SharedCountMinSketch {
+    fn header(&self) -> &subetha_core::HandshakeHeader { &self.header_sidecar }
+    fn ring(&self) -> &subetha_core::ObservationRing { &self.ring_sidecar }
+    fn make_policy(&self) -> Box<dyn subetha_sidecar::Policy> {
+        Box::new(subetha_sidecar::NoMigrationPolicy)
+    }
+}
+
+impl SharedCountMinSketch {
+    /// Suggest (d, w) for target (epsilon, delta) error bounds.
+    /// Estimate <= true + epsilon * N with probability 1 - delta.
+    pub fn suggest_config(epsilon: f64, delta: f64) -> (u32, u32) {
+        assert!(epsilon > 0.0 && epsilon < 1.0);
+        assert!(delta > 0.0 && delta < 1.0);
+        let w = (std::f64::consts::E / epsilon).ceil() as u32;
+        let d = (1.0 / delta).ln().ceil() as u32;
+        (d.max(1), w.max(1))
+    }
+
+    /// Obtain the sketch at `path`, initializing an empty one if the
+    /// path does not yet exist and attaching to it if it does.
+    /// Attaching leaves live counts in place; a region built with a
+    /// different `(d, w)` is a `LayoutMismatch`. The in-place
+    /// [`reset`](Self::reset) zeroes a live sketch.
+    pub fn create(
+        path: impl AsRef<Path>, d: u32, w: u32,
+    ) -> Result<Self, CMSError> {
+        if d == 0 || w == 0 {
+            return Err(CMSError::InvalidConfig);
+        }
+        let (file, mmap) = crate::mmf_attach::create_or_attach(
+            path.as_ref(),
+            cms_file_size(d, w),
+            |ptr| unsafe { Self::init_region(ptr, d, w) },
+            |ptr| unsafe { (*(ptr as *const CMSHeader)).magic },
+            CMS_MAGIC,
+        )
+        .map_err(|e| crate::mmf_attach::attach_error(e, CMSError::LayoutMismatch))?;
+        Self::from_region(file, mmap, d, w)
+    }
+
+    /// Lay out an empty sketch: config first, magic last, because
+    /// attachers spin on it. The zeroed region is already the zero
+    /// counter matrix.
+    ///
+    /// # Safety
+    /// `ptr` addresses at least `cms_file_size(d, w)` writable zeroed
+    /// bytes.
+    unsafe fn init_region(ptr: *mut u8, d: u32, w: u32) {
+        let hdr = ptr as *mut CMSHeader;
+        unsafe {
+            (*hdr).d = d;
+            (*hdr).w = w;
+            std::ptr::write_volatile(&raw mut (*hdr).magic, CMS_MAGIC);
+        }
+    }
+
+    /// Wrap an initialized region, refusing one built with a different
+    /// config.
+    fn from_region(file: File, mmap: MmapMut, d: u32, w: u32) -> Result<Self, CMSError> {
+        let hdr = unsafe { &*(mmap.as_ptr() as *const CMSHeader) };
+        crate::layout::Mismatch::first(&[
+            ("magic", hdr.magic, CMS_MAGIC),
+            ("depth", u64::from(hdr.d), u64::from(d)),
+            ("width", u64::from(hdr.w), u64::from(w)),
+        ])
+        .map_err(CMSError::LayoutMismatch)?;
+        Ok(Self {
+            _file: file, mmap, d, w,
+            header_sidecar: subetha_core::HandshakeHeader::new(),
+            ring_sidecar: Box::new(subetha_core::ObservationRing::new()),
+        })
+    }
+
+    pub fn open(
+        path: impl AsRef<Path>, expected_d: u32, expected_w: u32,
+    ) -> Result<Self, CMSError> {
+        let total = cms_file_size(expected_d, expected_w);
+        let file = crate::region_file::open_existing(path.as_ref())?;
+        let len = file.metadata()?.len();
+        if len < total as u64 {
+            return Err(CMSError::LayoutMismatch(crate::layout::Mismatch::new(
+                "length",
+                len,
+                total as u64,
+            )));
+        }
+        let mmap = unsafe { MmapOptions::new().len(total).map_mut(&file)? };
+        Self::from_region(file, mmap, expected_d, expected_w)
+    }
+
+    #[inline]
+    pub fn d(&self) -> u32 { self.d }
+    #[inline]
+    pub fn w(&self) -> u32 { self.w }
+    #[inline]
+    pub fn total_inserts(&self) -> u64 {
+        unsafe { (*(self.mmap.as_ptr() as *const CMSHeader)).total_inserts.load(Ordering::Acquire) }
+    }
+
+    fn cell(&self, row: u32, col: u32) -> &AtomicU64 {
+        let idx = (row as usize) * (self.w as usize) + (col as usize);
+        let base = unsafe { self.mmap.as_ptr().add(size_of::<CMSHeader>()) };
+        unsafe { &*(base.add(idx * size_of::<AtomicU64>()) as *const AtomicU64) }
+    }
+
+    /// Invoke `f(row, col)` for each of the `d` hash positions of `item`,
+    /// without allocating. Two FNV-1a + fmix64 hashes feed
+    /// Kirsch-Mitzenmacher double-hashing `h1 + row * h2`; the column is
+    /// reduced mod `w`, using a bit-mask when `w` is a power of two (the
+    /// runtime divisor otherwise compiles to a hardware DIV per row).
+    #[inline]
+    fn for_each_position(&self, item: &[u8], mut f: impl FnMut(u32, u32)) {
+        let h1 = fmix64(fnv1a(item, FNV_OFFSET_BASIS_1));
+        let h2 = fmix64(fnv1a(item, FNV_OFFSET_BASIS_2));
+        let w = self.w as u64;
+        let pow2 = self.w.is_power_of_two();
+        let mask = w.wrapping_sub(1);
+        for row in 0..self.d {
+            let raw = h1.wrapping_add((row as u64).wrapping_mul(h2));
+            let col = if pow2 {
+                (raw & mask) as u32
+            } else {
+                // Lemire fastrange: multiply-shift maps into [0, w) with no
+                // hardware DIV. h1/h2 are fmix64-avalanched, so the high
+                // bits the shift keys on are well-distributed.
+                ((raw as u128 * w as u128) >> 64) as u32
+            };
+            f(row, col);
+        }
+    }
+
+    /// Insert one observation of `item`. `d` atomic increments.
+    pub fn insert(&self, item: &[u8]) {
+        self.for_each_position(item, |row, col| {
+            self.cell(row, col).fetch_add(1, Ordering::AcqRel);
+        });
+        unsafe {
+            (*(self.mmap.as_ptr() as *const CMSHeader))
+                .total_inserts.fetch_add(1, Ordering::AcqRel);
+        }
+        self.ring_sidecar
+            .push_op(crate::sidecar_ops::sketch::OP_INSERT, 0);
+    }
+
+    /// Insert `count` observations at once (bulk increment).
+    pub fn insert_n(&self, item: &[u8], count: u64) {
+        if count == 0 { return; }
+        self.for_each_position(item, |row, col| {
+            self.cell(row, col).fetch_add(count, Ordering::AcqRel);
+        });
+        unsafe {
+            (*(self.mmap.as_ptr() as *const CMSHeader))
+                .total_inserts.fetch_add(count, Ordering::AcqRel);
+        }
+        self.ring_sidecar
+            .push_op(crate::sidecar_ops::sketch::OP_INSERT, 0);
+    }
+
+    /// Estimate the frequency of `item`. Guaranteed upper bound on
+    /// true count.
+    pub fn estimate_count(&self, item: &[u8]) -> u64 {
+        let mut v = u64::MAX;
+        self.for_each_position(item, |row, col| {
+            let c = self.cell(row, col).load(Ordering::Acquire);
+            if c < v { v = c; }
+        });
+        let v = if self.d == 0 { 0 } else { v };
+        self.ring_sidecar.push_op(
+            crate::sidecar_ops::sketch::OP_QUERY,
+            if v == 0 { 2 } else { 0 },
+        );
+        v
+    }
+
+    /// Reset all cells to zero.
+    pub fn reset(&self) {
+        for row in 0..self.d {
+            for col in 0..self.w {
+                self.cell(row, col).store(0, Ordering::Release);
+            }
+        }
+        unsafe {
+            (*(self.mmap.as_ptr() as *const CMSHeader))
+                .total_inserts.store(0, Ordering::Release);
+        }
+        self.ring_sidecar
+            .push_op(crate::sidecar_ops::sketch::OP_CLEAR, 0);
+    }
+
+    pub fn flush(&self) -> Result<(), CMSError> {
+        self.mmap.flush()?;
+        Ok(())
+    }
+    pub fn flush_async(&self) -> Result<(), CMSError> {
+        self.mmap.flush_async()?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::thread;
+
+    /// A file for one test, removed when the test ends; declared before the
+    /// primitive that maps it so it drops after it.
+    fn tmp(name: &str) -> crate::test_paths::TmpFile {
+        crate::test_paths::TmpFile::new(format!("subetha-cms-{name}-{}.bin", std::process::id()))
+    }
+
+    #[test]
+    fn create_initial_state_zero() {
+        let p = tmp("init");
+        let cms = SharedCountMinSketch::create(&p, 4, 256).unwrap();
+        assert_eq!(cms.d(), 4);
+        assert_eq!(cms.w(), 256);
+        assert_eq!(cms.total_inserts(), 0);
+        assert_eq!(cms.estimate_count(b"anything"), 0);
+    }
+
+    /// A second create attaches with live counts in place; the
+    /// in-place reset is what zeroes them.
+    #[test]
+    fn second_create_attaches_and_keeps_counts() {
+        let p = tmp("attach");
+        let cms = SharedCountMinSketch::create(&p, 4, 256).unwrap();
+        cms.insert(b"key");
+        cms.insert(b"key");
+
+        let cms2 = SharedCountMinSketch::create(&p, 4, 256).unwrap();
+        assert_eq!(cms2.estimate_count(b"key"), 2, "attach zeroed live counts");
+        assert!(matches!(
+            SharedCountMinSketch::create(&p, 2, 256),
+            Err(CMSError::LayoutMismatch(crate::layout::Mismatch { field: "depth", found: 4, wanted: 2 })),
+        ));
+
+        cms2.reset();
+        assert_eq!(cms.estimate_count(b"key"), 0, "reset did not zero for every handle");
+        drop(cms);
+        drop(cms2);
+    }
+
+    #[test]
+    fn invalid_config_rejected() {
+        let p = tmp("invalid");
+        assert!(matches!(
+            SharedCountMinSketch::create(&p, 0, 256).err(),
+            Some(CMSError::InvalidConfig)
+        ));
+        assert!(matches!(
+            SharedCountMinSketch::create(&p, 4, 0).err(),
+            Some(CMSError::InvalidConfig)
+        ));
+    }
+
+    #[test]
+    fn insert_then_estimate_returns_at_least_true_count() {
+        let p = tmp("insert");
+        let cms = SharedCountMinSketch::create(&p, 4, 1024).unwrap();
+        for _ in 0..5 { cms.insert(b"foo"); }
+        for _ in 0..3 { cms.insert(b"bar"); }
+        // Guaranteed: estimate >= true.
+        assert!(cms.estimate_count(b"foo") >= 5);
+        assert!(cms.estimate_count(b"bar") >= 3);
+        assert_eq!(cms.total_inserts(), 8);
+    }
+
+    #[test]
+    fn insert_n_is_equivalent_to_n_inserts() {
+        let p = tmp("insert-n");
+        let a = SharedCountMinSketch::create(tmp("insert-n-a"), 4, 1024).unwrap();
+        let b = SharedCountMinSketch::create(tmp("insert-n-b"), 4, 1024).unwrap();
+        for _ in 0..100 { a.insert(b"item"); }
+        b.insert_n(b"item", 100);
+        assert_eq!(a.estimate_count(b"item"), b.estimate_count(b"item"));
+        assert_eq!(a.total_inserts(), b.total_inserts());
+        let _p = p;
+    }
+
+    #[test]
+    fn estimate_for_absent_item_is_low() {
+        // Probability of false-positive (estimate > 0) on absent
+        // item is bounded by (n / w)^d. For n=100 inserts, w=1024,
+        // d=4: (100/1024)^4 = 9e-5 - very low.
+        let p = tmp("absent");
+        let cms = SharedCountMinSketch::create(&p, 4, 1024).unwrap();
+        for i in 0..100u32 {
+            cms.insert(format!("inserted-{i}").as_bytes());
+        }
+        // Try 100 absent items; expect very few false positives.
+        let mut fp = 0u32;
+        for i in 0..100u32 {
+            if cms.estimate_count(format!("absent-{i}").as_bytes()) > 0 {
+                fp += 1;
+            }
+        }
+        // Allow up to 10% (well above theoretical bound).
+        assert!(fp < 10, "expected < 10 false positives, got {fp}");
+    }
+
+    #[test]
+    fn heavy_hitter_detection() {
+        // Insert 1 heavy item (10000 times) + 1000 single-insert
+        // items. Heavy item should clearly stand out.
+        let p = tmp("heavy");
+        let cms = SharedCountMinSketch::create(&p, 5, 2048).unwrap();
+        for _ in 0..10_000 { cms.insert(b"HEAVY"); }
+        for i in 0..1000u32 {
+            cms.insert(format!("light-{i}").as_bytes());
+        }
+        let heavy = cms.estimate_count(b"HEAVY");
+        // Heavy is at least 10000; error <= epsilon * N where
+        // N = 11000 and epsilon ~ e/2048 ~ 0.00133. So error <= ~15.
+        assert!(heavy >= 10_000);
+        assert!(heavy <= 10_100, "heavy estimate {heavy} should be very close to 10000");
+        // Light items should estimate near 1.
+        for i in 0..10u32 {
+            let light = cms.estimate_count(format!("light-{i}").as_bytes());
+            assert!(light < 20, "light item {i} estimate {light} should be small");
+        }
+    }
+
+    #[test]
+    fn reset_zeroes_everything() {
+        let p = tmp("reset");
+        let cms = SharedCountMinSketch::create(&p, 4, 256).unwrap();
+        for _ in 0..50 { cms.insert(b"x"); }
+        assert!(cms.estimate_count(b"x") >= 50);
+        cms.reset();
+        assert_eq!(cms.estimate_count(b"x"), 0);
+        assert_eq!(cms.total_inserts(), 0);
+    }
+
+    #[test]
+    fn cross_handle_visibility() {
+        let p = tmp("cross-handle");
+        let w = SharedCountMinSketch::create(&p, 4, 256).unwrap();
+        let r = SharedCountMinSketch::open(&p, 4, 256).unwrap();
+        w.insert(b"shared");
+        w.insert(b"shared");
+        assert!(r.estimate_count(b"shared") >= 2);
+        assert_eq!(r.total_inserts(), 2);
+    }
+
+    #[test]
+    fn config_mismatch_at_open_rejected() {
+        let p = tmp("mismatch");
+        let _w = SharedCountMinSketch::create(&p, 4, 256).unwrap();
+        assert!(matches!(
+            SharedCountMinSketch::open(&p, 5, 256),
+            Err(CMSError::LayoutMismatch(m)) if m == crate::layout::Mismatch::new(
+                "length",
+                cms_file_size(4, 256) as u64,
+                cms_file_size(5, 256) as u64,
+            )
+        ));
+        assert!(matches!(
+            SharedCountMinSketch::open(&p, 4, 512),
+            Err(CMSError::LayoutMismatch(m)) if m == crate::layout::Mismatch::new(
+                "length",
+                cms_file_size(4, 256) as u64,
+                cms_file_size(4, 512) as u64,
+            )
+        ));
+        assert!(matches!(
+            SharedCountMinSketch::open(&p, 2, 256),
+            Err(CMSError::LayoutMismatch(crate::layout::Mismatch { field: "depth", found: 4, wanted: 2 }))
+        ));
+    }
+
+    #[test]
+    fn suggest_config_returns_sensible_values() {
+        // epsilon=0.01, delta=0.01 -> w ~ e/0.01 ~ 272, d ~ ln(100) ~ 5.
+        let (d, w) = SharedCountMinSketch::suggest_config(0.01, 0.01);
+        assert!((250..=300).contains(&w));
+        assert!((4..=6).contains(&d));
+    }
+
+    #[test]
+    fn concurrent_inserters_accurate() {
+        // 4 threads each insert "shared-item" 1000 times. After
+        // join, estimate should be at least 4000.
+        let p = tmp("concurrent");
+        let cms = Arc::new(SharedCountMinSketch::create(&p, 4, 1024).unwrap());
+        let mut handles = vec![];
+        for _ in 0..4 {
+            let cms = cms.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..1000 { cms.insert(b"shared-item"); }
+            }));
+        }
+        for h in handles { h.join().unwrap(); }
+        let est = cms.estimate_count(b"shared-item");
+        assert!(est >= 4000, "concurrent estimate {est} should be >= 4000");
+        assert_eq!(cms.total_inserts(), 4000);
+    }
+
+    #[test]
+    fn disk_persistence_survives_reopen() {
+        let p = tmp("disk");
+        {
+            let cms = SharedCountMinSketch::create(&p, 4, 256).unwrap();
+            for _ in 0..50 { cms.insert(b"persisted"); }
+            cms.flush().unwrap();
+        }
+        let cms2 = SharedCountMinSketch::open(&p, 4, 256).unwrap();
+        assert!(cms2.estimate_count(b"persisted") >= 50);
+        assert_eq!(cms2.total_inserts(), 50);
+    }
+}

@@ -1,0 +1,7 @@
+# The newest stable Rust and the LLVM it carries. The module ships only as
+# prebuilt binaries on the PowerShell Gallery, so every build of this tree,
+# local, on a guest or in CI, uses the newest release; rustup installs it
+# beside a host's default toolchain on first use.
+[toolchain]
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]

@@ -1,0 +1,9 @@
+[package]
+name = "pwrs-gui-fonts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "OFL-1.1"
+authors.workspace = true
+description = "The fonts PWRS-GUI's renderers draw text in, Inter and JetBrains Mono NL, unchanged from their releases."
+publish = false
